@@ -180,6 +180,7 @@ Commit::Commit(CPU *_cpu, branch_prediction::BPredUnit *_bp, const BaseO3CPUPara
         htmStarts[tid] = 0;
         htmStops[tid] = 0;
         traceCommitIndex[tid] = 0;
+        traceLastHeartbeatIndex[tid] = 0;
     }
     interrupt = NoFault;
 
