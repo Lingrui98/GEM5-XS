@@ -152,7 +152,7 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
         thread[tid].setDcachePort(&dcachePort);
     }
 
-    bankOccupied.resize(8, false);
+    bankOccupied = std::vector<bool>(8, false);
 }
 
 
