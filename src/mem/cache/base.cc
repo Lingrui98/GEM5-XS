@@ -541,6 +541,16 @@ BaseCache::BaseCache(const BaseCacheParams &p, unsigned blk_size)
         "exceeds mshrs (%u)", name(), demandFetchMSHRs,
         instPrefetchMSHRs, p.mshrs);
 
+    fatal_if(demandFetchMSHRs > p.mshrs,
+        "%s demand_fetch_mshrs (%u) exceeds mshrs (%u)",
+        name(), demandFetchMSHRs, p.mshrs);
+    fatal_if(fdipPrefetchMSHRs > p.mshrs,
+        "%s fdip_prefetch_mshrs (%u) exceeds mshrs (%u)",
+        name(), fdipPrefetchMSHRs, p.mshrs);
+    fatal_if(demandFetchMSHRs + fdipPrefetchMSHRs > p.mshrs,
+        "%s demand_fetch_mshrs + fdip_prefetch_mshrs (%u + %u) exceeds mshrs (%u)",
+        name(), demandFetchMSHRs, fdipPrefetchMSHRs, p.mshrs);
+
     fatal_if(compressor && !dynamic_cast<CompressedTags*>(tags),
         "The tags of compressed cache %s must derive from CompressedTags",
         name());
@@ -1268,6 +1278,10 @@ BaseCache::recvTimingReq(PacketPtr pkt)
     pkt->lldpHint = prefetcher ? prefetcher->loadTrain(pkt, !satisfied) : lldp::Hint();
 
     if (satisfied) {
+        if (isL1I() && pkt->cmd.isSWPrefetch() && isFdipPkt(pkt)) {
+            stats.fdipProbeHit++;
+        }
+
         // notify before anything else as later handleTimingReqHit might turn
         // the packet in a response
         if (blk && !pkt->isWrite()) {
