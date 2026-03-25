@@ -46,8 +46,9 @@ target 才真正拥有 decode/buildInst 的归属”。
 `Fetch::processSingleInstruction()` 在为当前 `pc.instAddr()` 构造 DynInst 之前：
 
 1. 读取当前 `ftqFetchingTarget()`
-2. 如果 `curr_pc < target.decodeStartPC`
-3. 说明当前 target 不拥有这条指令
+2. 同时读取 `ftqFollowingTarget()`
+3. 如果 `curr_pc >= following.decodeStartPC()`
+4. 说明 following target 已经从这条指令开始接管 ownership
 4. 先 `consumeFetchTarget()` 切到 following target
 5. 再继续 `buildInst()`
 
@@ -84,7 +85,8 @@ owner migration 只改变微架构所有权，不改变用户可读统计的 bra
 ## Risks / Trade-offs
 
 - fetch target 的消费时机提前到 `buildInst()` 之前，必须确保普通 target
-  不会被误消费；缓解方式是只在 `curr_pc < decodeStartPC` 时迁移。
+  不会被误消费；缓解方式是只在 `curr_pc >= following.decodeStartPC()`
+  时迁移。
 - owner migration 改变了 DynInst 绑定的 `ftqId`，因此必须补 directed test
   覆盖 split control case。
 - `trigger_covered` 删除后，taken 判断完全依赖 owner target 和 `startPC`

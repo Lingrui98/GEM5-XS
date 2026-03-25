@@ -27,8 +27,7 @@ for a control instruction whose decode ownership migrated to the following targe
 #### Scenario: Cross-boundary taken control builds under the following target
 
 - **GIVEN** the current instruction start PC is `P`
-- **AND** the current fetch target has `decodeStartPC > P`
-- **AND** the following target has `decodeStartPC == P`
+- **AND** the current fetch target is followed by another target whose `decodeStartPC == P`
 - **WHEN** fetch processes the instruction at `P`
 - **THEN** it SHALL consume the current target before `buildInst()`
 - **AND** the constructed DynInst SHALL be associated with the following target

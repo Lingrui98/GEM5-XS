@@ -21,7 +21,7 @@ following target，fetch 也必须在构造 DynInst 前迁移 ownership，使 re
   - 对于跨边界且 predicted-taken 的 carried split control target：
     `decodeStartPC == predBranchInfo.startPC()`
 - 要求 fetch 在 `buildInst()` 之前检查 owner target：
-  - 如果当前指令 `startPC` 小于当前 target 的 `decodeStartPC`
+  - 如果 following target 的 `decodeStartPC` 已经小于等于当前指令 `startPC`
   - 则先消费当前 target，并切换到 following target，再继续构造该条 DynInst
 - 删除 fetch taken matching 中对 `trigger_covered` 的依赖：
   - taken redirect 只由 owner target 的 `predTaken + predBranchInfo.startPC()`
