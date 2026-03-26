@@ -52,6 +52,12 @@ following target，fetch 也必须在构造 DynInst 前迁移 ownership，使 re
 - `scons -j128 --unit-test build/RISCV/cpu/pred/btb/test/btb.test.opt build/RISCV/cpu/pred/btb/test/fetch_coverage.test.opt`
 - `./build/RISCV/cpu/pred/btb/test/btb.test.opt`
 - `./build/RISCV/cpu/pred/btb/test/fetch_coverage.test.opt`
+- `source openspec/changes/update-bpu-control-pc-owner-migration/validation/env.example.sh`
+- 以 `openspec/changes/update-bpu-control-pc-owner-migration/validation/tasks.csv`
+  为执行 source of truth，串行完成 `setup_env`、`trace_preflight`、`fs_dry_run`
+- 在同一个 `RUN_ROOT` 下并行完成 `fs_spec_target12` 与 `trace_top66`
+- 运行 `final_verify`，产出 `final_status.csv` 与 `final_report.md`，并要求
+  `overall = PASS`
 
 新增或更新的 directed witness 至少包括：
 

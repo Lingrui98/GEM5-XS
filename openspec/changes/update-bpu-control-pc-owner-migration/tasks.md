@@ -28,6 +28,12 @@
 ## 4. Validation
 
 - [x] Reuse the validation scheme from `update-bpu-control-pc-tail-halfword`.
+- [x] Add the manifest-driven validation assets under `validation/`:
+  - [x] `env.example.sh`
+  - [x] `tasks.csv`
+  - [x] `fs_spec_target12.lst`
+  - [x] `scripts/run_fs_checkpoint.sh`
+  - [x] `scripts/summarize_regression.py`
 - [x] Update or add directed unit tests for:
   - [x] `Rvi4B_ControlPC_CrossBoundaryPredictInNextBlock`
   - [x] `SplitControlOwnershipMigratesBeforeBuildInst`
@@ -37,3 +43,7 @@
 - [x] Build the BTB unit tests with `scons -j128 --unit-test ...`.
 - [x] Run `btb.test.opt`.
 - [x] Run `fetch_coverage.test.opt`.
+- [x] Run the manifest prerequisites `setup_env`, `trace_preflight`, and `fs_dry_run`.
+- [x] Run the representative 12-workload FS checkpoint gate `fs_spec_target12`.
+- [x] Run the mytools-based 66-trace gate `trace_top66` in parallel with the FS gate.
+- [x] Run `final_verify` and archive the PASS summary in `final_status.csv` and `final_report.md`.
