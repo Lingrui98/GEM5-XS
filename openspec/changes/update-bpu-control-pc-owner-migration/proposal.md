@@ -34,6 +34,7 @@ following target，fetch 也必须在构造 DynInst 前迁移 ownership，使 re
 
 - Affected specs: `decoupled-btb-control-pc-semantics`
 - Affected code:
+  - `src/cpu/pred/BranchPredictor.py`
   - `src/cpu/pred/btb/common.hh`
   - `src/cpu/pred/btb/decoupled_bpred.hh`
   - `src/cpu/pred/btb/decoupled_bpred.cc`
@@ -56,6 +57,9 @@ following target，fetch 也必须在构造 DynInst 前迁移 ownership，使 re
 - 以 `openspec/changes/update-bpu-control-pc-owner-migration/validation/tasks.csv`
   为执行 source of truth，串行完成 `setup_env`、`trace_preflight`、`fs_dry_run`
 - 在同一个 `RUN_ROOT` 下并行完成 `fs_spec_target12` 与 `trace_top66`
+- `trace_top66` 的 task status 由
+  `validation/scripts/check_trace_gate.py` 直接根据 trace run 目录回写，
+  避免内联文本匹配导致的假阴性
 - 运行 `final_verify`，产出 `final_status.csv` 与 `final_report.md`，并要求
   `overall = PASS`
 

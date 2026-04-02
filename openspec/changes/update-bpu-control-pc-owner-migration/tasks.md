@@ -32,6 +32,7 @@
   - [x] `env.example.sh`
   - [x] `tasks.csv`
   - [x] `fs_spec_target12.lst`
+  - [x] `scripts/check_trace_gate.py`
   - [x] `scripts/run_fs_checkpoint.sh`
   - [x] `scripts/summarize_regression.py`
 - [x] Update or add directed unit tests for:
