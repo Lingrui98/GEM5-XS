@@ -229,3 +229,165 @@ BPU::tick()
 ###### 子预测器的抽象
 
 
+## Decoupled BTB 的 control-PC 语义演进
+
+这一节补充近期 BTB-only 路径中最容易看混的几个语义点。核心结论是：
+
+- predictor-visible 的 branch identity 不再直接使用“指令起始地址”，而是使用 **control PC view**
+- 对于跨 block 的 32-bit 控制流指令，这个 control PC view 采用 **tail-halfword** 作为身份
+- 但统计、debug、RAS/uRAS 回退地址、fetch byte coverage 仍然需要保留 **architectural startPC**
+
+也就是说，当前模型里至少同时存在三种“和同一条控制流指令有关”的 PC：
+
+1. `startPC`
+   - 指令的真实起始地址，也是 architectural 语义最稳定的表示。
+   - 用于 byte coverage、fall-through 计算、RAS/uRAS 的 start-PC 相关逻辑，以及很多 debug/统计信息。
+2. `controlPC`
+   - predictor-visible 的控制流身份。
+   - 对普通情况，它和 `startPC` 相同；对 split 32-bit control instruction，它可能落在后一半 halfword 上。
+3. `predEndPC`
+   - 当前 fetch target 允许 fetch 消费的上界（exclusive）。
+   - fetch 是否“跑出这个 target 的覆盖区间”，看的是这个值，而不是单纯看一条 branch 的起始位置。
+
+这套拆分的动机是：让 predictor key 与 RTL 的控制流身份保持一致，同时又不丢失 fetch/decoder/RAS 仍然必须依赖的起始地址语义。
+
+### tail-halfword 视角为什么需要单独引入
+
+对于一条跨 fetch block 边界的 32-bit 控制流指令：
+
+- decoder 和 fetch byte coverage 的视角，天然更关心 `startPC`
+- 但 BTB 的 control-flow key 更接近“控制流真正生效的那个 halfword 位置”
+
+如果继续把同一个字段同时拿来做：
+
+- predictor lookup key
+- fetch coverage trigger
+- 回退/统计的 architectural address
+
+那么代码中会不断出现“到底是 startPC 还是 controlPC”的临时分支，既容易出错，也很难和 RTL 对齐。
+
+因此这一轮修改把这两个语义正式拆开：
+
+- `BranchInfo::startPC()` 继续表示 architectural start
+- `BranchInfo::controlPC()` 表示 predictor-visible control identity
+
+fetch 侧随后再通过 coverage helper 判断“当前 PC 是否仍属于这个 target 的覆盖区间”，而不再把“是否落在 controlPC 上”误当成整个 target 的消费边界。
+
+## split-control owner migration 与 fetch handoff
+
+在 control-PC 切换到 tail-halfword 以后，会出现一个新的情况：
+
+- 一条 taken control instruction 的 `controlPC` 已经属于“后一个 fetch target”的视角
+- 但它的起始字节仍然可能位于“前一个 fetch target”抓到的 fetch buffer 中
+
+这时如果 fetch 仍然机械地按“当前 FTQ head 拥有当前所有 inst-start PC”的假设运行，就会出现两个问题：
+
+1. buildInst 仍在旧 target 上构造这条 split control instruction
+2. taken matching / redirect matching 仍在旧 target 上判断，导致 owner 语义和 predictor key 脱节
+
+因此引入了 **owner migration**：
+
+- 当前正在消费的 target 仍然按顺序提供 fetch bytes
+- 但当 following target 明确声明“这条 split control instruction 由我拥有”时，fetch 会在 buildInst 之前把 owner 切到 following target
+
+### 当前 owner 语义如何表达
+
+`FetchTarget` 现在显式区分了“stream 起点”和“owner 起点”：
+
+- `startPC`
+  - 这个 fetch target 在 FTQ 中的 nominal 起点
+- `ownerStartPC()`
+  - 这个 target 实际拥有的最早 inst-start PC
+  - 对普通 target，`ownerStartPC() == startPC`
+  - 对 split-control handoff，`ownerStartPC() < startPC`
+
+这也是为什么之前的 `decodeStartPC` 被重命名成 `ownerStartPC`：
+
+- 它表达的并不是 decoder 的局部状态
+- 它表达的是“这条 fetch target 对哪些 inst-start PC 负责”
+
+### fetch handoff 的触发条件
+
+fetch 侧不再手写一长串 owner-migration 条件，而是通过 `FetchTarget` helper 来统一表达：
+
+- `hasSplitControlOwnership()`
+- `ownsInstPC(inst_pc)`
+- `shouldTakeSplitControlOwnershipFrom(previous, inst_pc)`
+- `isTakenControlAt(inst_pc)`
+
+这样做的好处是：
+
+- owner range 的定义只保留一份
+- fetch 与单测不再各自维护一套“手写布尔表达式”
+- 以后如果 owner 语义继续演进，只需要改 `FetchTarget` 的契约
+
+从使用层面看，fetch 的判断可以概括成两步：
+
+1. 如果 following target 对当前 `inst_pc` 满足 `shouldTakeSplitControlOwnershipFrom(...)`，先完成 handoff
+2. handoff 完成后，再在新的 owner target 上判断：
+   - 当前 PC 是否仍在 owner range 内
+   - 当前 PC 是否正好命中 taken control instruction
+
+## trace / FS 路径的边界
+
+owner migration 本质上是一个“fetch 消费 FTQ target 时的运行时协议”。这条协议并不是所有前端模式都需要照搬。
+
+### FS / 正常 decoupled fetch
+
+在正常 decoupled BTB fetch 路径中：
+
+- fetch 需要逐条指令地消费当前 target
+- 同时还要保持与 predictor-visible controlPC 身份一致
+
+因此 owner migration 必须真实发生，否则 split-control 的 taken matching、redirect 和 update 语义都会漂移。
+
+### trace mode
+
+trace mode 的目标不同：
+
+- 它更像“用 trace 驱动一条顺序消费路径”
+- 而不是“完整重放 FTQ owner handoff 协议”
+
+因此当前实现里，fetch-time owner migration 在 trace mode 下会直接跳过；如果 trace 消费时发现当前 PC 不落在 owner range 内，就退回顺序推进，而不是继续尝试 FTQ owner handoff。
+
+这个约束的意义是：
+
+- 避免把正常 FTQ handoff 协议生搬到 trace mode，导致回滚/恢复逻辑更复杂
+- 把 trace mode 的行为收敛为“能顺序消费就顺序消费，不能映射 owner 时不强行模拟 handoff”
+
+### 相关回归点
+
+这一轮语义调整之后，至少有三类路径需要一起看：
+
+1. normal FS / decoupled BTB
+   - 检查 split-control handoff、taken matching、redirect 是否一致
+2. trace mode
+   - 检查 owner migration 被跳过后，是否还能顺序推进并正确回滚
+3. start-PC consumers
+   - 例如 RAS/uRAS、trace wrong-path NOP sizing、coverage helper 等，是否仍然使用 architectural startPC
+
+## 最终简化：为什么要把 owner 规则收回到 FetchTarget
+
+在 owner migration 最初落地时，fetch 里存在较强的“协议泄漏”：
+
+- fetch 自己知道 owner handoff 的所有条件
+- 测试代码也手写了一份几乎等价的判定
+
+这样的问题在于：
+
+- reader 很难分辨“这是 fetch 的状态机”还是“这是 FetchTarget 的领域规则”
+- 一旦语义有改动，很容易只改到 fetch 没改到测试，或反过来
+
+最终简化版做的事情并不只是改名，而是把契约收回到 `FetchTarget`：
+
+- `decodeStartPC -> ownerStartPC`
+- handoff / owner range / taken match 都通过 helper 表达
+- `decoupled_bpred`、`fetch`、`btb.test` 共用同一套 owner 语义
+
+因此更准确的理解是：
+
+- `FetchTarget` 描述“这个 target 拥有哪段 inst-start PC，以及哪一个位置是 taken control”
+- `fetch` 只负责按这个契约消费 target，而不再自己重写一套协议
+
+这也是后续若继续简化 FTQ / FSQ 边界时，最重要的准备工作之一：先把 owner 规则变成稳定的数据契约，再考虑把 handoff 进一步下沉到 queue/predictor 侧。
+
