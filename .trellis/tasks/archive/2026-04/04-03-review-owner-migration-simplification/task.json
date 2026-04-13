@@ -1,0 +1,67 @@
+{
+  "id": "review-owner-migration-simplification",
+  "name": "review-owner-migration-simplification",
+  "title": "Review and simplify owner-migration implementation on top of PR 805",
+  "description": "Track a simplification pass for split-control owner migration after PR #805. Preserve the corrected owner semantics while reducing fetch-local protocol complexity and maintenance risk.",
+  "status": "completed",
+  "dev_type": "backend",
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "glr",
+  "assignee": "glr",
+  "createdAt": "2026-04-03",
+  "completedAt": "2026-04-13",
+  "branch": "review-owner-migration-simplification",
+  "base_branch": "impl-control-pc-tail-halfword",
+  "worktree_path": ".worktrees/review-owner-migration-simplification",
+  "current_phase": 0,
+  "next_action": [
+    {
+      "phase": 1,
+      "action": "implement"
+    },
+    {
+      "phase": 2,
+      "action": "check"
+    },
+    {
+      "phase": 3,
+      "action": "finish"
+    },
+    {
+      "phase": 4,
+      "action": "create-pr"
+    }
+  ],
+  "commit": "946a8b2808",
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    ".trellis/tasks/archive/2026-04/04-02-openspec-update-bpu-control-pc-owner-migration",
+    ".trellis/tasks/04-02-openspec-update-bpu-control-pc-tail-halfword",
+    ".worktrees/impl-control-pc-views/src/cpu/o3/fetch.cc",
+    ".worktrees/impl-control-pc-tail-halfword/src/cpu/o3/fetch.cc",
+    ".worktrees/impl-control-pc-tail-halfword/src/cpu/pred/btb/common.hh",
+    ".worktrees/impl-control-pc-tail-halfword/src/cpu/pred/btb/decoupled_bpred.cc",
+    ".worktrees/impl-control-pc-tail-halfword/src/cpu/o3/trace/TraceFetch.cc",
+    ".worktrees/impl-control-pc-tail-halfword/src/cpu/pred/btb/test/btb.test.cc"
+  ],
+  "notes": "Drafted from the 2026-04-03 review of PR #805 versus the owner-migration follow-up chain. Validation: btb/fetch_coverage/uras unit tests passed, and a 10k-instruction ChampSim trace sanity run exited at the max instruction count after rebuilding gem5.opt with DRAMSim3 enabled in the review worktree.",
+  "meta": {
+    "source": "manual-review",
+    "github_pr_number": 805,
+    "github_pr_url": "https://github.com/OpenXiangShan/GEM5/pull/805",
+    "review_baseline_branch": "impl-control-pc-views",
+    "review_followup_branch": "impl-control-pc-tail-halfword",
+    "review_followup_commits": [
+      "4ef1163cb6",
+      "a19ab7b953",
+      "cb522d9a45",
+      "ee4d353bd1"
+    ],
+    "tracking_scope": "root-trellis-only"
+  }
+}

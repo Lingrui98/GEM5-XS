@@ -1,0 +1,7 @@
+{"file": ".trellis/workflow.md", "reason": "Project workflow and conventions"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend development guide"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Backend subsystem file placement and locality"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Build and targeted validation requirements for predictor/fetch changes"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Invariant and fatal/panic conventions for fetch and trace runtime changes"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Centralize split-owner handoff logic instead of duplicating predicates"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Owner semantics span predictor metadata, fetch, trace, and tests"}
