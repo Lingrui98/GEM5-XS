@@ -18,6 +18,13 @@ SlicedCacheAccessor::inCache(Addr addr, bool is_secure) const
     return getSlice(addr)->inCache(addr, is_secure);
 }
 
+bool
+SlicedCacheAccessor::lookupHitWay(Addr addr, bool is_secure, uint8_t &way) const
+{
+    fatal_if(l2_wrapper->cache_accessors.empty(), "No slice accessors available.");
+    return getSlice(addr)->lookupHitWay(addr, is_secure, way);
+}
+
 unsigned
 SlicedCacheAccessor::level() const
 {

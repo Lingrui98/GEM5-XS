@@ -568,6 +568,12 @@ BaseCache::BaseCache(const BaseCacheParams &p, unsigned blk_size)
         prevReqCycles.emplace_back(system->maxRequestors(), Cycles{0});
     }
 
+    statistics::registerResetCallback([this]() {
+        fdipMissAllocTrackers.clear();
+        fdipLastOutcomes.clear();
+        fdipPendingMissAllocs.clear();
+    });
+
     if (dumpMissPC && cacheLevel) {
         registerExitCallback([this]() {
             if (pcMissCount.empty())
@@ -1010,6 +1016,11 @@ BaseCache::handleTimingReqMiss(PacketPtr pkt, MSHR *mshr, CacheBlk *blk,
             if (!checkAndAllocateMSHRCycle(pkt)) {
                 return;
             }
+            if (isL1I() && isFdipPkt(pkt)) {
+                stats.fdipMissAlloc++;
+                noteFdipMissAlloc(pkt->getBlockAddr(blkSize),
+                                  pkt->isSecure());
+            }
             // Here we are using forward_time, modelling the latency of
             // a miss (outbound) just as forwardLatency, neglecting the
             // lookupLatency component.
@@ -1017,6 +1028,103 @@ BaseCache::handleTimingReqMiss(PacketPtr pkt, MSHR *mshr, CacheBlk *blk,
 
         }
     }
+}
+
+BaseCache::FdipMissAllocPriorClass
+BaseCache::classifyFdipMissAllocPriorClass(const FdipLineKey &key) const
+{
+    auto outcome_it = fdipLastOutcomes.find(key);
+    if (outcome_it == fdipLastOutcomes.end()) {
+        return FdipMissAllocPriorClass::ColdOrUnknown;
+    }
+    if (outcome_it->second.outcome == FdipLastOutcome::UsefulDemandHit) {
+        return FdipMissAllocPriorClass::AfterUseful;
+    }
+    return FdipMissAllocPriorClass::AfterUnused;
+}
+
+void
+BaseCache::noteFdipMissAlloc(Addr blkAddr, bool is_secure)
+{
+    const auto key = makeFdipLineKey(blkAddr, is_secure);
+    const auto prior_class = classifyFdipMissAllocPriorClass(key);
+    if (prior_class == FdipMissAllocPriorClass::ColdOrUnknown) {
+        stats.fdipMissAllocColdOrUnknown++;
+    } else if (prior_class == FdipMissAllocPriorClass::AfterUseful) {
+        stats.fdipMissAllocAfterUseful++;
+    } else {
+        stats.fdipMissAllocAfterUnused++;
+    }
+
+    fdipPendingMissAllocs[key] = FdipPendingMissAlloc{prior_class};
+
+    const uint64_t cycle = ticksToCycles(curTick());
+    auto &tracker = fdipMissAllocTrackers[key];
+
+    if (tracker.allocCount > 0) {
+        const uint64_t delta = cycle - tracker.lastAllocCycle;
+        stats.fdipMissAllocRepeat++;
+        stats.fdipMissAllocRepeatDeltaCyclesSum += delta;
+        if (tracker.allocCount == 1) {
+            stats.fdipMissAllocRepeatLines++;
+        }
+
+        if (delta <= 64) {
+            stats.fdipMissAllocRepeatLe64++;
+        } else if (delta <= 256) {
+            stats.fdipMissAllocRepeatLe256++;
+        } else if (delta <= 1024) {
+            stats.fdipMissAllocRepeatLe1K++;
+        } else if (delta <= 4096) {
+            stats.fdipMissAllocRepeatLe4K++;
+        } else if (delta <= 16384) {
+            stats.fdipMissAllocRepeatLe16K++;
+        } else if (delta <= 65536) {
+            stats.fdipMissAllocRepeatLe64K++;
+        } else {
+            stats.fdipMissAllocRepeatGt64K++;
+        }
+    }
+
+    tracker.lastAllocCycle = cycle;
+    ++tracker.allocCount;
+    if (tracker.allocCount > stats.fdipMissAllocMaxAllocsPerLine.value()) {
+        stats.fdipMissAllocMaxAllocsPerLine = tracker.allocCount;
+    }
+}
+
+void
+BaseCache::noteFdipUsefulLifecycle(Addr blkAddr, bool is_secure)
+{
+    const auto key = makeFdipLineKey(blkAddr, is_secure);
+    noteFdipMissAllocEvent(
+        key, stats.fdipMissAllocColdOrUnknownThenUseful,
+        stats.fdipMissAllocAfterUsefulThenUseful,
+        stats.fdipMissAllocAfterUnusedThenUseful, true);
+    fdipLastOutcomes[key] = FdipLastOutcomeRecord{
+        FdipLastOutcome::UsefulDemandHit, ticksToCycles(curTick())};
+}
+
+void
+BaseCache::noteFdipUnusedLifecycle(Addr blkAddr, bool is_secure)
+{
+    const auto key = makeFdipLineKey(blkAddr, is_secure);
+    noteFdipMissAllocEvent(
+        key, stats.fdipMissAllocColdOrUnknownThenUnused,
+        stats.fdipMissAllocAfterUsefulThenUnused,
+        stats.fdipMissAllocAfterUnusedThenUnused, true);
+    fdipLastOutcomes[key] = FdipLastOutcomeRecord{
+        FdipLastOutcome::UnusedEvict, ticksToCycles(curTick())};
+}
+
+void
+BaseCache::noteFdipDroppedLifecycle(Addr blkAddr, bool is_secure)
+{
+    const auto key = makeFdipLineKey(blkAddr, is_secure);
+    noteFdipMissAllocEvent(
+        key, stats.fdipMissAllocColdOrUnknownThenDropped,
+        stats.fdipMissAllocAfterUsefulThenDropped,
+        stats.fdipMissAllocAfterUnusedThenDropped, true);
 }
 
 bool
@@ -1061,6 +1169,11 @@ BaseCache::calReqInterval(PacketPtr pkt)
 {
     RequestorID reqId = pkt->requestorId();
     size_t sliceId = (getActualSliceNum() == 1) ? 0 : getSliceIdx(pkt->getAddr());
+    if (reqId >= prevReqCycles[sliceId].size()) {
+        const size_t new_size = std::max<size_t>(
+            reqId + 1, static_cast<size_t>(system->maxRequestors()));
+        prevReqCycles[sliceId].resize(new_size, Cycles{0});
+    }
     auto& prev = prevReqCycles[sliceId][reqId];
     if (prev == 0) {
         // first request
@@ -1300,6 +1413,8 @@ BaseCache::recvTimingReq(PacketPtr pkt)
             pkt->req->setPFDepth(0);
             if (isL1I() && pkt->isDemand() && isFdipBlk(blk)) {
                 stats.fdipUsefulHits++;
+                noteFdipUsefulLifecycle(regenerateBlkAddr(blk),
+                                        blk->isSecure());
             }
             blk->clearPrefetched();
             first_acc_after_pf = true;
@@ -1657,6 +1772,10 @@ BaseCache::recvTimingResp(PacketPtr pkt)
         if (drop_fdip_refill) {
             stats.fdipEpochMismatch++;
             stats.fdipDroppedRefill++;
+            if (isL1I() && isFdipPkt(pkt)) {
+                noteFdipDroppedLifecycle(pkt->getBlockAddr(blkSize),
+                                         pkt->isSecure());
+            }
             blk = nullptr;
             DPRINTF(Cache,
                     "%s: drop old-path FDIP refill install addr=%#llx "
@@ -2755,14 +2874,26 @@ BaseCache::access(PacketPtr pkt, CacheBlk *&blk, Cycles &lat,
 
         // Calculate access latency based on the need to access the data array
         if (pkt->isRead() || pkt->isWrite()) {
+            const Cycles effective_tag_latency =
+                shouldUseFdipWayHint(pkt, blk) ? Cycles(0) : tag_latency;
             // Read and Write can succeed after the data block is ready if Cache Hit
-            lat = calculateAccessLatency(blk, pkt->headerDelay, tag_latency);
+            lat = calculateAccessLatency(blk, pkt->headerDelay,
+                                         effective_tag_latency);
 
             // When a block is compressed, it must first be decompressed
             // before being read. This adds to the access latency.
             if (compressor) {
                 lat += compressor->getDecompressionLatency(blk);
             }
+
+            if (effective_tag_latency != tag_latency) {
+                DPRINTF(Cache,
+                        "%s: FDIP selected-way hint bypasses L1I tag latency "
+                        "addr=%#lx way=%u orig_tag_lat=%u\n",
+                        __func__, pkt->getAddr(), blk->getWay(),
+                        tag_latency);
+            }
+
         } else {
             lat = calculateTagOnlyLatency(pkt->headerDelay, tag_latency);
         }
@@ -3282,6 +3413,8 @@ BaseCache::invalidateBlock(CacheBlk *blk)
     if (blk->wasPrefetched()) {
         if (isL1I() && isFdipBlk(blk)) {
             stats.fdipUnused++;
+            noteFdipUnusedLifecycle(regenerateBlkAddr(blk),
+                                    blk->isSecure());
         }
         if (prefetcher) {
             prefetcher->prefetchUnused(regenerateBlkAddr(blk),
@@ -4007,18 +4140,68 @@ BaseCache::CacheStats::CacheStats(BaseCache &c)
              "number of unused FDIP-prefetched L1I evictions"),
     ADD_STAT(fdipProbeMerged, statistics::units::Count::get(),
              "number of FDIP probes merged into an existing miss"),
+    ADD_STAT(fdipProbeHit, statistics::units::Count::get(),
+             "number of FDIP tag probes that hit in L1I and avoid miss allocation"),
     ADD_STAT(fdipEpochMismatch, statistics::units::Count::get(),
              "number of FDIP refills dropped for epoch mismatch"),
     ADD_STAT(fdipDroppedRefill, statistics::units::Count::get(),
              "number of FDIP refills dropped at install time"),
     ADD_STAT(fdipRejectedNoPrefetchMSHR, statistics::units::Count::get(),
              "number of FDIP allocations rejected for missing prefetch MSHR credit"),
+    ADD_STAT(fdipMissAlloc, statistics::units::Count::get(),
+             "number of FDIP misses that allocate a real MSHR"),
+    ADD_STAT(fdipMissAllocColdOrUnknown, statistics::units::Count::get(),
+             "number of FDIP miss allocs with no prior FDIP lifecycle outcome"),
+    ADD_STAT(fdipMissAllocAfterUseful, statistics::units::Count::get(),
+             "number of FDIP miss allocs following a prior useful FDIP lifecycle"),
+    ADD_STAT(fdipMissAllocAfterUnused, statistics::units::Count::get(),
+             "number of FDIP miss allocs following a prior unused FDIP lifecycle"),
     ADD_STAT(fdipMissAllocColdOrUnknownThenLate, statistics::units::Count::get(),
              "late FDIP observations after a cold or unknown prior"),
     ADD_STAT(fdipMissAllocAfterUsefulThenLate, statistics::units::Count::get(),
              "late FDIP observations after a useful prior"),
     ADD_STAT(fdipMissAllocAfterUnusedThenLate, statistics::units::Count::get(),
              "late FDIP observations after an unused prior"),
+    ADD_STAT(fdipMissAllocColdOrUnknownThenUseful, statistics::units::Count::get(),
+             "number of cold/unknown FDIP miss allocs later observed as useful"),
+    ADD_STAT(fdipMissAllocColdOrUnknownThenUnused, statistics::units::Count::get(),
+             "number of cold/unknown FDIP miss allocs later observed as unused"),
+    ADD_STAT(fdipMissAllocColdOrUnknownThenDropped, statistics::units::Count::get(),
+             "number of cold/unknown FDIP miss allocs later dropped on refill"),
+    ADD_STAT(fdipMissAllocAfterUsefulThenUseful, statistics::units::Count::get(),
+             "number of after-useful FDIP miss allocs later observed as useful"),
+    ADD_STAT(fdipMissAllocAfterUsefulThenUnused, statistics::units::Count::get(),
+             "number of after-useful FDIP miss allocs later observed as unused"),
+    ADD_STAT(fdipMissAllocAfterUsefulThenDropped, statistics::units::Count::get(),
+             "number of after-useful FDIP miss allocs later dropped on refill"),
+    ADD_STAT(fdipMissAllocAfterUnusedThenUseful, statistics::units::Count::get(),
+             "number of after-unused FDIP miss allocs later observed as useful"),
+    ADD_STAT(fdipMissAllocAfterUnusedThenUnused, statistics::units::Count::get(),
+             "number of after-unused FDIP miss allocs later observed as unused"),
+    ADD_STAT(fdipMissAllocAfterUnusedThenDropped, statistics::units::Count::get(),
+             "number of after-unused FDIP miss allocs later dropped on refill"),
+    ADD_STAT(fdipMissAllocRepeat, statistics::units::Count::get(),
+             "number of repeated FDIP miss allocs on the same physical line"),
+    ADD_STAT(fdipMissAllocRepeatLines, statistics::units::Count::get(),
+             "number of unique physical lines that saw repeated FDIP miss allocs"),
+    ADD_STAT(fdipMissAllocRepeatDeltaCyclesSum, statistics::units::Count::get(),
+             "sum of repeat miss-alloc intervals in cycles"),
+    ADD_STAT(fdipMissAllocMaxAllocsPerLine, statistics::units::Count::get(),
+             "maximum number of FDIP miss allocs observed on one line"),
+    ADD_STAT(fdipMissAllocRepeatLe64, statistics::units::Count::get(),
+             "repeat FDIP miss allocs within 64 cycles"),
+    ADD_STAT(fdipMissAllocRepeatLe256, statistics::units::Count::get(),
+             "repeat FDIP miss allocs within 256 cycles"),
+    ADD_STAT(fdipMissAllocRepeatLe1K, statistics::units::Count::get(),
+             "repeat FDIP miss allocs within 1K cycles"),
+    ADD_STAT(fdipMissAllocRepeatLe4K, statistics::units::Count::get(),
+             "repeat FDIP miss allocs within 4K cycles"),
+    ADD_STAT(fdipMissAllocRepeatLe16K, statistics::units::Count::get(),
+             "repeat FDIP miss allocs within 16K cycles"),
+    ADD_STAT(fdipMissAllocRepeatLe64K, statistics::units::Count::get(),
+             "repeat FDIP miss allocs within 64K cycles"),
+    ADD_STAT(fdipMissAllocRepeatGt64K, statistics::units::Count::get(),
+             "repeat FDIP miss allocs beyond 64K cycles"),
     cmd(MemCmd::NUM_MEM_CMDS)
 {
     for (int idx = 0; idx < MemCmd::NUM_MEM_CMDS; ++idx)

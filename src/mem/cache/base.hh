@@ -52,6 +52,7 @@
 #include <cstdint>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -1480,6 +1481,9 @@ class BaseCache : public ClockedObject, public CacheAccessor
         /** Number of FDIP probes merged into an existing miss. */
         statistics::Scalar fdipProbeMerged;
 
+        /** Number of FDIP probe hits that avoid miss allocation. */
+        statistics::Scalar fdipProbeHit;
+
         /** Number of FDIP refills dropped for epoch mismatch. */
         statistics::Scalar fdipEpochMismatch;
 
@@ -1491,12 +1495,70 @@ class BaseCache : public ClockedObject, public CacheAccessor
 
         /** Late FDIP observations after a cold/unknown prior. */
         statistics::Scalar fdipMissAllocColdOrUnknownThenLate;
-
-        /** Late FDIP observations after a useful prior. */
+        /** Number of after-useful FDIP miss allocs later observed as late. */
         statistics::Scalar fdipMissAllocAfterUsefulThenLate;
-
-        /** Late FDIP observations after an unused prior. */
+        /** Number of after-unused FDIP miss allocs later observed as late. */
         statistics::Scalar fdipMissAllocAfterUnusedThenLate;
+
+        /** Number of FDIP misses that allocate a real MSHR. */
+        statistics::Scalar fdipMissAlloc;
+        /** Number of FDIP miss allocs with no prior FDIP lifecycle outcome. */
+        statistics::Scalar fdipMissAllocColdOrUnknown;
+        /** Number of FDIP miss allocs following a prior useful FDIP lifecycle. */
+        statistics::Scalar fdipMissAllocAfterUseful;
+        /** Number of FDIP miss allocs following a prior unused FDIP lifecycle. */
+        statistics::Scalar fdipMissAllocAfterUnused;
+        /** Number of cold/unknown FDIP miss allocs later observed as useful. */
+        statistics::Scalar fdipMissAllocColdOrUnknownThenUseful;
+        /** Number of cold/unknown FDIP miss allocs later observed as unused. */
+        statistics::Scalar fdipMissAllocColdOrUnknownThenUnused;
+        /** Number of cold/unknown FDIP miss allocs later dropped on refill. */
+        statistics::Scalar fdipMissAllocColdOrUnknownThenDropped;
+        /** Number of after-useful FDIP miss allocs later observed as useful. */
+        statistics::Scalar fdipMissAllocAfterUsefulThenUseful;
+        /** Number of after-useful FDIP miss allocs later observed as unused. */
+        statistics::Scalar fdipMissAllocAfterUsefulThenUnused;
+        /** Number of after-useful FDIP miss allocs later dropped on refill. */
+        statistics::Scalar fdipMissAllocAfterUsefulThenDropped;
+        /** Number of after-unused FDIP miss allocs later observed as useful. */
+        statistics::Scalar fdipMissAllocAfterUnusedThenUseful;
+        /** Number of after-unused FDIP miss allocs later observed as unused. */
+        statistics::Scalar fdipMissAllocAfterUnusedThenUnused;
+        /** Number of after-unused FDIP miss allocs later dropped on refill. */
+        statistics::Scalar fdipMissAllocAfterUnusedThenDropped;
+
+        /** Number of repeated FDIP miss allocs on the same physical line. */
+        statistics::Scalar fdipMissAllocRepeat;
+
+        /** Number of unique physical lines that saw repeated FDIP miss allocs. */
+        statistics::Scalar fdipMissAllocRepeatLines;
+
+        /** Sum of repeat miss-alloc intervals in cycles. */
+        statistics::Scalar fdipMissAllocRepeatDeltaCyclesSum;
+
+        /** Maximum number of FDIP miss allocs observed on one line. */
+        statistics::Scalar fdipMissAllocMaxAllocsPerLine;
+
+        /** Repeat FDIP miss allocs within 64 cycles. */
+        statistics::Scalar fdipMissAllocRepeatLe64;
+
+        /** Repeat FDIP miss allocs within 256 cycles. */
+        statistics::Scalar fdipMissAllocRepeatLe256;
+
+        /** Repeat FDIP miss allocs within 1K cycles. */
+        statistics::Scalar fdipMissAllocRepeatLe1K;
+
+        /** Repeat FDIP miss allocs within 4K cycles. */
+        statistics::Scalar fdipMissAllocRepeatLe4K;
+
+        /** Repeat FDIP miss allocs within 16K cycles. */
+        statistics::Scalar fdipMissAllocRepeatLe16K;
+
+        /** Repeat FDIP miss allocs within 64K cycles. */
+        statistics::Scalar fdipMissAllocRepeatLe64K;
+
+        /** Repeat FDIP miss allocs beyond 64K cycles. */
+        statistics::Scalar fdipMissAllocRepeatGt64K;
 
         /** Per-command statistics */
         std::vector<std::unique_ptr<CacheCmdStats>> cmd;
@@ -1973,6 +2035,7 @@ public:
         auto blk = tags->findBlock(addr, is_secure);
         return blk ? blk->data: nullptr;
     }
+
     private:
     const bool Prefetch_CanOffload;
 };
