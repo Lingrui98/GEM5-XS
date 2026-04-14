@@ -45,7 +45,10 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -82,6 +85,7 @@ namespace gem5
 {
 
 struct BaseO3CPUParams;
+struct CacheAccessor;
 
 namespace o3
 {

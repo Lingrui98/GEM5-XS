@@ -73,6 +73,7 @@
 #include "debug/O3CPU.hh"
 #include "debug/O3PipeView.hh"
 #include "debug/TraceReader.hh"
+#include "mem/cache/base.hh"
 #include "mem/packet.hh"
 #include "params/BaseO3CPU.hh"
 #include "sim/full_system.hh"
@@ -1991,6 +1992,26 @@ Fetch::finishFdipTranslation(const Fault &fault, const RequestPtr &mem_req)
         return;
     }
 
+    if (tryCompleteFdipLineByDirectProbe(pending.tid, pending.lineIndex,
+                                         mem_req)) {
+        fdipPendingReqs.erase(it);
+        return;
+    }
+
+    const auto recent_unused_cycles = dbpbtb->fdipRecentUnusedCycles();
+    if (recent_unused_cycles > 0 && fdipIcacheAccessor &&
+        mem_req->hasPaddr() &&
+        fdipIcacheAccessor->shouldSuppressFdipLine(
+            mem_req->getPaddr(), mem_req->isSecure(),
+            recent_unused_cycles)) {
+        ++fetchStats.fdipFilteredRecentUnused;
+        state.lines[pending.lineIndex].status = FdipFilteredRecentUnused;
+        state.lines[pending.lineIndex].req.reset();
+        finishFdipTargetIfReady(pending.tid);
+        fdipPendingReqs.erase(it);
+        return;
+    }
+
     state.lines[pending.lineIndex].status = FdipReady;
 }
 
@@ -3073,6 +3094,31 @@ Fetch::handleSuccessfulTranslation(ThreadID tid, const RequestPtr &mem_req, Addr
         return;
     }
 
+    if (mem_req->hasPaddr() && dbpbtb->ftqHasFetching(tid)) {
+        FdipProbeHint hint;
+        const Addr phys_line_addr =
+            mem_req->getPaddr() - (mem_req->getPaddr() % cacheBlkSize);
+        noteDemandOnWrongPathFdipLine(tid, phys_line_addr);
+        const auto ftq_id = dbpbtb->ftqHeadId(tid);
+        if (lookupAndConsumeFdipProbeHint(tid, ftq_id, phys_line_addr,
+                                          mem_req->isSecure(), hint)) {
+            Request::XsMetadata xs_meta = mem_req->hasXsMetadata() ?
+                mem_req->getXsMetadata() : Request::XsMetadata();
+            xs_meta.fdipEpoch = hint.epoch;
+            xs_meta.fdipFtqId = hint.ftqId;
+            xs_meta.fdipSelectedWayValid = true;
+            xs_meta.fdipSelectedWay = hint.selectedWay;
+            xs_meta.fdipSelectedWayTick = hint.installTick;
+            mem_req->setXsMetadata(xs_meta);
+
+            DPRINTF(Fetch,
+                    "[tid:%i] FDIP demand consumes way hint: ftqId=%u "
+                    "paddr=%#lx way=%u age=%lu\n",
+                    tid, hint.ftqId, phys_line_addr, hint.selectedWay,
+                    curTick() - hint.installTick);
+        }
+    }
+
     // Build packet here.
     PacketPtr data_pkt = new Packet(mem_req, MemCmd::ReadReq);
     data_pkt->dataDynamic(new uint8_t[fetchBufferSize]);
@@ -3759,6 +3805,7 @@ Fetch::sendInstructionsToDecode()
 
         if (blocked_tid != InvalidThreadID) {
             setAllFetchStalls(stallSig->fetchBlockReason[blocked_tid]);
+            profileStall(blocked_tid);
         }
 
         toDecode->fetchStallReason = stallReason;
@@ -4376,6 +4423,7 @@ Fetch::handleCommitSignals(ThreadID tid)
     clearRedirectPending(tid);
 
     if (mispred_inst) {
+        noteFdipWrongPathTargets(tid, mispred_inst->getFtqId());
         DPRINTF(Fetch, "Use mispred inst to redirect, treating as control squash\n");
         const auto corr_pc = fromCommit->commitInfo[tid].pc->as<RiscvISA::PCState>();
         assert(dbpbtb);
@@ -4384,6 +4432,8 @@ Fetch::handleCommitSignals(ThreadID tid)
                               mispred_inst->getInstBytes(), fromCommit->commitInfo[tid].branchTaken,
                               mispred_inst->seqNum, tid, mispred_inst->getLoopIteration(), true);
     } else if (fromCommit->commitInfo[tid].isTrapSquash) {
+        noteFdipWrongPathTargets(tid,
+                                 fromCommit->commitInfo[tid].squashedTargetId);
         DPRINTF(Fetch, "Treating as trap squash\n", tid);
         const auto trap_pc = fromCommit->commitInfo[tid].pc->as<RiscvISA::PCState>();
         assert(dbpbtb);
@@ -4391,6 +4441,8 @@ Fetch::handleCommitSignals(ThreadID tid)
                            trap_pc, tid, fromCommit->commitInfo[tid].squashedLoopIter);
     } else {
         if (fromCommit->commitInfo[tid].pc && fromCommit->commitInfo[tid].squashedTargetId != 0) {
+            noteFdipWrongPathTargets(
+                tid, fromCommit->commitInfo[tid].squashedTargetId);
             DPRINTF(Fetch, "Squash with stream id and target id from IEW\n");
             const auto nc_pc = fromCommit->commitInfo[tid].pc->as<RiscvISA::PCState>();
             assert(dbpbtb);
@@ -4419,6 +4471,7 @@ Fetch::handleDecodeSquash(ThreadID tid)
         auto mispred_inst = fromDecode->decodeInfo[tid].mispredictInst;
         clearRedirectPending(tid);
         if (fromDecode->decodeInfo[tid].branchMispredict) {
+            noteFdipWrongPathTargets(tid, mispred_inst->getFtqId());
             assert(dbpbtb);
             const auto next_pc =
                 fromDecode->decodeInfo[tid].nextPC->as<RiscvISA::PCState>();
@@ -5175,10 +5228,13 @@ Fetch::profileStall(ThreadID tid)
     } else if (fetchStatus[tid] == Squashing) {
         ++fetchStats.squashCycles;
         DPRINTF(Fetch, "[tid:%i] Fetch is squashing!\n", tid);
-    } else if (threads[tid].cacheReq.getOverallStatus() == CacheWaitResponse) {
+    } else if (threads[tid].cacheReq.getOverallStatus() == CacheWaitResponse ||
+               stallReason[tid] == StallReason::IcacheStall) {
         ++fetchStats.icacheStallCycles;
-        DPRINTF(Fetch, "[tid:%i] Fetch is waiting cache response!\n",
-                tid);
+        DPRINTF(Fetch,
+                "[tid:%i] Fetch is stalled on ICache (cacheStatus=%d, "
+                "stallReason=%d)\n",
+                tid, threads[tid].cacheReq.getOverallStatus(), stallReason[tid]);
     } else if (threads[tid].cacheReq.getOverallStatus() == TlbWait) {
         ++fetchStats.tlbCycles;
         DPRINTF(Fetch, "[tid:%i] Fetch is waiting ITLB walk to "
