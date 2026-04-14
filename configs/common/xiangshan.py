@@ -490,6 +490,8 @@ def _finish_xiangshan_system(args, test_sys, TestCPUClass, ruby):
             args.fdip_flush_partial_on_epoch_change)
         test_sys.cpu[i].branchPred.fdip_drop_refill_on_epoch_mismatch = bool(
             args.fdip_drop_refill_on_epoch_mismatch)
+        test_sys.cpu[i].branchPred.fdip_recent_unused_cycles = int(
+            args.fdip_recent_unused_cycles)
 
     # configure memory related
     if args.mem_type == 'DRAMsim3':

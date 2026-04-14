@@ -1229,3 +1229,5 @@ class DecoupledBPUWithBTB(BranchPredictor):
         True, "Flush FDIP partial per-entry state on redirect/epoch change")
     fdip_drop_refill_on_epoch_mismatch = Param.Bool(
         False, "Drop old-path FDIP refill installation on epoch mismatch")
+    fdip_recent_unused_cycles = Param.Unsigned(
+        0, "Suppress FDIP issue for recently-unused lines for N cycles")

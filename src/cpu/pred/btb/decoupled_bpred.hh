@@ -103,6 +103,7 @@ class DecoupledBPUWithBTB : public BPredUnit
     const unsigned fdipLookaheadEntriesCfg;
     const unsigned fdipIssueBandwidthCfg;
     const unsigned fdipMaxOutstandingCfg;
+    const unsigned fdipRecentUnusedCyclesCfg;
     const bool fdipFlushPartialOnEpochChangeCfg;
     const bool fdipDropRefillOnEpochMismatchCfg;
     const std::string prefetchLinesPerFtqCfg;
@@ -427,6 +428,10 @@ class DecoupledBPUWithBTB : public BPredUnit
     unsigned fdipLookaheadEntries() const { return fdipLookaheadEntriesCfg; }
     unsigned fdipIssueBandwidth() const { return fdipIssueBandwidthCfg; }
     unsigned fdipMaxOutstanding() const { return fdipMaxOutstandingCfg; }
+    unsigned fdipRecentUnusedCycles() const
+    {
+        return fdipRecentUnusedCyclesCfg;
+    }
     bool fdipFlushPartialOnEpochChange() const
     {
         return fdipFlushPartialOnEpochChangeCfg;

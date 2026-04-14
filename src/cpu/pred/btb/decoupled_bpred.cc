@@ -65,6 +65,7 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
       fdipLookaheadEntriesCfg(p.fdip_lookahead_entries),
       fdipIssueBandwidthCfg(p.fdip_issue_bandwidth),
       fdipMaxOutstandingCfg(p.fdip_max_outstanding),
+      fdipRecentUnusedCyclesCfg(p.fdip_recent_unused_cycles),
       fdipFlushPartialOnEpochChangeCfg(p.fdip_flush_partial_on_epoch_change),
       fdipDropRefillOnEpochMismatchCfg(p.fdip_drop_refill_on_epoch_mismatch),
       prefetchLinesPerFtqCfg(p.prefetch_lines_per_ftq),

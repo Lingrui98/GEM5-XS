@@ -776,3 +776,9 @@ def addXiangshanFDIPOptions(parser):
         default=False,
         help="Drop old-path FDIP refill installation on epoch mismatch",
     )
+    parser.add_argument(
+        "--fdip-recent-unused-cycles",
+        type=int,
+        default=0,
+        help="Suppress FDIP issue for recently-unused lines for N cycles (default: 0)",
+    )
