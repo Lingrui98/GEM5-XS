@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 1
-- **Last Active**: 2026-04-13
+- **Total Sessions**: 2
+- **Last Active**: 2026-04-17
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~56 | Active |
+| `journal-1.md` | ~105 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 2 | 2026-04-17 | Wave-1 IPF runtime skeleton | `e419db4428` | `ipf-research-framework-wave1` |
 | 1 | 2026-04-13 | PR 805 owner-migration simplification, docs, and CI fix | `6cef98f253`, `546514ed09`, `94bd711647` | `review-owner-migration-simplification` |
 <!-- @@@/auto:session-history -->
 

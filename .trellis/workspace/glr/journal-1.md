@@ -54,3 +54,52 @@ Simplified split-control owner migration on top of PR #805, refreshed frontend d
 ### Next Steps
 
 - None - task complete
+
+
+## Session 2: Wave-1 IPF runtime skeleton
+
+**Date**: 2026-04-17
+**Task**: Wave-1 IPF runtime skeleton
+**Branch**: `ipf-research-framework-wave1`
+
+### Summary
+
+(Add summary)
+
+### Main Changes
+
+| Area | Result |
+|------|--------|
+| Runtime | Added the Wave-1 O3 instruction-prefetch runtime skeleton with normalized fetch/trace demand observers, null policy, submit queue, and scoreboard skeleton |
+| Config | Wired XiangShan CLI knobs for `enableInstPrefetchRuntime`, policy, queue size, and issue width |
+| Validation | Built `build/RISCV/gem5.opt`, passed `build/NULL/cpu/o3/inst_prefetch.test.opt`, and validated both trace-path and FS/XiangShan fetch-path stats |
+| Docs | Added English/Chinese runtime docs and updated backend code-spec/contracts |
+
+**Validation Evidence**:
+- `build/NULL/cpu/o3/inst_prefetch.test.opt` passed (3 tests)
+- `/tmp/ipf_trace_smoke/stats.txt`: `demandBlocksFromTrace = 4`
+- `/tmp/ipf_fs_smoke/stats.txt`: `demandBlocksFromFetch = 2386`
+
+**Notes**:
+- The root-repo Trellis task `04-02-openspec-add-instruction-prefetch-research-framework` was archived after code commit because the Wave-1 scope is complete.
+- Per research policy, SE-based timing validation is not counted as closeout evidence.
+- `openspec validate add-instruction-prefetch-research-framework --strict` remains externally blocked in this root worktree because the local openspec change entry is absent.
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `e419db4428` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
