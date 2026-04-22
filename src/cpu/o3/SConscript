@@ -168,6 +168,8 @@ if env['CONF']['TARGET_ISA'] == 'null':
           '../../sim/sim_object.cc',
           '../../sim/globals.cc',
           '../../sim/tags.cc')
+    GTest('fdip_cleanup.test',
+          'fdip_cleanup.test.cc')
     GTest('champsim_trace_reader.test',
           'trace/ChampSimTraceReader.test.cc',
           'trace/TraceReader.cc',
@@ -285,6 +287,8 @@ else:
           '../../sim/tags.cc',
           '../../sim/root.cc',
           with_tag('gem5 trace'))
+    GTest('fdip_cleanup.test',
+          'fdip_cleanup.test.cc')
     GTest('champsim_trace_reader.test',
           'trace/ChampSimTraceReader.test.cc',
           'trace/TraceReader.cc',
