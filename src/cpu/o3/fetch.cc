@@ -554,8 +554,7 @@ Fetch::clearStates(ThreadID tid)
     delayedCommit[tid] = false;
     threads[tid].cacheReq.reset();
     threads[tid].reset();
-    resetFdipState(tid);
-    resetFdipProbeHints(tid);
+    resetFdipPartialState(tid);
     resetFdipTracking(tid);
     fdipEpoch[tid] = 0;
     fetchQueue[tid].clear();
@@ -589,8 +588,7 @@ Fetch::resetStage()
         threads[tid].cacheReq.reset();
 
         threads[tid].reset();
-        resetFdipState(tid);
-        resetFdipProbeHints(tid);
+        resetFdipPartialState(tid);
         resetFdipTracking(tid);
         fdipEpoch[tid] = 0;
         ftqEntryFetchedInsts[tid] = 0;
@@ -613,6 +611,15 @@ Fetch::resetStage()
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
         dbpbtb->resetPC(tid, threads[tid].fetchpc->instAddr());
     }
+}
+
+void
+Fetch::resetFdipPartialState(ThreadID tid)
+{
+    const auto summary = cleanupFdipPartialState(
+        tid, fdipState[tid], fdipPendingReqs, fdipProbeHints[tid],
+        fdipOutstandingLines);
+    fdipOutstandingLines = summary.outstandingLines;
 }
 
 void
@@ -1929,8 +1936,7 @@ Fetch::doSquash(PCStateBase &new_pc, const DynInstPtr squashInst, const InstSeqN
     // Reset the cache request after cancelling
     threads[tid].cacheReq.reset();
     ++fdipEpoch[tid];
-    resetFdipState(tid);
-    resetFdipProbeHints(tid);
+    resetFdipPartialState(tid);
 
     // Drop any retry packets that belong to this squashed thread.
     for (auto it = retryPkt.begin(); it != retryPkt.end();) {
