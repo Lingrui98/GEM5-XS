@@ -103,3 +103,52 @@ Simplified split-control owner migration on top of PR #805, refreshed frontend d
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: FDIP P0/P1 stabilization cut on sub-worktree
+
+**Date**: 2026-04-23
+**Task**: FDIP P0/P1 stabilization cut on sub-worktree
+**Branch**: `fdip-phase2-xsdev`
+
+### Summary
+
+Recorded the completed FDIP stabilization cut from the fdip-phase2-xsdev worktree, archived the Trellis task, and captured validation/results/stop recommendation in root Trellis.
+
+### Main Changes
+
+| Area | Result |
+|------|--------|
+| Worktree | Work was implemented in sub-worktree `.worktrees/fdip-phase2-xsdev`, but recorded into root repo Trellis (`~/project/GEM5/.trellis/`). |
+| Task lifecycle | Archived `04-02-openspec-add-fdip-icache-prefetch` after code and validation were complete for the Trellis-defined P0/P1 scope. |
+| Commits | `917eb08d37` predictor/config semantics, `5925a5da8c` cache contract/refill gating, `ce57b30b6c` fetch engine/probe/tracking, `f02d1a1f62` redirect/partial-state cleanup witness. |
+| Validation | Passed `openspec validate add-fdip-icache-prefetch --strict`, `scons build/RISCV/gem5.opt -j8`, `build/RISCV/cpu/pred/btb/test/fetch_coverage.test.opt`, and `build/RISCV/cpu/o3/fdip_cleanup.test.opt`. |
+| Performance evidence | `srv67` 5M: IPC `+0.39%`; `crypto14`: `fetch.icacheStallCycles 35513 -> 27065`; `compute_int_32`: `12778 -> 6187`. |
+| Cleanup | Emptied repo-local `.tmp/` and moved prior transient artifacts out of the repo so the task no longer depends on temporary directories. |
+| Trellis knowledge | Added/updated root Trellis notes: `fdip-p0-analysis-2026-04-13.md`, `fdip-slice-status-2026-04-14.md`, `fdip-cleanup-witness-2026-04-22.md`, `fdip-params-stats-limitations-2026-04-22.md`, and backend spec `fdip-guidelines.md`. |
+| Decision | Recommended stopping at Phase 1 / 1.5 for this task because the remaining gaps are mainly deeper RTL-fidelity work, not blockers for the current P0/P1 conclusions. |
+
+**Key conclusion**:
+The FDIP task is complete for the Trellis-owned P0/P1 stabilization scope. The current model now has parameter/stats documentation, two high-I$ sanity traces, old-path refill-drop evidence, recent-unused suppression evidence, and a helper-level redirect/partial-state cleanup witness.
+
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `917eb08d37` | (see git log) |
+| `5925a5da8c` | (see git log) |
+| `ce57b30b6c` | (see git log) |
+| `f02d1a1f62` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
