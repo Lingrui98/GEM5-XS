@@ -1,0 +1,8 @@
+{"file": ".agents/skills/finish-work/SKILL.md", "reason": "Finish work checklist"}
+{"file": ".agents/skills/check/SKILL.md", "reason": "Code quality check spec"}
+{"file": ".agents/skills/check-cross-layer/SKILL.md", "reason": "Cross-layer verification for fetch/bpu/cache/request changes"}
+{"file": ".trellis/spec/backend/control-pc-contracts.md", "reason": "Control-PC witness requirements and config contracts"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Cross-layer verification checklist"}
+{"file": ".trellis/tasks/04-02-openspec-add-fdip-icache-prefetch/prd.md", "reason": "Task-local validation scope and stop rules"}
+{"file": ".worktrees/fdip-phase2-xsdev/openspec/changes/add-fdip-icache-prefetch/tasks.md", "reason": "Canonical OpenSpec validation checklist"}
+{"file": ".worktrees/fdip-phase2-xsdev/openspec/changes/add-fdip-icache-prefetch/validation/", "type": "directory", "reason": "Canonical validation manifests and artifacts"}

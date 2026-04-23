@@ -1,0 +1,19 @@
+{"file": ".trellis/workflow.md", "reason": "Project workflow and conventions"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend development guide"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "File placement and package conventions"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Validation and code-quality expectations"}
+{"file": ".trellis/spec/backend/control-pc-contracts.md", "reason": "Control-PC and owner-migration contracts that FDIP must respect"}
+{"file": ".trellis/spec/guides/index.md", "reason": "Shared thinking guides index"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Cross-layer checklist for fetch/bpu/cache/request changes"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Reuse and boundary guidance for shared helpers"}
+{"file": ".trellis/workspace/glr/wave1-execution-checklists-2026-04-13.md", "reason": "Wave-1 kickoff plan and isolation boundaries"}
+{"file": ".trellis/tasks/04-02-openspec-add-fdip-icache-prefetch/prd.md", "reason": "Task-local status snapshot, ownership, and stop rules"}
+{"file": ".worktrees/fdip-phase2-xsdev/openspec/changes/add-fdip-icache-prefetch/proposal.md", "reason": "Canonical OpenSpec proposal"}
+{"file": ".worktrees/fdip-phase2-xsdev/openspec/changes/add-fdip-icache-prefetch/tasks.md", "reason": "Canonical OpenSpec checklist"}
+{"file": ".worktrees/fdip-phase2-xsdev/openspec/changes/add-fdip-icache-prefetch/design.md", "reason": "Canonical OpenSpec design"}
+{"file": ".worktrees/fdip-phase2-xsdev/openspec/changes/add-fdip-icache-prefetch/specs/", "type": "directory", "reason": "Canonical OpenSpec delta specs"}
+{"file": ".worktrees/fdip-phase2-xsdev/openspec/changes/add-fdip-icache-prefetch/validation/", "type": "directory", "reason": "Canonical validation manifests and artifacts"}
+{"file": ".worktrees/fdip-phase2-xsdev/src/cpu/o3/fetch.cc", "reason": "Primary FDIP scheduler and state machine"}
+{"file": ".worktrees/fdip-phase2-xsdev/src/cpu/o3/fetch.hh", "reason": "FDIP state, stats, and ownership declarations"}
+{"file": ".worktrees/fdip-phase2-xsdev/src/cpu/pred/btb/decoupled_bpred.hh", "reason": "FDIP predictor-facing knobs and FTQ helper APIs"}
+{"file": ".worktrees/fdip-phase2-xsdev/src/mem/cache/base.cc", "reason": "Cache-side gating, refill handling, and FDIP feedback accounting"}

@@ -210,7 +210,8 @@ python3 ./.trellis/scripts/task.py create "<title>" --slug <task-name>
        Format: feat/fix/docs/refactor/test/chore
 
 5. Record session (one command)
-   --> python3 ./.trellis/scripts/add_session.py --title "Title" --commit "hash"
+   --> Main/root worktree: python3 ./.trellis/scripts/add_session.py --title "Title" --commit "hash"
+   --> Child `.worktrees/<name>`: prepare a handoff, then use `trellis-root-record-session` from the main/root worktree
 ```
 
 ### Code Quality Checklist
@@ -244,11 +245,24 @@ This automatically:
 3. Appends session content
 4. Updates index.md (sessions count, history table)
 
+### Parallel `.worktrees/*` Rule
+
+When using internal `.worktrees/<name>` child worktrees for parallel execution:
+
+1. The main/root worktree is the canonical Trellis ledger.
+2. Child worktrees may use local `.current-task` for context, but they should
+   not be the final source of truth for `.trellis/workspace/` journals or task
+   archiving.
+3. Child worktrees should hand off task/branch/commit/summary/test evidence
+   back to the main/root worktree, then use `trellis-root-record-session`.
+4. Run `python3 ./.trellis/scripts/add_session.py ...` in the main/root
+   worktree before `python3 ./.trellis/scripts/task.py archive <task-name>`.
+
 ### Pre-end Checklist
 
 Use `/trellis:finish-work` command to run through:
 1. [OK] All code committed, commit message follows convention
-2. [OK] Session recorded via `add_session.py`
+2. [OK] Session recorded via `add_session.py` in the canonical ledger worktree
 3. [OK] No lint/test errors
 4. [OK] Working directory clean (or WIP noted)
 5. [OK] Spec docs updated if needed
