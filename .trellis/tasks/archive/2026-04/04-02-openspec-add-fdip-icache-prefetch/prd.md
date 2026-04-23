@@ -73,9 +73,24 @@ Canonical source: `.worktrees/fdip-phase2-xsdev/openspec/changes/add-fdip-icache
 - Alternate variants tracked: 4
 
 ## Current Status Snapshot
-- Branch head already contains baseline plumbing and L1I miss gating.
-- The active worktree is dirty and must be converged before adding more logic.
-- This is now a stabilization and slicing task, not a greenfield implementation task.
+- Branch head now includes baseline plumbing plus the current P0/P1 stabilization stack.
+- The previously dirty worktree has been cut into three reviewable commits:
+  - `917eb08d37` `cpu,cpu-o3,tests: Tighten FDIP predictor semantics`
+  - `5925a5da8c` `mem-cache,cpu-o3: Add FDIP cache contract and refill gating`
+  - `ce57b30b6c` `cpu-o3: Extend FDIP fetch engine with probe and tracking`
+- Main-worktree validation for this stack has completed:
+  - `openspec validate add-fdip-icache-prefetch --strict`
+  - `scons build/RISCV/gem5.opt -j8`
+  - `build/RISCV/cpu/pred/btb/test/fetch_coverage.test.opt`
+  - focused `srv67` smoke / 5M
+  - high-I$ sanity on `crypto14` and `compute_int_32`
+- This remains a stabilization and slicing task, not a greenfield implementation task.
+
+## Current Remaining Gaps
+
+1. Consolidate parameter/stats/limitations documentation into Trellis-owned notes or promoted docs.
+2. Decide whether to stop at Phase 1 / 1.5 or continue to optional deeper RTL-alignment work.
+3. Investigate why `system.cpu.iew.fetchStallReason::IcacheStall` still stays at zero while `system.cpu.fetch.icacheStallCycles` now moves correctly in trace mode.
 
 ## Worktree Lock
 - Branch: `fdip-phase2-xsdev`
