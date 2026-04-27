@@ -86,11 +86,28 @@ Canonical source: `.worktrees/fdip-phase2-xsdev/openspec/changes/add-fdip-icache
   - high-I$ sanity on `crypto14` and `compute_int_32`
 - This remains a stabilization and slicing task, not a greenfield implementation task.
 
-## Current Remaining Gaps
+## Closeout Status
 
-1. Consolidate parameter/stats/limitations documentation into Trellis-owned notes or promoted docs.
-2. Decide whether to stop at Phase 1 / 1.5 or continue to optional deeper RTL-alignment work.
-3. Investigate why `system.cpu.iew.fetchStallReason::IcacheStall` still stays at zero while `system.cpu.fetch.icacheStallCycles` now moves correctly in trace mode.
+Completed for the Trellis-owned P0/P1 stabilization scope on 2026-04-27.
+
+Validation refreshed during closeout:
+
+- `openspec validate add-fdip-icache-prefetch --strict`
+- `scons build/RISCV/gem5.opt USE_SYSTEMC=no -j8`
+- `scons build/RISCV/cpu/o3/fdip_cleanup.test.opt --unit-test -j8`
+- `build/RISCV/cpu/o3/fdip_cleanup.test.opt`
+- `scons build/RISCV/cpu/pred/btb/test/fetch_coverage.test.opt --unit-test -j8`
+- `build/RISCV/cpu/pred/btb/test/fetch_coverage.test.opt`
+
+Remaining non-blocking follow-up:
+
+1. Optional deeper RTL-alignment phases remain out of scope for this cut.
+2. `system.cpu.iew.fetchStallReason::IcacheStall` still stays at zero while
+   `system.cpu.fetch.icacheStallCycles` moves correctly in trace mode; this is
+   documented as a current limitation rather than a closeout blocker.
+3. Full SystemC-enabled `gem5.opt` rebuild hit an existing SCons node conflict
+   around `src/systemc/ext/systemc`; FDIP/O3/BTB/cache compile coverage was
+   refreshed with `USE_SYSTEMC=no`.
 
 ## Worktree Lock
 - Branch: `fdip-phase2-xsdev`
