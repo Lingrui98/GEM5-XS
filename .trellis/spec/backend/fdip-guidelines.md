@@ -31,6 +31,130 @@ paper-faithful or RTL-complete future design.
 
 ---
 
+## Implementation Data Flow / 实现数据流
+
+<img src="./assets/fdip-data-flow.svg" alt="FDIP data flow" width="100%">
+
+当前实现是 Phase 1 / 1.5 的 **FTQ-directed ICache prefetch**：它从
+FTQ 的 runahead / prefetch target 读取预测窗口，尽力提前把对应 ICache
+line 送入 memory/cache 路径。它不是完整 RTL 对齐或论文 faithful 的 future
+design；FDIP 只影响 best-effort 性能路径，demand fetch 仍是 correctness
+path。
+
+上图是默认阅读入口：蓝色主线描述当前 FDIP best-effort prefetch path，
+绿色主线保留 demand fetch 的 correctness path，紫色虚线是 direct probe /
+selected-way hint，橙色虚线是 redirect / epoch cleanup，红色虚线表示 epoch
+mismatch 后的 old-path FDIP refill drop。编号 1-7 对应下方关键步骤；图内只放
+英文代码标识以降低 SVG 字体依赖，语义以本节文字为准。
+
+<details>
+<summary>Editable source / Mermaid fallback</summary>
+
+### 主数据流
+
+```mermaid
+flowchart LR
+  subgraph Control["control path: BPU / FTQ"]
+    BPU["BPU / DecoupledBPUWithBTB"]
+    FTQ["FTQ\nfetchptr + prefetchptr"]
+    Target["FetchTarget\nstartPC / predEndPC / ftqId"]
+    BPU --> FTQ --> Target
+  end
+
+  subgraph FetchLane["FDIP prefetch request path: Fetch"]
+    Run["Fetch::runFdip(tid)\npeek prefetchptr"]
+    Cover["computeFdipLineAddrs(...)\nactual fetch coverage"]
+    Meta["Request::XsMetadata\nfdipEpoch / fdipFtqId / fdipStartPC"]
+    Issue["startFdipTranslation\nfinishFdipTranslation\nissueFdipReadyLine"]
+    Run --> Cover --> Meta --> Issue
+  end
+
+  subgraph MemoryLane["MMU + BaseCache path"]
+    MMU["MMU translation"]
+    Cache["BaseCache / L1I\nFDIP-scoped request"]
+    Refill["FDIP refill / completion"]
+    Stats["processFdipCompletion\nuseful / late / unused / drop stats"]
+    MMU --> Cache --> Refill --> Stats
+  end
+
+  subgraph ProbeLane["direct probe / selected-way hint path"]
+    Probe["direct probe hit\nno real miss allocation"]
+    Hint["fdipSelectedWayValid\nfdipSelectedWay / tick"]
+    Probe --> Hint
+  end
+
+  Target --> Run
+  Issue --> MMU
+  Cache -.-> Probe
+  Hint -.-> Stats
+
+  Demand["Demand fetch\ncorrectness path"] --> Cache
+```
+
+### Redirect / Epoch 清理图
+
+```mermaid
+flowchart LR
+  Redirect["redirect / squash / reset"]
+
+  subgraph FTQClean["control cleanup"]
+    Squash["FTQ::squashAfter(...)"]
+    PrefetchState["fetchptr / prefetchptr\nfinishPrefetchTarget state"]
+  end
+
+  subgraph FetchClean["FDIP local cleanup"]
+    Partial["partial FDIP state"]
+    Pending["pending requests\noutstanding accounting"]
+    Hints["per-thread probe hints"]
+  end
+
+  subgraph RefillDrop["refill/drop path"]
+    Epoch["fdipEpoch mismatch"]
+    Drop["shouldDropFdipRefill(...)\ndrop old-path FDIP refill"]
+  end
+
+  Redirect -.-> Squash -.-> PrefetchState
+  Redirect -.-> Partial -.-> Pending -.-> Hints
+  Redirect -.-> Epoch -.-> Drop
+```
+
+</details>
+
+### 关键步骤
+
+- `BPU / FTQ` 产生 `FetchTarget`，`fetchptr` 驱动 demand fetch，
+  `prefetchptr` 暴露给 FDIP runahead 使用。
+- `Fetch::runFdip(tid)` 只查看 `prefetchptr` 对应的 future target，并受
+  `fdip_issue_bandwidth`、`fdip_max_outstanding` 等 best-effort 约束限制。
+- `computeFdipLineAddrs(...)` 按 demand fetch 相同的 actual fetch coverage
+  计算 cacheline，边界 line 只有在真实 fetch 覆盖到时才纳入。
+- `Request::XsMetadata` 携带 `fdipEpoch`、`fdipFtqId`、`fdipStartPC`，并在
+  direct probe 命中时携带 `fdipSelectedWay*` hint。
+- FDIP request 经过 `startFdipTranslation` / `finishFdipTranslation` 后进入
+  MMU + `BaseCache`；cache 侧只把这些策略作用在 FDIP-scoped request 上。
+- direct probe 可在命中时形成 selected-way hint 或完成 FDIP line，避免把
+  旁路命中误建模成真实 miss allocation。
+- redirect / squash 通过 epoch 与 per-thread cleanup 清理 partial state、
+  pending request、outstanding accounting 和 probe hint；epoch mismatch 的旧路径
+  FDIP refill 由 `shouldDropFdipRefill(...)` 丢弃。
+
+### 读图约定 / Legend
+
+- 蓝色实线：主 FDIP prefetch path，表示 FTQ-directed best-effort request 从
+  `prefetchptr` 到 MMU / L1I / stats 的路径。
+- 绿色实线：demand correctness path，表示 `fetchptr` 驱动的 architectural
+  demand fetch；FDIP 不得改变该路径的正确性。
+- 紫色虚线：direct probe / selected-way hint path，表示 FDIP-scoped bypass
+  或 hint，不代表真实 miss allocation。
+- 橙色虚线：redirect / epoch cleanup path，表示 squash/reset 后的 partial
+  state、pending request、outstanding accounting 与 probe hint 清理。
+- 红色虚线：old-path refill drop，表示 `fdipEpoch` mismatch 且 drop policy
+  开启时，旧路径 FDIP refill 不安装进 L1I。
+- 编号 1-7：对应“关键步骤”的维护契约边界；图中节点不是逐函数调用栈，新增实现
+  应优先保持这些边界清晰。
+
+---
+
 ## Scenario: Current FDIP Runtime Contract
 
 ### 1. Scope / Trigger
