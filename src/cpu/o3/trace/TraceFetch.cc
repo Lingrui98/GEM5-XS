@@ -431,6 +431,29 @@ TraceFetch::maybeStallFetch(ThreadID tid)
     return false;
 }
 
+Addr
+TraceFetch::getControlPCView(ThreadID tid, Addr fallbackPC)
+{
+    if (!traceMode || !traceReader) {
+        return fallbackPC;
+    }
+    if (fetch.isDecoupledFrontend() && traceEnableWrongPath &&
+        traceWrongPathActive) {
+        return fallbackPC;
+    }
+
+    ensureTraceStreamFilled(tid, 1);
+    if (traceExpectedStream[tid].empty()) {
+        return fallbackPC;
+    }
+
+    const Addr trace_pc = traceExpectedStream[tid].front().getPC();
+    DPRINTF(Fetch,
+            "[tid:%i] Trace control-PC view override: fallback=0x%llx trace=0x%llx\n",
+            tid, (unsigned long long)fallbackPC, (unsigned long long)trace_pc);
+    return trace_pc;
+}
+
 void
 TraceFetch::ensureTraceStreamFilled(ThreadID tid, size_t min_count)
 {
@@ -509,8 +532,13 @@ TraceFetch::supplyTraceToDecoder(ThreadID tid, const PCStateBase &this_pc,
     auto *dec_ptr = fetch.decoder[tid];
     memcpy(dec_ptr->moreBytesPtr(), &machInst, sizeof(machInst));
     fetch.decoder[tid]->moreBytes(this_pc, instrPC);
+    auto &fetch_pc = fetch.pc[tid]->as<RiscvISA::PCState>();
+    fetch_pc.set(instrPC);
     fetch.fetchBuffer[tid].startPC = instrPC;
     fetch.fetchBuffer[tid].valid = true;
+    DPRINTF(Fetch,
+            "[tid:%i] Trace on-demand: sync fetch PC to 0x%llx before decode\n",
+            tid, (unsigned long long)instrPC);
     DPRINTF(Fetch, "[tid:%i] Trace on-demand: %s at PC=0x%llx\n",
             tid, tag, (unsigned long long)instrPC);
 }

@@ -849,6 +849,55 @@ Fetch::lookupAndUpdateNextPC(const DynInstPtr &inst, PCStateBase &next_pc)
     //  BP  =>  FSQ  =>  FTB  => Fetch
     ThreadID tid = inst->threadNumber;
     if (isDecoupledFrontend()) {
+        const Addr current_pc = next_pc.instAddr();
+        bool target_avail = false;
+        bool target_covers_pc = false;
+        auto targetCoversPC = [current_pc](Addr start, Addr end) {
+            return start <= current_pc && current_pc < end;
+        };
+
+        if (isStreamPred()) {
+            target_avail = dbsp->fetchTargetAvailable();
+            if (target_avail) {
+                const auto &ftq = dbsp->getSupplyingFetchTarget();
+                target_covers_pc = targetCoversPC(ftq.startPC, ftq.endPC);
+            }
+        } else if (isFTBPred()) {
+            target_avail = dbpftb->fetchTargetAvailable();
+            if (target_avail) {
+                const auto &ftq = dbpftb->getSupplyingFetchTarget();
+                target_covers_pc = targetCoversPC(ftq.startPC, ftq.endPC);
+            }
+        } else if (isBTBPred()) {
+            target_avail = dbpbtb->fetchTargetAvailable();
+            if (target_avail) {
+                const auto &ftq = dbpbtb->getSupplyingFetchTarget();
+                target_covers_pc = targetCoversPC(ftq.startPC, ftq.endPC);
+            }
+        }
+
+        if (isTraceMode() && traceFetch && traceFetch->wrongPathActive() &&
+            (!target_avail || !target_covers_pc)) {
+            DPRINTF(Fetch,
+                    "[tid:%i] Trace wrong-path rescue: pc=%#lx "
+                    "target_avail=%d target_covers=%d, "
+                    "bypass decoupledPredict\n",
+                    tid, current_pc, target_avail, target_covers_pc);
+            if (isStreamPred()) {
+                dbsp->resetPC(current_pc);
+            } else if (isFTBPred()) {
+                dbpftb->resetPC(current_pc);
+            } else if (isBTBPred()) {
+                dbpbtb->resetPC(current_pc);
+            }
+            usedUpFetchTargets = true;
+            fetchBuffer[tid].valid = false;
+            inst->staticInst->advancePC(next_pc);
+            inst->setPredTarg(next_pc);
+            inst->setPredTaken(false);
+            return false;
+        }
+
         if (isStreamPred()) {
             std::tie(predict_taken, usedUpFetchTargets) =
                 dbsp->decoupledPredict(
@@ -1515,15 +1564,52 @@ Fetch::updateBranchPredictors()
     // 对 decoupled 前端：优先使用 fetchBuffer 中的起始 PC；
     // 对非 decoupled 前端：使用架构 PC。
     Addr bp_pc = pc[0]->instAddr();
-    if (isDecoupledFrontend() && fetchBuffer[0].valid) {
+    if (!isTraceMode() && isDecoupledFrontend() && fetchBuffer[0].valid) {
         bp_pc = fetchBuffer[0].startPC;
     }
+    bp_pc = getDecoupledDemandPC(0, bp_pc);
     DPRINTF(Fetch, "Updating branch predictors with PC 0x%lx\n", bp_pc);
     DPRINTF(Fetch, "pc[0]->instAddr %#lx, fetchBuffer[0].startPC %#lx\n",
             pc[0]->instAddr(), fetchBuffer[0].startPC);
 
     bool supplied = false;
     if (isDecoupledFrontend()) {
+        if (isTraceMode() && hasPendingCacheRequests(0) && !usedUpFetchTargets) {
+            DPRINTF(Fetch,
+                    "Trace mode: skip decoupled predictor update while icache request is pending (pc=0x%lx)\n",
+                    bp_pc);
+            return;
+        }
+
+        bool trace_need_resync = false;
+        if (isTraceMode()) {
+            trace_need_resync = usedUpFetchTargets;
+            if (!hasPendingCacheRequests(0)) {
+                trace_need_resync |= (bp_pc != pc[0]->instAddr());
+                if (isFTBPred()) {
+                    trace_need_resync |= (dbpftb->getEnqueuePC() != bp_pc);
+                } else if (isBTBPred()) {
+                    trace_need_resync |= (dbpbtb->getEnqueuePC() != bp_pc);
+                }
+            }
+        }
+
+        if (trace_need_resync) {
+            DPRINTF(Fetch,
+                    "Trace mode: reset decoupled BPU PC view from 0x%lx to 0x%lx (usedUpFetchTargets=%d)\n",
+                    pc[0]->instAddr(), bp_pc, usedUpFetchTargets);
+            if (isStreamPred()) {
+                assert(dbsp);
+                dbsp->resetPC(bp_pc);
+            } else if (isFTBPred()) {
+                assert(dbpftb);
+                dbpftb->resetPC(bp_pc);
+            } else if (isBTBPred()) {
+                assert(dbpbtb);
+                dbpbtb->resetPC(bp_pc);
+            }
+        }
+
         if (isStreamPred()) {
             assert(dbsp);
             dbsp->tick();
@@ -1558,6 +1644,17 @@ Fetch::updateBranchPredictors()
             }
         }
     }
+}
+
+Addr
+Fetch::getDecoupledDemandPC(ThreadID tid, Addr fallback_pc)
+{
+    if (!isTraceMode()) {
+        return fallback_pc;
+    }
+
+    assert(traceFetch);
+    return traceFetch->getControlPCView(tid, fallback_pc);
 }
 
 bool
@@ -2540,13 +2637,14 @@ Fetch::getNextFTQStartPC(ThreadID tid)
 
         bool in_loop = false;
         bool got_target = false;
+        const Addr demand_pc = getDecoupledDemandPC(tid, pc[tid]->instAddr());
 
         if (isBTBPred()) {
-            got_target = dbpbtb->trySupplyFetchWithTarget(pc[tid]->instAddr(), in_loop);
+            got_target = dbpbtb->trySupplyFetchWithTarget(demand_pc, in_loop);
         } else if (isFTBPred()) {
-            got_target = dbpftb->trySupplyFetchWithTarget(pc[tid]->instAddr(), in_loop);
+            got_target = dbpftb->trySupplyFetchWithTarget(demand_pc, in_loop);
         } else if (isStreamPred()) {
-            got_target = dbsp->trySupplyFetchWithTarget(pc[tid]->instAddr());
+            got_target = dbsp->trySupplyFetchWithTarget(demand_pc);
         }
 
         if (got_target) {

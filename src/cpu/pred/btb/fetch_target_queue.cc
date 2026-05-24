@@ -136,25 +136,29 @@ FetchTargetQueue::trySupplyFetchWithTarget(Addr fetch_demand_pc, bool &in_loop)
         // Try to find the target in the queue
         auto it = ftq.find(fetchDemandTargetId);
         if (it != ftq.end()) {
-            // Special case: fetch PC is already past the end of this target
-            if (M5_UNLIKELY(fetch_demand_pc >= it->second.endPC)) {
-                // In this case, we should just finish the current target
-                // and supply the fetch with the next one
+            while (it != ftq.end()) {
+                const bool invalid_range = it->second.startPC >= it->second.endPC;
+                const bool demand_past_end = fetch_demand_pc >= it->second.endPC;
+                if (!invalid_range && !demand_past_end) {
+                    break;
+                }
+
                 DPRINTF(DecoupleBP,
                         "Skip ftq entry %lu: [%#lx, %#lx),", it->first,
                         it->second.startPC, it->second.endPC);
 
-                ++fetchDemandTargetId;  // Move to next target
-                it = ftq.erase(it);  // Remove current target
+                ++fetchDemandTargetId;
+                it = ftq.erase(it);
                 if (it == ftq.end()) {
-                    // No next target available
                     in_loop = false;
                     return false;
                 }
+
                 DPRINTFR(DecoupleBP,
-                        " use %lu: [%#lx, %#lx) instead. because demand pc "
-                        "past the first entry.\n",
-                        it->first, it->second.startPC, it->second.endPC);
+                        " use %lu: [%#lx, %#lx) instead. because %s.\n",
+                        it->first, it->second.startPC, it->second.endPC,
+                        invalid_range ? "entry range is invalid"
+                                      : "demand pc past the first entry");
             }
 
             // Update supply state with found target
@@ -220,6 +224,32 @@ FetchTargetQueue::enqueue(FtqEntry entry)
             fetchTargetEnqState.nextEnqTargetId, entry.startPC, entry.fsqID);
     ftq[fetchTargetEnqState.nextEnqTargetId] = entry;
     ++fetchTargetEnqState.nextEnqTargetId;
+}
+
+void
+FetchTargetQueue::discardPending(FetchStreamId new_enq_stream_id, Addr new_enq_pc)
+{
+    FetchTargetId first_pending_id = fetchDemandTargetId;
+    if (supplyFetchTargetState.valid &&
+        supplyFetchTargetState.targetId == fetchDemandTargetId) {
+        first_pending_id = fetchDemandTargetId + 1;
+    } else {
+        supplyFetchTargetState.valid = false;
+        supplyFetchTargetState.entry = nullptr;
+    }
+
+    auto erase_it = ftq.lower_bound(first_pending_id);
+    while (erase_it != ftq.end()) {
+        erase_it = ftq.erase(erase_it);
+    }
+
+    fetchTargetEnqState.nextEnqTargetId = first_pending_id;
+    fetchTargetEnqState.streamId = new_enq_stream_id;
+    fetchTargetEnqState.pc = new_enq_pc;
+
+    DPRINTF(DecoupleBP,
+            "Discard pending FTQ entries from %lu, reset enq stream=%lu pc=%#lx\n",
+            first_pending_id, new_enq_stream_id, new_enq_pc);
 }
 
 /**

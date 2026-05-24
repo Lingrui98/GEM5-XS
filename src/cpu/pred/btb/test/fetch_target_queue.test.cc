@@ -210,6 +210,21 @@ TEST_F(FetchTargetQueueTest, SkipPastEntries) {
     EXPECT_EQ(target.endPC, 0x1010);
 }
 
+TEST_F(FetchTargetQueueTest, SkipInvalidRangeEntries) {
+    ftq->enqueue(createFtqEntry(0x1008, 0x1008));
+    ftq->enqueue(createFtqEntry(0x1010, 0x1018));
+
+    bool inLoop = false;
+    bool result = ftq->trySupplyFetchWithTarget(0x1008, inLoop);
+
+    EXPECT_TRUE(result);
+    EXPECT_TRUE(ftq->fetchTargetAvailable());
+
+    FtqEntry& target = ftq->getTarget();
+    EXPECT_EQ(target.startPC, 0x1010);
+    EXPECT_EQ(target.endPC, 0x1018);
+}
+
 // Test edge case with empty queue
 TEST_F(FetchTargetQueueTest, EmptyQueueSupply) {
     bool inLoop = false;

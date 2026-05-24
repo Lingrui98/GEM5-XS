@@ -639,6 +639,16 @@ class DecoupledBPUWithFTB : public BPredUnit
         return fetchTargetQueue.getSupplyingStreamId();
     }
 
+    Addr getEnqueuePC() const
+    {
+        return fetchTargetQueue.getEnqPC();
+    }
+
+    Addr getCurrentPC() const
+    {
+        return s0PC;
+    }
+
     void dumpFsq(const char *when);
 
     // Dummy overriding
