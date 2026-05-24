@@ -305,3 +305,83 @@ Current recommendation:
 - treat the current stack as complete for the P0/P1 stabilization cut
 - stop at Phase 1 / 1.5 unless a new research question specifically requires
   deeper RTL-fidelity work
+
+---
+
+## Legacy KMH FDIP vs Phase2 FDIP (50 traces, 2026-05)
+
+This section captures the comparison study from trellis task
+`05-09-fdip-kmh-legacy-port-compare`. Use it as the default reference
+when deciding whether to keep legacy KMH FDIP as a baseline, retire it,
+or use it to explain current FDIP deltas.
+
+### Setup
+
+- Workload: first 50 rows of
+  `/nfs/home/share/glr/champsim_traces/champsim_traces_btb_and_icache_intensive.lst`.
+- Branches:
+  - legacy KMH FDIP port: branch `fdip-kmh-legacy-port-compare`, started
+    from baseline commit `103c503233`, with the legacy
+    `origin/kmh-fdip` FDIP (core commits `aa1a36a395`, `5f2344a383`,
+    `2c05e4373c`) ported back and adapted only at interface boundaries.
+  - current FDIP: branch `fdip-phase2-xsdev` (FTQ-directed phase2).
+- Both variants used the same trace root, scheduler, and resource
+  settings; legacy FDIP is enabled via
+  `util/xs_scripts/trace/run_trace_champsim_legacy_fdip_on.sh`, which
+  injects `--l1i-hwp-type=FDIPPrefetcher`.
+- Aggregator: `util/xs_scripts/trace/compare_fdip_top50.py`.
+
+### Headline result
+
+- Completion: 50/50 on both sides, 0 aborts.
+- Mean IPC, old: **2.187714**.
+- Mean IPC, new: **2.182969**.
+- Old IPC > new IPC: **30** workloads.
+- New IPC > old IPC: **20** workloads.
+- Per-workload data: `.regression_runs/fdip_kmh_legacy_compare/compare_fdip_top50.csv`.
+
+### Workload breakdown
+
+- `srv*` workloads (49 of 50): old wins 29, new wins 20; both leads are
+  small in magnitude (mean lead ~0.006 IPC either way). The two sides
+  are effectively tied across the srv class.
+- `compute_int_32` (1 of 50): old IPC 2.286 vs new IPC 2.090, old leads
+  by ~0.20 IPC. This is the single largest gap in the run and is the
+  main reason the aggregate mean tilts toward old.
+
+### Known confounders
+
+- The legacy worktree could not complete the 50-trace batch cleanly
+  without first synchronizing trace-mode plumbing changes
+  (`src/cpu/o3/trace/*`, `src/cpu/o3/fetch.*`, decoupled BPU squash
+  alignment) from the current tree. The old-vs-new gap therefore is not
+  a pure FDIP-algorithm comparison; trace-infrastructure parity is a
+  prerequisite, not a result.
+- Legacy and current trees do not expose identical FDIP stat names.
+  `old_icacheStallCycles`, `old_trySendPrefetch`, and
+  `old_demandSendPrefetch` are blank in the legacy CSV columns; the
+  current tree reports `system.cpu.fetch.icacheStallCycles`. Aggregate
+  comparisons against ICache-stall or FDIP-internal counters must
+  preserve this asymmetry per the Trace Batch Comparison Reports
+  contract in `trace-debug-tooling.md`.
+
+### Takeaways
+
+- Within ICache-intensive ChampSim traces, the FTQ-directed phase2 FDIP
+  is performance-neutral relative to the legacy KMH L1I FDIP at the IPC
+  aggregate (delta ~0.22% in favor of legacy). The current FDIP does
+  not regress the legacy baseline outside one outlier workload.
+- Keep legacy KMH FDIP as a *baseline reference for explaining current
+  FDIP deltas*, not as a production replacement: it is older, narrower
+  in scope, and only ran here after consuming current-tree trace-mode
+  fixes.
+- The `compute_int_32` outlier is the most useful single signal: it is
+  the workload where the legacy algorithm noticeably outperforms phase2
+  FDIP, so it is the natural target if a research question asks "where
+  did phase2 FDIP regress against legacy KMH FDIP?".
+- **Next-study prerequisite:** any future legacy-vs-phase2 algorithm
+  comparison must first isolate trace-infrastructure parity. The IPC
+  delta observed here cannot be attributed purely to FDIP differences
+  until both branches share an identical trace/fetch/BPU infrastructure
+  baseline. Use this row only as a calibration anchor, not as evidence
+  of FDIP algorithm regression.
