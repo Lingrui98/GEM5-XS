@@ -144,6 +144,27 @@ class HistoryManager
     }
 
     /**
+     * @brief Discards speculative history entries from the given stream ID.
+     *
+     * Used by trace-mode local resync when future FSQ entries are detected as
+     * stale before they ever reach execution.
+     *
+     * @param stream_id Lowest stream ID to discard
+     */
+    void discardFrom(const uint64_t stream_id)
+    {
+        auto it = speculativeHists.begin();
+        while (it != speculativeHists.end()) {
+            if (it->streamId >= stream_id) {
+                printEntry("Discard", *it);
+                it = speculativeHists.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    /**
      * @brief Gets the list of speculative history entries
      *
      * Used for debugging and history reconstruction.

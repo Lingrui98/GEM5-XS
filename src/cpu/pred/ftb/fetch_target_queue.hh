@@ -63,6 +63,8 @@ class FetchTargetQueue
 
     FetchTargetEnqState &getEnqState() { return fetchTargetEnqState; }
 
+    Addr getEnqPC() const { return fetchTargetEnqState.pc; }
+
     FetchTargetId getSupplyingTargetId()
     {
         if (supplyFetchTargetState.valid) {

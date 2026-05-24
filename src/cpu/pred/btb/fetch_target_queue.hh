@@ -120,6 +120,9 @@ class FetchTargetQueue
      */
     FetchTargetEnqState &getEnqState() { return fetchTargetEnqState; }
 
+    /** Get the current enqueue PC without exposing mutable state. */
+    Addr getEnqPC() const { return fetchTargetEnqState.pc; }
+
     /**
      * @brief Get the ID of the target currently being supplied
      *
@@ -186,6 +189,15 @@ class FetchTargetQueue
      * @param entry The entry to add
      */
     void enqueue(FtqEntry entry);
+
+    /**
+     * @brief Drop pending FTQ entries while preserving the current supplied one.
+     *
+     * This keeps the currently supplied target (if any) so fetch can finish the
+     * in-flight block, and discards later queued targets before re-synchronizing
+     * enqueue state to a new stream/PC view.
+     */
+    void discardPending(FetchStreamId new_enq_stream_id, Addr new_enq_pc);
 
     /**
      * @brief Print debug information about the queue

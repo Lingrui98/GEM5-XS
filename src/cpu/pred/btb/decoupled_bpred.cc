@@ -863,13 +863,50 @@ DecoupledBPUWithBTB::validateFTQEnqueue()
         return false;
     }
 
-    // Validation check - warn if FTQ enqueue PC is beyond FSQ end
-    if (ftq_enq_state.pc > streamIt->second.predEndPC) {
+    // Validation check - reject invalid / empty FTQ ranges early.
+    if (ftq_enq_state.pc >= streamIt->second.predEndPC) {
         warn("Warning: FTQ enqueue PC %#lx is beyond FSQ end %#lx\n",
              ftq_enq_state.pc, streamIt->second.predEndPC);
+        recoverFromStaleEnqueue(ftq_enq_state.streamId, ftq_enq_state.pc);
+        return false;
     }
 
     return true;
+}
+
+void
+DecoupledBPUWithBTB::recoverFromStaleEnqueue(FetchStreamId stream_id, Addr demand_pc)
+{
+    auto erase_it = fetchStreamQueue.lower_bound(stream_id);
+    while (erase_it != fetchStreamQueue.end()) {
+        DPRINTF(DecoupleBP,
+                "Dropping stale FSQ stream %lu during enqueue resync to %#lx\n",
+                erase_it->first, demand_pc);
+        erase_it = fetchStreamQueue.erase(erase_it);
+    }
+
+    historyManager.discardFrom(stream_id);
+    rebuildGlobalHistoryFromManager();
+    clearPreds();
+    numOverrideBubbles = 0;
+    bpuState = BpuState::IDLE;
+    squashing = true;
+    s0PC = demand_pc;
+    fsqId = stream_id;
+    fetchTargetQueue.discardPending(stream_id, demand_pc);
+}
+
+void
+DecoupledBPUWithBTB::rebuildGlobalHistoryFromManager()
+{
+    s0History.reset();
+    for (const auto &entry : historyManager.getSpeculativeHist()) {
+        if (entry.shamt == 0) {
+            continue;
+        }
+        s0History <<= entry.shamt;
+        s0History[0] = entry.cond_taken;
+    }
 }
 
 /**

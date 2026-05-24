@@ -181,6 +181,8 @@ class DecoupledBPUWithBTB : public BPredUnit
 
     // Helper function to validate FTQ and FSQ state before enqueueing
     bool validateFTQEnqueue();
+    void recoverFromStaleEnqueue(FetchStreamId stream_id, Addr demand_pc);
+    void rebuildGlobalHistoryFromManager();
 
     void processNewPrediction(bool create_new_stream);
 
@@ -504,6 +506,16 @@ class DecoupledBPUWithBTB : public BPredUnit
     unsigned getSupplyingStreamId()
     {
         return fetchTargetQueue.getSupplyingStreamId();
+    }
+
+    Addr getEnqueuePC() const
+    {
+        return fetchTargetQueue.getEnqPC();
+    }
+
+    Addr getCurrentPC() const
+    {
+        return s0PC;
     }
 
     void dumpFsq(const char *when);

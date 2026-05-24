@@ -999,6 +999,9 @@ class Fetch
     /** Get the start PC of the next FTQ entry and update fetchBufferPC */
     Addr getNextFTQStartPC(ThreadID tid);
 
+    /** Apply trace-mode control-PC override to a decoupled-frontend demand PC. */
+    Addr getDecoupledDemandPC(ThreadID tid, Addr fallback_pc);
+
     /**
      * Check if the thread can fetch instructions
      * @param tid Thread ID
