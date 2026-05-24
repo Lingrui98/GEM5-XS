@@ -107,6 +107,8 @@ style_ignores = [
     # Ignore test data, as they are not code
     _re_ignore("^tests/(?:quick|long)/"),
     _re_ignore("^tests/test-progs/hello/bin/"),
+    # Ignore Trellis tooling: not gem5 source code
+    _re_ignore("^\.trellis/"),
     # Only include Scons files and those with extensions that suggest source
     # code
     _re_only("^((.*\/)?(SConscript|SConstruct)|"
