@@ -3,7 +3,7 @@
   "name": "dashboard-hotreload-autostart-extract",
   "title": "trellis-dashboard 自动热更新 + 自启动 + 抽独立 repo",
   "description": "",
-  "status": "in_progress",
+  "status": "completed",
   "dev_type": null,
   "scope": null,
   "package": null,
@@ -11,21 +11,16 @@
   "creator": "glr",
   "assignee": "glr",
   "createdAt": "2026-05-27",
-  "completedAt": null,
+  "completedAt": "2026-05-27",
   "branch": null,
   "base_branch": "trace-new",
   "worktree_path": null,
   "commit": null,
   "pr_url": null,
   "subtasks": [],
-  "children": [
-    "05-27-dashboard-pr1-extract-repo",
-    "05-27-dashboard-pr2-hot-reload",
-    "05-27-dashboard-pr3-autostart",
-    "05-27-dashboard-pr4-gem5-migration"
-  ],
+  "children": [],
   "parent": null,
   "relatedFiles": [],
-  "notes": "",
+  "notes": "All 4 child PRs done: PR1 extract+pipx (new-repo 132f4083), PR2 hot-reload (431e08b), PR3 autostart (31221c7), PR4 GEM5 migration (gem5 commit 1e3090afb9). pipx editable install of trellis-dashboard live; old .trellis/scripts/{dashboard*.py,progress.py} in .recycle_bin/. Hook lifecycle verified.",
   "meta": {}
 }
