@@ -1,0 +1,1 @@
+{"ts": "2026-05-27T00:00:00+00:00", "phase": "check", "step": "trellis-check 15-dim verification all green: install->active->restart->uninstall->force gating, /api endpoints under service, no zshrc damage, idempotent uninstall", "status": "done", "warnings": ["service.py 467 LOC slightly above 400 hint (cohesive)"], "source": "agent"}
