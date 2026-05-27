@@ -1,0 +1,31 @@
+{
+  "id": "dashboard-hotreload-autostart-extract",
+  "name": "dashboard-hotreload-autostart-extract",
+  "title": "trellis-dashboard 自动热更新 + 自启动 + 抽独立 repo",
+  "description": "",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "glr",
+  "assignee": "glr",
+  "createdAt": "2026-05-27",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "trace-new",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "05-27-dashboard-pr1-extract-repo",
+    "05-27-dashboard-pr2-hot-reload",
+    "05-27-dashboard-pr3-autostart",
+    "05-27-dashboard-pr4-gem5-migration"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

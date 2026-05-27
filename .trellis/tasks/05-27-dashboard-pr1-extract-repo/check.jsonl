@@ -1,0 +1,1 @@
+{"ts": "2026-05-27T00:00:00+00:00", "phase": "check", "step": "trellis-check 7-dim verification all green: layout/pipx/CLI parity/md diff/importlib/server smoke/no-leak/imports", "status": "done", "warnings": ["install/ placeholder deferred to PR3", "pytest not in pipx venv (cosmetic)", "/api/build-version stub for PR2"], "source": "agent"}
