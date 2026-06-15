@@ -142,6 +142,10 @@ MBTB::MBTB(const Params &p)
         entry.tick = 0;
     }
 
+    // SWAY per-way visit counters, mirror sram0/sram1 shape.
+    wayVisit0.assign(numSets, std::vector<uint32_t>(numWays, 0));
+    wayVisit1.assign(numSets, std::vector<uint32_t>(numWays, 0));
+
     DPRINTF(BTB, "numEntries %d, numSets %d, numWays %d, tagBits %d, tagShiftAmt %d, "
         "idxMask %#lx, tagMask %#lx, victimCacheSize %d\n",
         numEntries, numSets, numWays, tagBits, tagShiftAmt, idxMask, tagMask, victimCacheSize);
@@ -344,14 +348,56 @@ MBTB::lookupSingleBlock(Addr block_pc, uint8_t asidHash)
     DPRINTF(BTB, "BTB: Doing tag comparison for SRAM%d index 0x%lx tag %#lx\n",
         sram_id, btb_idx, current_tag);
         
+    auto& target_visit = (sram_id == 0) ? wayVisit0 : wayVisit1;
+    unsigned way_idx = 0;
     for (auto &way : btb_set) {
         if (way.valid && way.tag == current_tag) {
             res.push_back(way);
             way.tick = curTick(); // Update timestamp for MRU
             std::make_heap(target_mru[btb_idx].begin(), target_mru[btb_idx].end(), older());
+            // SWAY: record per-way demand inside this phase.
+            if (btb_idx < target_visit.size() && way_idx < target_visit[btb_idx].size()) {
+                ++target_visit[btb_idx][way_idx];
+            }
         }
+        ++way_idx;
     }
     return res;
+}
+
+std::vector<MBTB::WayPhaseSnapshot>
+MBTB::collectAndResetWayVisitCounts()
+{
+    std::vector<WayPhaseSnapshot> out;
+    out.reserve(2);
+
+    auto sweep = [&](const std::string& scope,
+                     std::vector<BTBSet>& sram,
+                     std::vector<std::vector<uint32_t>>& visit) {
+        WayPhaseSnapshot snap;
+        snap.scope = scope;
+        snap.totalWays = static_cast<uint64_t>(numSets) * numWays;
+        snap.validWays = 0;
+        snap.activeWays = 0;
+        for (unsigned s = 0; s < numSets; ++s) {
+            const auto& set = sram[s];
+            auto& vcounts = visit[s];
+            for (unsigned w = 0; w < numWays; ++w) {
+                if (w < set.size() && set[w].valid) {
+                    ++snap.validWays;
+                }
+                if (w < vcounts.size() && vcounts[w] > 0) {
+                    ++snap.activeWays;
+                    vcounts[w] = 0;
+                }
+            }
+        }
+        out.push_back(snap);
+    };
+
+    sweep("mbtb_sram0", sram0, wayVisit0);
+    sweep("mbtb_sram1", sram1, wayVisit1);
+    return out;
 }
 
 std::vector<MBTB::TickedBTBEntry>

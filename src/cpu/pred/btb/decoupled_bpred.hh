@@ -700,6 +700,32 @@ class DecoupledBPUWithBTB : public BPredUnit
     std::vector<std::unordered_map<Addr, std::pair<BTBEntry, int>>> BTBEntriesByPhase;
 
     /**
+     * @brief SWAY stranded-ratio accumulator (one row per scope per phase).
+     *
+     * Rows are appended at every main phase boundary by
+     * collectSwayWayVisitForPhase(), then flushed to
+     * sway_stranded_by_phase.csv inside dumpStats(). Each row carries
+     * (phaseID, scope, total_ways, valid_ways, active_ways) so that the
+     * Figure 1 plotting code can compute
+     *   stranded_ratio = (valid_ways - active_ways) / total_ways
+     * directly. See SWAY plan PENDING-9.
+     */
+    struct SwayStrandedRow
+    {
+        int phaseID;
+        std::string scope;
+        uint64_t totalWays;
+        uint64_t validWays;
+        uint64_t activeWays;
+    };
+    std::vector<SwayStrandedRow> swayStrandedByPhase;
+
+    /**
+     * @brief Snapshot SWAY per-way visit counters at a phase boundary.
+     */
+    void collectSwayWayVisitForPhase(int phaseID);
+
+    /**
      * @brief Next phase ID to dump statistics for
      */
     int phaseIdToDump{1};

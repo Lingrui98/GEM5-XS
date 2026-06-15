@@ -61,6 +61,35 @@ DecoupledBPUWithBTB::initDB()
 }
 
 void
+DecoupledBPUWithBTB::collectSwayWayVisitForPhase(int phaseID)
+{
+    auto append = [&](const std::string& scope, uint64_t totalWays,
+                      uint64_t validWays, uint64_t activeWays) {
+        swayStrandedByPhase.push_back({phaseID, scope, totalWays,
+                                       validWays, activeWays});
+    };
+
+    if (mbtb) {
+        for (const auto& snap : mbtb->collectAndResetWayVisitCounts()) {
+            append(snap.scope, snap.totalWays, snap.validWays,
+                   snap.activeWays);
+        }
+    }
+    if (tage) {
+        for (const auto& snap : tage->collectAndResetWayVisitCounts()) {
+            append(snap.scope, snap.totalWays, snap.validWays,
+                   snap.activeWays);
+        }
+    }
+    if (microtage) {
+        for (const auto& snap : microtage->collectAndResetWayVisitCounts()) {
+            append(snap.scope, snap.totalWays, snap.validWays,
+                   snap.activeWays);
+        }
+    }
+}
+
+void
 DecoupledBPUWithBTB::dumpStats()
 {
     // Helper function: create output file and write header
@@ -329,6 +358,20 @@ DecoupledBPUWithBTB::dumpStats()
         phaseID++;
     }
     simout.close(outFile);
+
+    // 10. SWAY per-way stranded-capacity rows.
+    {
+        auto handle = createOutputFile(
+            "sway_stranded_by_phase.csv",
+            "phaseID,scope,total_ways,valid_ways,active_ways");
+        auto& out = *handle->stream();
+        for (const auto& row : swayStrandedByPhase) {
+            out << row.phaseID << ',' << row.scope << ','
+                << row.totalWays << ',' << row.validWays << ','
+                << row.activeWays << '\n';
+        }
+        simout.close(handle);
+    }
 
     // Save the database
     if (someDBenabled) {
@@ -983,6 +1026,9 @@ DecoupledBPUWithBTB::notifyInstCommit(const DynInstPtr &inst)
 
             // Process BTB entries
             BTBEntriesByPhase.push_back(processBTBEntries());
+
+            // SWAY: snapshot per-way visit counters across MBTB + TAGE/microtage.
+            collectSwayWayVisitForPhase(currentPhaseID);
         }
     }
 

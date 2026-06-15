@@ -90,6 +90,10 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
              "FDIP with --no-fdip-flush-partial-on-epoch-change is not "
              "implemented yet in this MVP");
 
+    // SWAY: profiling phase length is now a SimObject param so a single
+    // build can sweep W via -P system.cpu[0].branchPred.phaseSizeByInst=N.
+    phaseSizeByInst = p.phaseSizeByInst;
+    subPhaseRatio = p.subPhaseRatio;
     if (bpDBSwitches.size() > 0) {
         initDB();
     }

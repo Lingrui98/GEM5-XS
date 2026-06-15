@@ -377,7 +377,34 @@ class MBTB : public TimedBaseBTBPredictor
     unsigned numEntries;    // Total number of entries
     unsigned numWays;       // Number of ways per SRAM (4 for dual-SRAM)
     unsigned numSets;       // Number of sets per SRAM (numEntries/numWays/2)
-    
+
+  public:
+    /** SWAY per-way visit counters for stranded-capacity profiling.
+     *
+     *  Indexed as [set][way]. Incremented on every lookup that matches
+     *  (valid && tag == current_tag) at way granularity. Read and
+     *  cleared at every phase boundary by the top-level BPU via
+     *  collectAndResetWayVisitCounts() to derive per-phase stranded
+     *  ratio = (valid_ways - active_ways) / total_ways. See SWAY plan
+     *  PENDING-9 / Figure 1.
+     */
+    std::vector<std::vector<uint32_t>> wayVisit0, wayVisit1;
+
+    /** Snapshot the current per-way visit counts and reset them.
+     *
+     *  @param out Filled with one row per SRAM containing
+     *             (total_ways, valid_ways, active_ways).
+     */
+    struct WayPhaseSnapshot
+    {
+        std::string scope;      // "mbtb_sram0" / "mbtb_sram1"
+        uint64_t totalWays;     // numSets * numWays
+        uint64_t validWays;     // entries with valid set
+        uint64_t activeWays;    // entries with visit count > 0 this phase
+    };
+    std::vector<WayPhaseSnapshot> collectAndResetWayVisitCounts();
+
+  private:
     /** SRAM selection helper function */
     inline int getSRAMId(Addr pc) {
         // Use the bit after block offset to select SRAM

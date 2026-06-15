@@ -1233,3 +1233,13 @@ class DecoupledBPUWithBTB(BranchPredictor):
         False, "Drop old-path FDIP refill installation on epoch mismatch")
     fdip_recent_unused_cycles = Param.Unsigned(
         0, "Suppress FDIP issue for recently-unused lines for N cycles")
+
+    # SWAY phase-profiling parameters (PENDING-11 W sweep). phaseSizeByInst
+    # drives every phase-boundary CSV (BTBEntriesByPhase, topMispredictByPhase,
+    # sway_stranded_by_phase). subPhaseRatio defines how many sub-phases fit
+    # in one main phase. Previously C++ literals; exposed here so a SWAY
+    # sweep can vary W via the gem5 command line (-P) instead of rebuilding.
+    phaseSizeByInst = Param.Unsigned(100000,
+        "Instructions per main profiling phase (W in SWAY paper)")
+    subPhaseRatio = Param.Unsigned(10,
+        "Number of sub-phases per main phase")
