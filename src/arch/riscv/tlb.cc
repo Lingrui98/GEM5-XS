@@ -161,10 +161,7 @@ TLB::getWalker()
 {
     return walker;
 }
-void
-TLB::setPTWmode(bool _enable_sv48){
-    walker->openSv48 = _enable_sv48;
-}
+
 void
 TLB::configL2Tlb(EntryList *List_choose, TlbEntryTrie *Trie_l2_choose, std::vector<TlbEntry> &l2Tlb_choose,
                  size_t size, bool sp)
@@ -319,7 +316,7 @@ TLB::l2TLBEvictLRU(int l2TLBlevel, Addr vaddr)
 
 TlbEntry *
 TLB::lookup(Addr vpn, uint16_t asid, BaseMMU::Mode mode, bool hidden,
-            bool sign_used,uint8_t translateMode)
+            bool sign_used, uint8_t translateMode, bool is_prefetch)
 {
     TlbEntry *entry = trie.lookup(buildKey(vpn, asid, translateMode));
 
@@ -327,25 +324,46 @@ TLB::lookup(Addr vpn, uint16_t asid, BaseMMU::Mode mode, bool hidden,
         if (entry)
             entry->lruSeq = nextSeq();
 
-        if (mode == BaseMMU::Write)
-            stats.writeAccesses++;
-        else
-            stats.readAccesses++;
+        if (is_prefetch) {
+            if (mode == BaseMMU::Write)
+                stats.writeprefetchAccesses++;
+            else
+                stats.readprefetchAccesses++;
+        } else {
+            if (mode == BaseMMU::Write)
+                stats.writeAccesses++;
+            else
+                stats.readAccesses++;
+        }
 
         if (!entry) {
-            if (mode == BaseMMU::Write)
-                stats.writeMisses++;
-            else
-                stats.readMisses++;
+            if (is_prefetch) {
+                if (mode == BaseMMU::Write)
+                    stats.writeprefetchMisses++;
+                else
+                    stats.readprefetchMisses++;
+            } else {
+                if (mode == BaseMMU::Write)
+                    stats.writeMisses++;
+                else
+                    stats.readMisses++;
+            }
         }
         else {
-            if (mode == BaseMMU::Write)
-                stats.writeHits++;
-            else
-                stats.readHits++;
+            if (is_prefetch) {
+                if (mode == BaseMMU::Write)
+                    stats.writeprefetchHits++;
+                else
+                    stats.readprefetchHits++;
+            } else {
+                if (mode == BaseMMU::Write)
+                    stats.writeHits++;
+                else
+                    stats.readHits++;
+            }
         }
 
-        if (entry) {
+        if (entry && !is_prefetch) {
             if (entry->isSquashed) {
                 if (mode == BaseMMU::Write)
                     stats.writeHitsSquashed++;
@@ -1374,10 +1392,13 @@ TLB::checkHL1Tlb(const RequestPtr &req, ThreadContext *tc,
     TlbEntry *e_l2tlb = nullptr;
     TlbEntry *e_l2tlbVsstage = nullptr;
     TlbEntry *e_l2tlbGstage = nullptr;
+    const bool is_prefetch = req->isPrefetch();
     if (vsatp.mode != 0)
-        e[0] = lookup(vaddr, vsatp.asid, mode, false, true, allstage);
+        e[0] = lookup(vaddr, vsatp.asid, mode, false, true, allstage,
+                      is_prefetch);
     else
-        e[0] = lookup(vaddr, hgatp.vmid, mode, false, true, gstage);
+        e[0] = lookup(vaddr, hgatp.vmid, mode, false, true, gstage,
+                      is_prefetch);
 
     vs_top_level = PTW_TOP_LEVEL(vsatp.mode);
     g_top_level = PTW_TOP_LEVEL(hgatp.mode);
@@ -1419,7 +1440,8 @@ TLB::checkHL1Tlb(const RequestPtr &req, ThreadContext *tc,
         Addr pg_mask = 0;
 
 
-        e[0] = lookup(vaddr, vsatp.asid, mode, false, true, vsstage);
+        e[0] = lookup(vaddr, vsatp.asid, mode, false, true, vsstage,
+                      is_prefetch);
         if (e[0]){
             req->setPte(e[0]->pte);
             hit_type = h_l1VSstageHit;
@@ -1446,7 +1468,8 @@ TLB::checkHL1Tlb(const RequestPtr &req, ThreadContext *tc,
 
             DPRINTFR(TLB, "\tpass check, try to lookup for Gstage pte\n");
 
-            e[0] = lookup(gPaddr, hgatp.vmid, mode, false, true, gstage);
+            e[0] = lookup(gPaddr, hgatp.vmid, mode, false, true, gstage,
+                          is_prefetch);
             if (e[0]) {
                 hit_type = h_l1GstageHit;
                 DPRINTF(TLB, "l1tlb hit in Gstage: level %d, ppn %#x\n", e[0]->level, e[0]->pte.ppn);
@@ -1521,6 +1544,7 @@ TLB::checkHL2Tlb(const RequestPtr &req, ThreadContext *tc, BaseMMU::Translation 
     TlbEntry *e_l2tlb = nullptr;
     TlbEntry *e_l2tlbVsstage = nullptr;
     TlbEntry *e_l2tlbGstage = nullptr;
+    const bool is_prefetch = req->isPrefetch();
 
     if ((!e[0]) && (l1tlbtype == h_l1VSstageHit)) {
         hit_level = PTW_TOP_LEVEL(vsatp.mode);
@@ -1583,7 +1607,8 @@ TLB::checkHL2Tlb(const RequestPtr &req, ThreadContext *tc, BaseMMU::Translation 
 
     if (!e[0]) {
         DPRINTF(TLB, "l1tlb miss, lookup l2tlb at VSstage.\n");
-        e[0] = lookup(vaddr, vsatp.asid, mode, false, true, vsstage);
+        e[0] = lookup(vaddr, vsatp.asid, mode, false, true, vsstage,
+                      is_prefetch);
         hit_level = PTW_TOP_LEVEL(vsatp.mode);
         if (!e[0]) {
             for (int i_e = 1; i_e < L_L2SUM; i_e++) {
@@ -1632,7 +1657,8 @@ TLB::checkHL2Tlb(const RequestPtr &req, ThreadContext *tc, BaseMMU::Translation 
 
                 DPRINTFR(TLB, "\tlookup (gPaddr: %#x) in l1tlb again for Gstage.\n", gPaddr);
                 e[0] = nullptr;
-                e[0] = lookup(gPaddr, hgatp.vmid, mode, false, true, gstage);
+                e[0] = lookup(gPaddr, hgatp.vmid, mode, false, true, gstage,
+                              is_prefetch);
                 if (!e[0]) {
                     DPRINTF(TLB, "l1tlb miss, lookup (gPaddr: %#x) l2tlb for Gstage.\n", gPaddr);
                     hit_level = PTW_TOP_LEVEL(hgatp.mode);
@@ -1840,7 +1866,17 @@ TLB::doTranslate(const RequestPtr &req, ThreadContext *tc,
 {
     delayed = false;
     SATP satp = tc->readMiscReg(MISCREG_SATP);
-    Addr vaddr = VADDR_SEXT(satp.mode, req->getVaddr());
+    // RISC-V Sv39/Sv48 require a canonical (sign-extended) virtual address.
+    // If the incoming vaddr is non-canonical, it must raise a page fault and
+    // STVAL should contain the *original* (non-canonical) vaddr.
+    const Addr raw_vaddr = req->getVaddr();
+    Addr vaddr = VADDR_SEXT(satp.mode, raw_vaddr);
+    if ((satp.mode == AddrXlateMode::SV39 || satp.mode == AddrXlateMode::SV48) &&
+        vaddr != raw_vaddr) {
+        DPRINTF(TLB, "Non-canonical vaddr %#lx (canon %#lx), mode %d\n",
+                raw_vaddr, vaddr, satp.mode);
+        return createPagefault(raw_vaddr, 0, mode, false);
+    }
     Addr vaddr_trace = (vaddr >> (PageShift + L2TLB_BLK_OFFSET)) << (PageShift + L2TLB_BLK_OFFSET);
     if (((vaddr_trace != lastVaddr) || (req->getPC() != lastPc)) &&
         is_dtlb) {
@@ -1854,7 +1890,8 @@ TLB::doTranslate(const RequestPtr &req, ThreadContext *tc,
     TlbEntry *e[L_L2SUM] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     TlbEntry *forward_pre[L_L2SUM] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     TlbEntry *back_pre[L_L2SUM] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-    e[0] = lookup(vaddr, satp.asid, mode, false, true, direct);
+    const bool is_prefetch = req->isPrefetch();
+    e[0] = lookup(vaddr, satp.asid, mode, false, true, direct, is_prefetch);
     Addr paddr = 0;
     Fault fault = NoFault;
     Fault fault_return = NoFault;
@@ -1896,17 +1933,7 @@ TLB::doTranslate(const RequestPtr &req, ThreadContext *tc,
     TlbEntry *pre_back = l2tlb->lookupBackPre(back_pre_block, satp.asid, true);
     backPrePrecision = checkPrePrecision(l2tlb->removeNoUseBackPre, l2tlb->usedBackPre);
     forwardPrePrecision = checkPrePrecision(l2tlb->removeNoUseForwardPre, l2tlb->forwardUsedPre);
-    if (walker->openSv48) {
-        fault = walker->start(0, tc, translation, req, mode, false, false, 3, false, 0);
 
-        if (translation != nullptr || fault != NoFault) {
-            // This gets ignored in atomic mode.
-            delayed = true;
-            return fault;
-        } else {
-            panic("sv48 goes wrong\n");
-        }
-    }
 
     for (int i_e = 1; i_e < L_L2SUM; i_e++) {
         if ((satp.mode == AddrXlateMode::SV39) && (i_e == L_L2L3 || i_e == L_L2sp3))
@@ -2046,12 +2073,14 @@ TLB::doTranslate(const RequestPtr &req, ThreadContext *tc,
                 delayed = true;
                 return fault;
             }
-            e[0] = lookup(vaddr, satp.asid, mode, false, true, direct);
+            e[0] = lookup(vaddr, satp.asid, mode, false, true, direct,
+                          is_prefetch);
             assert(e[0] != nullptr);
         }
     }
     if (!e[0])
-        e[0] = lookup(vaddr, satp.asid, mode, false, true, direct);
+        e[0] = lookup(vaddr, satp.asid, mode, false, true, direct,
+                      is_prefetch);
     assert(e[0] != nullptr);
 
     status = tc->readMiscReg(MISCREG_STATUS);
@@ -2117,23 +2146,58 @@ TLB::doTranslate(const RequestPtr &req, ThreadContext *tc,
 
     return NoFault;
 }
-
 PrivilegeMode
-TLB::getMemPriv(ThreadContext *tc, BaseMMU::Mode mode)
+TLB::currentMemPriv(ThreadContext *tc, BaseMMU::Mode mode)
 {
-    if (use_old_priv && mode != BaseMMU::Execute) {
-        if (mode == BaseMMU::Execute) {
-            return old_priv_ex;
-        } else {
-            return old_priv_ldst;
-        }
-    }
     STATUS status = (STATUS)tc->readMiscReg(MISCREG_STATUS);
     PrivilegeMode pmode = (PrivilegeMode)tc->readMiscReg(MISCREG_PRV);
     if (mode != BaseMMU::Execute && status.mprv == 1)
         pmode = (PrivilegeMode)(RegVal)status.mpp;
     return pmode;
 }
+
+PrivilegeMode
+TLB::getMemPriv(ThreadContext *tc, BaseMMU::Mode mode)
+{
+    if (mode != BaseMMU::Execute) {
+        const int tid = tc->threadId();
+        if (tid >= 0) {
+            const auto thread_idx = static_cast<size_t>(tid);
+            if (thread_idx < oldPrivByThread.size() &&
+                oldPrivByThread[thread_idx].valid) {
+                return oldPrivByThread[thread_idx].ldst;
+            }
+        }
+    }
+    return currentMemPriv(tc, mode);
+}
+
+void
+TLB::setOldPriv(ThreadContext *tc)
+{
+    const int tid = tc->threadId();
+    assert(tid >= 0);
+    const auto thread_idx = static_cast<size_t>(tid);
+    if (oldPrivByThread.size() <= thread_idx) {
+        oldPrivByThread.resize(thread_idx + 1);
+    }
+    oldPrivByThread[thread_idx].valid = true;
+    oldPrivByThread[thread_idx].ldst = currentMemPriv(tc, BaseMMU::Read);
+}
+
+void
+TLB::useNewPriv(ThreadContext *tc)
+{
+    const int tid = tc->threadId();
+    if (tid < 0) {
+        return;
+    }
+    const auto thread_idx = static_cast<size_t>(tid);
+    if (thread_idx < oldPrivByThread.size()) {
+        oldPrivByThread[thread_idx].valid = false;
+    }
+}
+
 bool
 TLB::hasTwoStageTranslation(ThreadContext *tc, const RequestPtr &req, BaseMMU::Mode mode)
 {

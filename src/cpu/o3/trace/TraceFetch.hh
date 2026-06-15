@@ -91,9 +91,6 @@ class TraceFetch
     /** Called by Fetch::performInstructionFetch to model coupled mispredict stalls. */
     bool maybeStallFetch(ThreadID tid);
 
-    /** Trace-mode helper: choose the control-PC view used to supply decoupled BPU. */
-    Addr getControlPCView(ThreadID tid, Addr fallbackPC);
-
     /** Trace-mode checkMemoryNeeds fast path (called from Fetch::checkMemoryNeeds). */
     StallReason checkMemoryNeeds(ThreadID tid, const PCStateBase &this_pc);
 
@@ -129,23 +126,6 @@ class TraceFetch
     bool wrongPathActive() const { return traceWrongPathActive; }
 
   private:
-    enum class TraceRecoveryMode
-    {
-        Hold,
-        Rollback
-    };
-
-    struct TraceRecoveryAction
-    {
-        TraceRecoveryMode mode = TraceRecoveryMode::Hold;
-        InstSeqNum rollbackSeqNum = 0;
-        uint64_t rollbackTraceIndex = 0;
-        bool useTraceIndex = false;
-        bool squashItself = false;
-        const char *exitWrongPathReason = nullptr;
-        const char *debugReason = nullptr;
-    };
-
     Fetch &fetch;
 
     bool initializeTraceReader();
@@ -161,24 +141,6 @@ class TraceFetch
                              Addr corrPC, bool forceMinStep,
                              const char *reason, uint64_t traceSeqNum);
     void exitTraceWrongPath(ThreadID tid, const char *reason);
-    bool resolveTraceRecoveryIndex(ThreadID tid,
-                                   const DynInstPtr &squashInst,
-                                   const PCStateBase &new_pc,
-                                   uint64_t &targetIndex);
-    TraceRecoveryAction classifyWrongPathInstSquash(ThreadID tid,
-                                                    const PCStateBase &new_pc,
-                                                    const DynInstPtr &squashInst,
-                                                    InstSeqNum seqNum);
-    TraceRecoveryAction classifyWrongPathNonInstSquash(ThreadID tid,
-                                                       const PCStateBase &new_pc,
-                                                       InstSeqNum seqNum);
-    TraceRecoveryAction classifyNormalSquash(ThreadID tid,
-                                             const PCStateBase &new_pc,
-                                             const DynInstPtr &squashInst,
-                                             InstSeqNum seqNum);
-    void applyTraceRecoveryAction(ThreadID tid,
-                                  const TraceRecoveryAction &action);
-    bool rollbackTraceReaderToIndex(uint64_t index);
 
     void ensureTraceStreamFilled(ThreadID tid, size_t min_count);
     void cleanupTraceMetadata(InstSeqNum seqNum);

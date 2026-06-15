@@ -23,7 +23,15 @@ GTest('abtb.test',
 # Add TAGE test with necessary dependencies
 GTest('tage.test', 
     '../btb_tage.cc',
+    '../btb_tage_ub.cc',
     'btb_tage.test.cc',
+    '../folded_hist.cc',
+    '../timed_base_pred.cc',
+)
+
+GTest('mgsc.test',
+    '../btb_mgsc.cc',
+    'btb_mgsc.test.cc',
     '../folded_hist.cc',
     '../timed_base_pred.cc',
 )
@@ -33,28 +41,8 @@ GTest('folded_hist.test',
     '../folded_hist.cc',
 )
 
-# below tests must add --unit-test to enable unit test mode!
-GTest('jump_ahead.test',
-    'jump_ahead.test.cc',
-)
-
-# must use --unit-test to enable unit test mode!
-# scons build/RISCV/cpu/pred/btb/test/fetch_target_queue.test.debug -j100 --unit-test
-GTest('fetch_target_queue.test',
-    'fetch_target_queue.test.cc',
-    '../fetch_target_queue.cc',
-)
-
-# add --unit-test to enable unit test mode
-GTest('decoupled_bpred.test',
-    'decoupled_bpred.test.cc',
-    'decoupled_bpred.cc',
-    '../mbtb.cc',
-    '../btb_tage.cc',
-    '../folded_hist.cc',
-    '../timed_base_pred.cc',
-    '../fetch_target_queue.cc',
-    # '../../../../sim/serialize.cc',     # for PCStateBase
+GTest('history_manager.test',
+    'history_manager.test.cc',
 )
 
 # add --unit-test to enable unit test mode for RAS
@@ -69,7 +57,9 @@ GTest('decoupled_bpred.test',
 env.Append(UNITTESTS=['uras.test',
         'btb.test',
         'tage.test',
+        'mgsc.test',
         'folded_hist.test',
+        'history_manager.test',
         'jump_ahead.test',
         'fetch_target_queue.test',
         'decoupled_bpred.test'])

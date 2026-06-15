@@ -657,15 +657,26 @@ def makeBareMetalRiscvSystem(mem_mode, mdesc=None, cmdline=None):
     self.system_port = self.membus.cpu_side_ports
     return self
 
-def makeBareMetalXiangshanSystem(mem_mode, mdesc=None, cmdline=None, np=1, ruby=False):
+def makeBareMetalXiangshanSystem(mem_mode, mdesc=None, cmdline=None, np=1,
+                                 ruby=False, num_threads=None):
+    self = makeXiangshanPlatformSystem(mem_mode, mdesc, np=np, ruby=ruby,
+                                       num_threads=num_threads)
+    self.workload = RiscvBareMetal()
+    self.workload.reset_vect = 0x80000000
+    return self
+
+
+def makeXiangshanPlatformSystem(mem_mode, mdesc=None, np=1, ruby=False,
+                                num_threads=None):
     self = System()
     if not mdesc:
         # generic system
         mdesc = SysConfig()
+    if num_threads is None:
+        num_threads = np
     self.mem_mode = mem_mode
     self.mem_ranges = [AddrRange(start=0x80000000, size=mdesc.mem())]
     print(self.mem_ranges)
-    self.workload = RiscvBareMetal()
 
     self.iobus = IOXBar()
     if not ruby:
@@ -681,7 +692,11 @@ def makeBareMetalXiangshanSystem(mem_mode, mdesc=None, cmdline=None, np=1, ruby=
     self.lint = Clint()
     self.lint.pio = self.iobus.mem_side_ports
     self.lint.pio_addr = 0x38000000
-    self.lint.num_threads = np
+    self.lint.num_threads = num_threads
+
+    self.hartctrl = HartCtrl()
+    self.hartctrl.pio = self.iobus.mem_side_ports
+    self.hartctrl.num_threads = num_threads
 
     self.mmcs = NemuMMC()
     self.mmcs.pio = self.iobus.mem_side_ports
@@ -694,11 +709,11 @@ def makeBareMetalXiangshanSystem(mem_mode, mdesc=None, cmdline=None, np=1, ruby=
             AddrRange(self.uartlite.pio_addr, self.uartlite.pio_addr +
             self.uartlite.pio_size),
             AddrRange(self.lint.pio_addr, self.lint.pio_addr + self.lint.pio_size),
+            AddrRange(self.hartctrl.pio_addr, self.hartctrl.pio_addr + self.hartctrl.pio_size),
             AddrRange(self.mmcs.pio_addr, self.mmcs.pio_addr + self.mmcs.pio_size),
             AddrRange(self.plic.pio_addr, self.plic.pio_addr + self.plic.pio_size),
             ]
 
-    self.workload.reset_vect = 0x80000000
     if not ruby:
         self.system_port = self.membus.cpu_side_ports
     return self

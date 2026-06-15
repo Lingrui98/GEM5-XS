@@ -3,7 +3,7 @@
 
 #include "base/types.hh"
 #include "cpu/inst_seq.hh"
-#include "cpu/pred/btb/stream_struct.hh"
+#include "cpu/pred/btb/common.hh"
 #include "cpu/pred/btb/timed_base_pred.hh"
 #include "debug/URAS.hh"
 #include "params/BTBuRAS.hh"
@@ -43,15 +43,15 @@ class BTBuRAS : public TimedBaseBTBPredictor
         void putPCHistory(Addr startAddr, const boost::dynamic_bitset<> &history,
                           std::vector<FullBTBPrediction> &stagePreds) override;
         
-        std::shared_ptr<void> getPredictionMeta() override;
+        std::shared_ptr<void> getPredictionMeta(ThreadID tid = 0) override;
 
-        void specUpdateHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred) override;
+        void specUpdateState(FullBTBPrediction &pred);
 
         unsigned getDelay() override {return 0;}
 
-        void recoverHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt, bool cond_taken) override;
+        void recoverState(const FetchTarget &entry);
 
-        void update(const FetchStream &entry) override;
+        void update(const FetchTarget &entry) override;
 
         int getSp() {return specSp;}
 

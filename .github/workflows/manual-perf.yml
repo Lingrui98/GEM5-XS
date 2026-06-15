@@ -1,8 +1,14 @@
 name: Manual Performance Test
+run-name: ${{ format('{0} - {1} - {2}{3} - {4} - {5}', github.event.inputs.note || 'Manual Performance Test', github.event.inputs.configuration, github.event.inputs.benchmark_type, github.event.inputs.specific_benchmarks && format(' ({0})', github.event.inputs.specific_benchmarks) || '', github.event.inputs.branch || github.ref_name, github.event.inputs.vector_type) }}
 
 on:
   workflow_dispatch:
     inputs:
+      note:
+        description: 'Title prefix for this manual perf run'
+        required: false
+        type: string
+        default: 'Manual Performance Test'
       configuration:
         description: 'Choose Kunminghu configuration'
         required: true
@@ -12,18 +18,29 @@ on:
           - 'kmhv2.py'
           - 'kmhv3.py'
           - 'idealkmhv3.py'
+          - 'smt_idealkmhv3.py'
       benchmark_type:
         description: 'Benchmark coverage type'
         required: true
         type: choice
-        default: 'spec06-0.8c'
+        default: 'gcc15-spec06-0.8c'
         options:
-          - spec06-0.3c
-          - spec06-0.8c
-          - spec06-1.0c
+          - gcc12-spec06-0.3c
+          - gcc12-spec06-smt-0.3c
+          - gcc12-spec06-smt-1.0c
+          - gcc12-spec06-0.8c
+          - gcc12-spec06-1.0c
+          - gcc15-spec06-0.3c
+          - gcc15-spec06-0.8c
+          - gcc15-spec06-1.0c
           - spec17-1.0c
           - spec06-rvv-1.0c
           - spec06int-rvv-0.8c
+      specific_benchmarks:
+        description: 'Specific benchmarks to run (comma-separated, eg. "mcf,gcc"), leave empty to run all'
+        required: false
+        type: string
+        default: ''
       vector_type:
         description: 'Vector decode strategy (only for rvv benchmarks)'
         required: false
@@ -41,27 +58,20 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      script_path: ${{ steps.resolve.outputs.script_path }}
+      config_path: ${{ steps.resolve.outputs.config_path }}
+      extra_args: ${{ steps.resolve.outputs.extra_args }}
       pr_sha: ${{ steps.resolve.outputs.pr_sha }}
     steps:
       - name: Resolve parameters
         id: resolve
         run: |
-          case "${{ github.event.inputs.configuration }}" in
-            "kmhv2.py")
-              echo "script_path=../kmh_6wide.sh" >> $GITHUB_OUTPUT
-              ;;
-            "kmhv3.py")
-              echo "script_path=../kmh_v3_btb.sh" >> $GITHUB_OUTPUT
-              ;;
-            "idealkmhv3.py")
-              echo "script_path=../kmh_v3_ideal.sh" >> $GITHUB_OUTPUT
-              ;;
-            *)
-              echo "Error: unsupported configuration '${{ github.event.inputs.configuration }}'" >&2
-              exit 1
-              ;;
-          esac
+          if [[ "${{ github.event.inputs.benchmark_type }}" == gcc12-spec06-smt-* ]]; then
+            echo "config_path=configs/example/smt_idealkmhv3.py" >> $GITHUB_OUTPUT
+            echo "extra_args=" >> $GITHUB_OUTPUT
+          else
+            echo "config_path=configs/example/${{ github.event.inputs.configuration }}" >> $GITHUB_OUTPUT
+            echo "extra_args=" >> $GITHUB_OUTPUT
+          fi
           
           if [ -n "${{ github.event.inputs.branch }}" ]; then
             echo "pr_sha=${{ github.event.inputs.branch }}" >> $GITHUB_OUTPUT
@@ -73,8 +83,10 @@ jobs:
     needs: setup
     uses: ./.github/workflows/gem5-perf-template.yml
     with:
-      script_path: ${{ needs.setup.outputs.script_path }}
+      config_path: ${{ needs.setup.outputs.config_path }}
+      extra_args: ${{ needs.setup.outputs.extra_args }}
       benchmark_type: ${{ github.event.inputs.benchmark_type }}
+      specific_benchmarks: ${{ github.event.inputs.specific_benchmarks }}
       vector_type: ${{ github.event.inputs.vector_type }}
       pr_sha: ${{ needs.setup.outputs.pr_sha }}
       check_result: true

@@ -92,62 +92,6 @@ enum class SplitStoreStatus
 
 class IEW;
 
-class StoreBufferEntry
-{
-  public:
-    const int index;
-    Addr blockVaddr;
-    Addr blockPaddr;
-    std::vector<uint8_t> blockDatas;
-    std::vector<bool> validMask;
-    bool sending;
-    // the another same addr entry when sending
-    // another cannot sending until self sending finished
-    StoreBufferEntry* vice = nullptr;
-    // merged request
-    LSQ::SbufferRequest* request = nullptr;
-
-    StoreBufferEntry(int size, int index) : index(index) {
-        blockDatas.resize(size, 0);
-        validMask.resize(size, false);
-    }
-
-    void reset(uint64_t blockVaddr, uint64_t blockPaddr, uint64_t offset, uint8_t *datas, uint64_t size,
-               const std::vector<bool> &mask);
-
-    void merge(uint64_t offset, uint8_t *datas, uint64_t size, const std::vector<bool> &mask);
-
-    bool recordForward(RequestPtr req, LSQ::LSQRequest *lsqreq);
-};
-
-class StoreBuffer
-{
-    using mapIter = typename std::unordered_map<uint64_t, StoreBufferEntry*>::iterator;
-
-    // key = (paddr & cacheblockmask)
-    uint64_t _size;
-    std::unordered_map<uint64_t, StoreBufferEntry*> data_map;
-    std::vector<mapIter> crossRef;
-    boost::circular_buffer<int> lru_index;
-    boost::circular_buffer<int> free_list;
-    std::vector<StoreBufferEntry*> data_vec;
-    std::vector<bool> data_vld;
-
-public:
-
-    void setData(std::vector<StoreBufferEntry*>& data_vec);
-    bool full();
-    uint64_t size();
-    uint64_t unsentSize();
-    StoreBufferEntry* getEmpty();
-    void insert(int index, uint64_t addr);
-    StoreBufferEntry* get(uint64_t addr);
-    void update(int index);
-    StoreBufferEntry* getEvict();
-    StoreBufferEntry* createVice(StoreBufferEntry* entry);
-    void release(StoreBufferEntry* entry);
-};
-
 /**
  * Class that implements the actual LQ and SQ for each specific
  * thread.  Both are circular queues; load entries are freed upon
@@ -210,6 +154,7 @@ class LSQUnit
         }
 
         LSQRequest* request() { return _request; }
+        const LSQRequest* request() const { return _request; }
         void setRequest(LSQRequest* r) { _request = r; }
         bool hasRequest() { return _request != nullptr; }
         /** Member accessors. */
@@ -268,6 +213,8 @@ class LSQUnit
 
         bool addrReady() const { return _addrReady; }
         bool dataReady() const { return _dataReady; }
+        bool staFinish() const { return _staFinish; }
+        bool stdFinish() const { return _stdFinish; }
         bool canForwardToLoad() const { return _addrReady && _dataReady; }
         bool splitStoreFinish() const { return _staFinish && _stdFinish; }
 
@@ -288,8 +235,7 @@ class LSQUnit
     using LQEntry = LSQEntry;
 
   public:
-    // storeQue -> storeBuffer -> cache
-    const int maxSQoffload = 2;
+    // storeQue -> shared storeBuffer -> cache
     const int sqFullBufferSize = 4;
 
     // loadpipe
@@ -300,22 +246,10 @@ class LSQUnit
     const int storeWhenToReplay = 2;
 
     int sqFullUpperLimit = 0;
-    int sqFullLowerLimit = 0;
-    bool storeBufferFlushing = false;
-    bool sqWillFull = false;
-    const uint32_t sbufferEvictThreshold = 0;
-    const uint32_t sbufferEntries = 0;
 
     uint64_t numSBufferRequest = 0;
     uint64_t numSingleRequest = 0;
     uint64_t numSplitRequest = 0;
-
-    StoreBuffer storeBuffer;
-    // Store Buffer Writeback Timeout
-    uint64_t storeBufferWritebackInactive;
-    uint64_t storeBufferInactiveThreshold;
-
-    StoreBufferEntry* blockedsbufferEntry = nullptr;
 
     /** Coverage of one address range with another */
     enum class AddrRangeCoverage
@@ -333,8 +267,7 @@ class LSQUnit
 
   public:
     /** Constructs an LSQ unit. init() must be called prior to use. */
-    LSQUnit(uint32_t lqEntries, uint32_t sqEntries, uint32_t sbufferEntries,
-      uint32_t sbufferEvictThreshold, uint64_t storeBufferInactiveThreshold,
+    LSQUnit(uint32_t lqEntries, uint32_t sqEntries,
       uint32_t ldPipeStages, uint32_t stPipeStages, uint32_t maxRARQEntries, uint32_t maxRAWQEntries,
       unsigned rarDequeuePerCycle, unsigned rawDequeuePerCycle,
       unsigned loadCompletionWidth, unsigned storeCompletionWidth);
@@ -372,6 +305,7 @@ class LSQUnit
     void insertLoad(const DynInstPtr &load_inst);
     /** Inserts a store instruction. */
     void insertStore(const DynInstPtr &store_inst);
+    bool splitStoreAddrSquashed(const DynInstPtr &inst);
 
     /** Check for ordering violations in the LSQ. For a store squash if we
      * ever find a conflicting load. For a load, only squash if we
@@ -396,6 +330,8 @@ class LSQUnit
      * of the intermediate invalidate.
      */
     void checkSnoop(PacketPtr pkt);
+    void checkLocalStoreVisible(Addr store_paddr,
+                                const std::vector<bool> &store_byte_enable);
 
     /** Iq issues a load to load pipeline. */
     void issueToLoadPipe(const DynInstPtr &inst);
@@ -418,18 +354,22 @@ class LSQUnit
 
     bool directStoreToCache();
 
+    uint32_t countStoreBufferOffloadableEntries(uint32_t max_entries) const;
+
     /** Writes back stores. */
-    void offloadToStoreBuffer();
+    void offloadToStoreBuffer(uint32_t max_entries, std::vector<bool>& offload_fail);
 
-    bool insertStoreBuffer(Addr vaddr, Addr paddr, uint8_t* datas, uint64_t size, const std::vector<bool>& mask);
+    bool insertStoreBuffer(Addr vaddr, Addr paddr, uint8_t* datas,
+                           uint64_t size, const std::vector<bool>& mask,
+                           InstSeqNum store_seq);
 
-    void storeBufferEvictToCache();
-
-    void flushStoreBuffer();
-
-    bool storeBufferEmpty() { return storeBuffer.size() == 0; }
-
-    void completeSbufferEvict(PacketPtr pkt);
+    bool storeBufferEmpty() { return lsq->storeBufferEmpty(); }
+    bool storeBufferEmpty(ThreadID tid) { return lsq->storeBufferEmpty(tid); }
+    bool storeBufferSQWillFull() const
+    {
+        return storeQueue.size() > sqFullUpperLimit;
+    }
+    void recordStoreBufferBlockedByCache() { ++stats.blockedByCache; }
 
     /** Completes the data access that has been returned from the
      * memory system. */
@@ -449,6 +389,12 @@ class LSQUnit
     /** Check if there exists raw nuke between load and store. */
     bool pipeLineNukeCheck(const DynInstPtr &load_inst, const DynInstPtr &store_inst);
 
+    /** Returns the current request attached to an active LQ entry. */
+    LSQRequest *currentLoadRequest(const DynInstPtr &inst);
+
+    /** Returns the current request attached to an active SQ entry. */
+    LSQRequest *currentStoreRequest(const DynInstPtr &inst);
+
     /** Returns the number of free LQ entries. */
     unsigned numFreeLoadEntries();
 
@@ -462,10 +408,16 @@ class LSQUnit
     unsigned getAndResetLastClockSQPopEntries();
 
     /** Returns the number of loads in the LQ. */
-    int numLoads() { return loadQueue.size(); }
+    int numLoads() const { return loadQueue.size(); }
 
     /** Returns the number of stores in the SQ. */
-    int numStores() { return storeQueue.size(); }
+    int numStores() const { return storeQueue.size(); }
+
+    /** Returns the number of entries in the per-thread RAR queue. */
+    int numRAREntries() const { return RARQueue.size(); }
+
+    /** Returns the number of entries in the per-thread RAW queue. */
+    int numRAWEntries() const { return RAWQueue.size(); }
 
     // hardware transactional memory
     int numHtmStarts() const { return htmStarts; }
@@ -507,8 +459,11 @@ class LSQUnit
     /** Returns if there are any stores to writeback. */
     bool hasStoresToWB() { return storesToWB > 0; }
 
+    /** Returns if there are older stores/atomics still pending writeback. */
+    bool hasStoresToWBBefore(InstSeqNum seq_num) const;
+
     /** Returns the number of stores to writeback. */
-    int numStoresToSbuffer() { return storesToWB; }
+    int numStoresToSbuffer() const { return storesToWB; }
 
     /** Update loadCompletedIdx and storeCompletedIdx */
     void updateCompletedIdx();
@@ -524,7 +479,7 @@ class LSQUnit
                         storeWBIt->canWB() &&
                         !storeWBIt->completed() &&
                         !isStoreBlocked;
-        return t || storeBufferFlushing;
+        return t;
     }
 
     /** Handles doing the retry. */
@@ -540,9 +495,6 @@ class LSQUnit
     /** Writes back the instruction, sending it to IEW. */
     void writebackReg(const DynInstPtr &inst, PacketPtr pkt);
 
-    /** Try to finish a previously blocked write back attempt */
-    void writebackBlockedStore();
-
     /** Completes the store at the specified index. */
     void completeStore(typename StoreQueue::iterator store_idx, bool from_sbuffer = false);
 
@@ -550,6 +502,9 @@ class LSQUnit
     void storePostSend();
 
   public:
+    /** Try to finish a previously blocked write back attempt */
+    bool writebackBlockedStore();
+
     /** Attempts to send a packet to the cache.
      * Check if there are ports available. Return true if
      * there are, false if there are not.
@@ -560,8 +515,6 @@ class LSQUnit
 
     bool trySendPacket(bool isLoad, PacketPtr data_pkt, bool &bank_conflict, bool &tag_read_fail,
                        bool &mshr_used, bool &mshr_alias_fail, bool &hit_in_write_buffer);
-
-    bool sbufferSendPacket(PacketPtr data_pkt);
 
     bool forwardFromStoreBuffer(const DynInstPtr &inst);
 
@@ -640,6 +593,9 @@ class LSQUnit
       private:
         /** Instruction whose results are being written back. */
         DynInstPtr inst;
+
+        /** Request that owns the delayed writeback lifecycle. */
+        LSQRequest *request;
 
         /** The packet that would have been sent to memory. */
         PacketPtr pkt;
@@ -778,8 +734,6 @@ class LSQUnit
     /** Whehter or not a store is blocked due to the memory system. */
     bool isStoreBlocked;
 
-    bool storeBlockedfromQue;
-
     bool sbufferStall;
 
     /** Whether or not a store is in flight. */
@@ -790,6 +744,9 @@ class LSQUnit
 
     /** Flag for memory model. */
     bool needsTSO;
+
+    /** Avoid counting the same store-load violation more than once per cycle. */
+    bool countedStLdViolationThisCycle = false;
 
     unsigned lastClockSQPopEntries;
     unsigned lastClockLQPopEntries;
@@ -852,6 +809,30 @@ class LSQUnit
         /** Tota number of memory ordering violations. */
         statistics::Scalar memOrderViolation;
 
+        /** Total number of load-load violation events. */
+        statistics::Scalar ldLdViolation;
+
+        /** Total number of store-load violation events. */
+        statistics::Scalar stLdViolation;
+
+        /** RAW memory ordering violations caused by a younger load. */
+        statistics::Scalar rawMemOrderViolation;
+
+        /** RAW violations where replay-based MDP had no producer prediction. */
+        statistics::Scalar rawViolationMdpNoPred;
+
+        /** RAW violations where replay-based MDP predicted the violating store. */
+        statistics::Scalar rawViolationMdpHit;
+
+        /** RAW violations where replay-based MDP predicted other stores only. */
+        statistics::Scalar rawViolationMdpMiss;
+
+        /** RAW violations where replay-based MDP used strict wait. */
+        statistics::Scalar rawViolationMdpStrict;
+
+        /** Load-load/snoop ordering violations. */
+        statistics::Scalar loadOrderViolation;
+
         /** Tota number of successfully forwarding from bus. */
         statistics::Scalar busForwardSuccess;
 
@@ -875,12 +856,11 @@ class LSQUnit
 
         statistics::Scalar sbufferFull;
 
+        /** Store-buffer line management counters. */
+        statistics::Scalar sbufferMerge;
+        statistics::Scalar sbufferNewline;
         statistics::Scalar sbufferCreateVice;
 
-        statistics::Scalar sbufferEvictDuetoFlush;
-        statistics::Scalar sbufferEvictDuetoFull;
-        statistics::Scalar sbufferEvictDuetoSQFull;
-        statistics::Scalar sbufferEvictDuetoTimeout;
         statistics::Scalar sbufferFullForward;
         statistics::Scalar sbufferPartiForward;
 
@@ -902,15 +882,33 @@ class LSQUnit
 
         /** RAR replay queue related stats */
         statistics::Scalar RARQueueFull;
+        statistics::Scalar RARQueueFullCycles;
         statistics::Scalar RARQueueReplay;
         statistics::Distribution RARQueueLatency;
+        statistics::Average RARQueueAvgEntryNum;
 
         /** RAW replay queue related stats */
         statistics::Scalar RAWQueueFull;
+        statistics::Scalar RAWQueueFullCycles;
         statistics::Scalar RAWQueueReplay;
         statistics::Distribution RAWQueueLatency;
+        statistics::Average RAWQueueAvgEntryNum;
 
+        /** Pipe-entry counters sampled at the actual pipe accept point. */
+        statistics::Vector loadPipeAccepted;
+        statistics::Vector storePipeAccepted;
+        /** Store replay counters recorded at the replay exit. */
+        statistics::Scalar storeReplayTotal;
+        statistics::Scalar storeReplayTlbMiss;
+        statistics::Vector loadPipeReplayAccepted;
+        statistics::Vector loadPipeFastReplayAccepted;
         statistics::Vector loadReplayEvents;
+        /**
+         * Replay causes counted only on the first IssueQueue -> load-pipe
+         * attempt, to better align with the RTL counters that count only the
+         * first enqueue into LRQ.
+         */
+        statistics::Vector loadReplayEventsFromIssueQueue;
     } stats;
 
     void bankConflictReplay();

@@ -58,7 +58,10 @@
 #include "debug/VecRegs.hh"
 #include "mem/packet.hh"
 #include "mem/request.hh"
+#include "mem/se_translating_port_proxy.hh"
+#include "mem/translating_port_proxy.hh"
 #include "params/RiscvISA.hh"
+#include "sim/faults.hh"
 #include "sim/full_system.hh"
 #include "sim/pseudo_inst.hh"
 
@@ -67,6 +70,47 @@ namespace gem5
 
 namespace RiscvISA
 {
+
+namespace
+{
+
+Fault
+matrixReadBlob(ThreadContext *tc, Addr addr, void *dst, size_t size)
+{
+    bool ok = false;
+    if (FullSystem) {
+        TranslatingPortProxy proxy(tc);
+        ok = proxy.tryReadBlob(addr, dst, size);
+    } else {
+        SETranslatingPortProxy proxy(tc);
+        ok = proxy.tryReadBlob(addr, dst, size);
+    }
+
+    if (!ok) {
+        return std::make_shared<GenericPageTableFault>(addr);
+    }
+    return NoFault;
+}
+
+Fault
+matrixWriteBlob(ThreadContext *tc, Addr addr, const void *src, size_t size)
+{
+    bool ok = false;
+    if (FullSystem) {
+        TranslatingPortProxy proxy(tc);
+        ok = proxy.tryWriteBlob(addr, src, size);
+    } else {
+        SETranslatingPortProxy proxy(tc);
+        ok = proxy.tryWriteBlob(addr, src, size);
+    }
+
+    if (!ok) {
+        return std::make_shared<GenericPageTableFault>(addr);
+    }
+    return NoFault;
+}
+
+} // namespace
 
 [[maybe_unused]] const std::array<const char *, NUM_MISCREGS> MiscRegNames = {{
     [MISCREG_PRV]           = "PRV",
@@ -210,8 +254,8 @@ namespace RiscvISA
     [MISCREG_PMPADDR14]     = "PMPADDR14",
     [MISCREG_PMPADDR15]     = "PMPADDR15",
 
-    [MISCREG_SEDELEG]       = "SEDELEG",
-    [MISCREG_SIDELEG]       = "SIDELEG",
+    [MISCREG_RESERVED01]    = "",
+    [MISCREG_RESERVED02]    = "",
     [MISCREG_STVEC]         = "STVEC",
     [MISCREG_SCOUNTEREN]    = "SCOUNTEREN",
     [MISCREG_SSCRATCH]      = "SSCRATCH",
@@ -220,11 +264,11 @@ namespace RiscvISA
     [MISCREG_STVAL]         = "STVAL",
     [MISCREG_SATP]          = "SATP",
 
-    [MISCREG_UTVEC]         = "UTVEC",
-    [MISCREG_USCRATCH]      = "USCRATCH",
-    [MISCREG_UEPC]          = "UEPC",
-    [MISCREG_UCAUSE]        = "UCAUSE",
-    [MISCREG_UTVAL]         = "UTVAL",
+    [MISCREG_RESERVED03]    = "",
+    [MISCREG_RESERVED04]    = "",
+    [MISCREG_RESERVED05]    = "",
+    [MISCREG_RESERVED06]    = "",
+    [MISCREG_RESERVED07]    = "",
     [MISCREG_FFLAGS]        = "FFLAGS",
     [MISCREG_FRM]           = "FRM",
 
@@ -285,6 +329,7 @@ ISA::ISA(const Params &p) : BaseISA(p)
     _regClasses.emplace_back(MiscRegClass, NUM_MISCREGS, debug::MiscRegs, sizeof(RegVal));
 
     miscRegFile.resize(NUM_MISCREGS);
+    resetMatrixState();
     clear();
 }
 
@@ -317,11 +362,10 @@ ISA::copyRegsFrom(ThreadContext *src)
 void ISA::clear()
 {
     std::fill(miscRegFile.begin(), miscRegFile.end(), 0);
+    resetMatrixState();
 
     miscRegFile[MISCREG_PRV] = PRV_M;
     miscRegFile[MISCREG_ISA] = 0x80000000003411af;
-    miscRegFile[MISCREG_VENDORID] = 0;
-    miscRegFile[MISCREG_ARCHID] = 0;
     miscRegFile[MISCREG_IMPID] = 0;
     miscRegFile[MISCREG_MIDELEG] = ((1 << 12) | (1 << 10) | (1 << 6) | (1 << 2));
     if (FullSystem) {
@@ -344,7 +388,137 @@ void ISA::clear()
     miscRegFile[MISCREG_HSTATUS] = (uint64_t)2<<32;
     miscRegFile[MISCREG_VSSTATUS] = miscRegFile[MISCREG_STATUS] & NEMU_SSTATUS_RMASK;
     miscRegFile[MISCREG_ARCHID] = 0x19;
+    miscRegFile[MISCREG_VENDORID] = (16ULL << 7) | 0x6FULL;
+}
 
+void
+ISA::resetMatrixState()
+{
+    matrixTileM = 0;
+    matrixTileK = 0;
+    matrixTileN = 0;
+    matrixTileA.assign(MatrixTileABytes, 0);
+    matrixTileB.assign(MatrixTileBBytes, 0);
+    matrixAcc.assign(MatrixAccElems, 0);
+    matrixTokens.assign(32, 0);
+}
+
+void
+ISA::matrixSyncReset(uint64_t token_idx)
+{
+    matrixToken(token_idx) = 0;
+}
+
+void
+ISA::matrixRelease(uint64_t token_idx)
+{
+    ++matrixToken(token_idx);
+}
+
+void
+ISA::matrixAcquire(uint64_t token_idx, uint64_t target)
+{
+    panic_if(matrixToken(token_idx) < target,
+        "macquire tok%u target=%llu observed=%llu",
+        token_idx, target, matrixToken(token_idx));
+}
+
+void
+ISA::setMatrixTileM(uint64_t value)
+{
+    matrixTileM = clampMatrixTileM(value);
+}
+
+void
+ISA::setMatrixTileK(uint64_t value)
+{
+    matrixTileK = clampMatrixTileK(value);
+}
+
+void
+ISA::setMatrixTileN(uint64_t value)
+{
+    matrixTileN = clampMatrixTileN(value);
+}
+
+Fault
+ISA::matrixLoadA8(ExecContext *xc, Addr base, Addr stride)
+{
+    ThreadContext *tc = xc->tcBase();
+    for (uint32_t row = 0; row < matrixTileM; ++row) {
+        auto *dst = reinterpret_cast<uint8_t *>(&matrixTileA[row * MatrixMaxK]);
+        Fault fault = matrixReadBlob(tc, base + row * stride, dst, matrixTileK);
+        if (fault != NoFault) {
+            return fault;
+        }
+    }
+    return NoFault;
+}
+
+Fault
+ISA::matrixLoadB8(ExecContext *xc, Addr base, Addr stride)
+{
+    ThreadContext *tc = xc->tcBase();
+    for (uint32_t row = 0; row < matrixTileN; ++row) {
+        auto *dst = reinterpret_cast<uint8_t *>(&matrixTileB[row * MatrixMaxK]);
+        Fault fault = matrixReadBlob(tc, base + row * stride, dst, matrixTileK);
+        if (fault != NoFault) {
+            return fault;
+        }
+    }
+    return NoFault;
+}
+
+Fault
+ISA::matrixLoadC32(ExecContext *xc, Addr base, Addr stride)
+{
+    ThreadContext *tc = xc->tcBase();
+    for (uint32_t row = 0; row < matrixTileM; ++row) {
+        auto *dst = reinterpret_cast<uint8_t *>(&matrixAcc[row * MatrixMaxN]);
+        Fault fault = matrixReadBlob(
+            tc, base + row * stride, dst, matrixTileN * sizeof(int32_t));
+        if (fault != NoFault) {
+            return fault;
+        }
+    }
+    return NoFault;
+}
+
+Fault
+ISA::matrixStoreC32(ExecContext *xc, Addr base, Addr stride)
+{
+    ThreadContext *tc = xc->tcBase();
+    for (uint32_t row = 0; row < matrixTileM; ++row) {
+        auto *src = reinterpret_cast<uint8_t *>(&matrixAcc[row * MatrixMaxN]);
+        Fault fault = matrixWriteBlob(
+            tc, base + row * stride, src, matrixTileN * sizeof(int32_t));
+        if (fault != NoFault) {
+            return fault;
+        }
+    }
+    return NoFault;
+}
+
+void
+ISA::matrixZeroAcc()
+{
+    std::fill(matrixAcc.begin(), matrixAcc.end(), 0);
+}
+
+void
+ISA::matrixMMAccWB()
+{
+    for (uint32_t m = 0; m < matrixTileM; ++m) {
+        for (uint32_t n = 0; n < matrixTileN; ++n) {
+            int32_t acc = matrixAcc[m * MatrixMaxN + n];
+            for (uint32_t k = 0; k < matrixTileK; ++k) {
+                int8_t a = matrixTileA[m * MatrixMaxK + k];
+                int8_t b = matrixTileB[n * MatrixMaxK + k];
+                acc += static_cast<int32_t>(a) * static_cast<int32_t>(b);
+            }
+            matrixAcc[m * MatrixMaxN + n] = acc;
+        }
+    }
 }
 
 bool
@@ -576,10 +750,16 @@ ISA::setMiscReg(int misc_reg, RegVal val)
         write_val = write_val | write_val2;
         setMiscRegNoEffect(MISCREG_VSSTATUS, write_val);
     } else if ((v == 1) && ((misc_reg == MISCREG_SATP))) {
-        if ((val & SATP_MODE_MASK) >> NEMU_SATP_RIGHT_OFFSET == NEMU_SATP_BARE ||
-            (val & SATP_MODE_MASK) >> NEMU_SATP_RIGHT_OFFSET == NEMU_SATP_SV39 ||
-            (val & SATP_MODE_MASK) >> NEMU_SATP_RIGHT_OFFSET == NEMU_SATP_SV48) {
+        auto satp_mode = (val & SATP_MODE_MASK) >> NEMU_SATP_RIGHT_OFFSET;
+        if (satp_mode == NEMU_SATP_BARE) {
             setMiscRegNoEffect(MISCREG_VSATP, val & NEMU_SATP_MASK);
+            warn("enable SATP BARE\n");
+        } else if (satp_mode == NEMU_SATP_SV39) {
+            setMiscRegNoEffect(MISCREG_VSATP, val & NEMU_SATP_MASK);
+            warn("enable SV39\n");
+        } else if (satp_mode == NEMU_SATP_SV48) {
+            setMiscRegNoEffect(MISCREG_VSATP, val & NEMU_SATP_MASK);
+            warn("enable SV48\n");
         }
     } else if ((v == 1) && (misc_reg == MISCREG_SEPC)) {
         setMiscRegNoEffect(MISCREG_VSEPC, val);
@@ -703,19 +883,20 @@ ISA::setMiscReg(int misc_reg, RegVal val)
                 // shall have no effect (see 4.1.12 in priv ISA manual)
                 SATP cur_val = readMiscRegNoEffect(misc_reg);
                 SATP new_val = val;
-                //change the mode update , only support sv39
-                //if (new_val.mode != AddrXlateMode::BARE &&
-                //    new_val.mode != AddrXlateMode::SV39)
-                //    new_val.mode = cur_val.mode;
-                //setMiscRegNoEffect(misc_reg, new_val);
                 if (cur_val != new_val) {
                     tc->getCpuPtr()->flushTLBs();
                 }
-                if ((val & SATP_MODE_MASK) >> NEMU_SATP_RIGHT_OFFSET == NEMU_SATP_BARE ||
-                    (val & SATP_MODE_MASK) >> NEMU_SATP_RIGHT_OFFSET == NEMU_SATP_SV39 ||
-                    (val & SATP_MODE_MASK) >> NEMU_SATP_RIGHT_OFFSET == NEMU_SATP_SV48) {
-                    RegVal writeVal = val & NEMU_SATP_MASK;
+                auto satp_mode = (val & SATP_MODE_MASK) >> NEMU_SATP_RIGHT_OFFSET;
+                RegVal writeVal = val & NEMU_SATP_MASK;
+                if (satp_mode == NEMU_SATP_BARE) {
                     setMiscRegNoEffect(misc_reg, writeVal);
+                    warn("enable SATP BARE\n");
+                } else if (satp_mode == NEMU_SATP_SV39) {
+                    setMiscRegNoEffect(misc_reg, writeVal);
+                    warn("enable SV39\n");
+                } else if (satp_mode == NEMU_SATP_SV48) {
+                    setMiscRegNoEffect(misc_reg, writeVal);
+                    warn("enable SV48\n");
                 }
 
             }
@@ -731,14 +912,10 @@ ISA::setMiscReg(int misc_reg, RegVal val)
             break;
           case MISCREG_STATUS:
             {
-                // SXL and UXL are hard-wired to 64 bit
+                // Match NEMU CSR semantics: only writable MSTATUS fields update.
                 auto cur = readMiscRegNoEffect(misc_reg);
-                DPRINTF(RiscvMisc, "Value before and: %#lx\n", val);
-                val &= ~(STATUS_SXL_MASK | STATUS_UXL_MASK);
-                DPRINTF(RiscvMisc, "Value before or: %#lx\n", val);
-                val |= cur & (STATUS_SXL_MASK | STATUS_UXL_MASK);
-                DPRINTF(RiscvMisc, "Value after or: %#lx\n", val);
-                STATUS mstatus = val;
+                STATUS mstatus =
+                    ((cur & ~(NEMU_MSTATUS_WMASK)) | (val & NEMU_MSTATUS_WMASK));
                 mstatus.sd = mstatus.fs == 0x3 || mstatus.vs == 0x3;
                 setMiscRegNoEffect(misc_reg, mstatus);
             }
@@ -822,6 +999,13 @@ ISA::serialize(CheckpointOut &cp) const
 {
     DPRINTF(Checkpoint, "Serializing Riscv Misc Registers\n");
     SERIALIZE_CONTAINER(miscRegFile);
+    SERIALIZE_SCALAR(matrixTileM);
+    SERIALIZE_SCALAR(matrixTileK);
+    SERIALIZE_SCALAR(matrixTileN);
+    SERIALIZE_CONTAINER(matrixTileA);
+    SERIALIZE_CONTAINER(matrixTileB);
+    SERIALIZE_CONTAINER(matrixAcc);
+    SERIALIZE_CONTAINER(matrixTokens);
 }
 
 void
@@ -829,6 +1013,29 @@ ISA::unserialize(CheckpointIn &cp)
 {
     DPRINTF(Checkpoint, "Unserializing Riscv Misc Registers\n");
     UNSERIALIZE_CONTAINER(miscRegFile);
+    UNSERIALIZE_SCALAR(matrixTileM);
+    UNSERIALIZE_SCALAR(matrixTileK);
+    UNSERIALIZE_SCALAR(matrixTileN);
+    UNSERIALIZE_CONTAINER(matrixTileA);
+    UNSERIALIZE_CONTAINER(matrixTileB);
+    UNSERIALIZE_CONTAINER(matrixAcc);
+    UNSERIALIZE_CONTAINER(matrixTokens);
+}
+
+RegVal &
+ISA::matrixToken(size_t idx)
+{
+    panic_if(idx >= matrixTokens.size(), "matrix token index %u out of range",
+        idx);
+    return matrixTokens[idx];
+}
+
+const RegVal &
+ISA::matrixToken(size_t idx) const
+{
+    panic_if(idx >= matrixTokens.size(), "matrix token index %u out of range",
+        idx);
+    return matrixTokens[idx];
 }
 
 const int WARN_FAILURE = 10000;

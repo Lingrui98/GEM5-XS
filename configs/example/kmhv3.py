@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 
 import m5
@@ -10,6 +11,7 @@ from m5.util.fdthelper import *
 addToPath('../')
 
 from ruby import Ruby
+from common.LSQBankConflict import set_lsq_bank_conflict_cache_params
 
 from common.FSConfig import *
 from common.SysPaths import *
@@ -17,7 +19,6 @@ from common.Benchmarks import *
 from common import Simulation
 from common.Caches import *
 from common.xiangshan import *
-
 
 def setKmhV3Params(args, system):
     for cpu in system.cpu:
@@ -92,8 +93,12 @@ def setKmhV3Params(args, system):
 
         # branch predictor
         if args.bp_type == 'DecoupledBPUWithBTB':
-            cpu.branchPred.ftq_size = 256
-            cpu.branchPred.fsq_size = 256
+            cpu.branchPred.ftq_size = 64
+            cpu.branchPred.fsq_size = 64
+
+            if args.btb_tage_upper_bound:
+                cpu.branchPred.tage = BTBTAGEUpperBound(
+                    usePathHashHistory=True)
 
             cpu.branchPred.mbtb.resolvedUpdate = True
             cpu.branchPred.tage.resolvedUpdate = True
@@ -101,12 +106,19 @@ def setKmhV3Params(args, system):
 
             cpu.branchPred.ubtb.enabled = True
             cpu.branchPred.abtb.enabled = True
-            cpu.branchPred.microtage.enabled = False
+            cpu.branchPred.microtage.enabled = True
             cpu.branchPred.mbtb.enabled = True
             cpu.branchPred.tage.enabled = True
             cpu.branchPred.ittage.enabled = True
-            cpu.branchPred.mgsc.enabled = False
+            cpu.branchPred.mgsc.enabled = True
             cpu.branchPred.ras.enabled = True
+
+            if getattr(args, 'standalone_sc', False):
+                cpu.branchPred.microtage.enabled = False
+                cpu.branchPred.tage.enabled = False
+
+                cpu.branchPred.mgsc.forceUseSC = True
+                cpu.branchPred.mgsc.allowMissingTageInfo = True
 
         # l1 cache per core
         if args.caches:
@@ -117,6 +129,7 @@ def setKmhV3Params(args, system):
             cpu.dcache.do_fast_writeline = False
             cpu.dcache.simulate_dcache_refill = True
             cpu.dcache.prefetch_can_offload = False
+            set_lsq_bank_conflict_cache_params(cpu, system)
 
     # l2 caches
     if args.l2cache:
@@ -178,6 +191,8 @@ if __name__ == '__m5_main__':
     TestMemClass = Simulation.setMemClass(args)
 
     test_sys = build_xiangshan_system(args)
+    if args.raw_cpt and args.generic_rv_cpt and os.path.basename(args.generic_rv_cpt) == "linux.bin":
+        configure_xiangshan_linux_workload(test_sys, args)
     # Set ideal parameters here with the highest priority, over command-line arguments
     setKmhV3Params(args, test_sys)
 

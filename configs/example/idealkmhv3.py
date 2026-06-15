@@ -10,6 +10,7 @@ from m5.util.fdthelper import *
 addToPath('../')
 
 from ruby import Ruby
+from common.LSQBankConflict import set_lsq_bank_conflict_cache_params
 
 from common.FSConfig import *
 from common.SysPaths import *
@@ -18,6 +19,7 @@ from common import Simulation
 from common.Caches import *
 from common.xiangshan import *
 
+from m5.objects.ValuePredictor import *
 
 def setKmhV3IdealParams(args, system):
     for cpu in system.cpu:
@@ -30,6 +32,7 @@ def setKmhV3IdealParams(args, system):
         cpu.fetchQueueSize = 64
 
         # decode
+        cpu.fetchToDecodeDelay = 5
         cpu.decodeWidth = 8
         cpu.enable_loadFusion = False
         cpu.enableConstantFolding = False
@@ -40,7 +43,7 @@ def setKmhV3IdealParams(args, system):
         cpu.numPhysFloatRegs = 256
 
         # dispatch
-        cpu.enableDispatchStage = True
+        cpu.enableDispatchStage = False
         cpu.numDQEntries = [8, 8, 8]
         cpu.dispWidth = [8, 8, 8]
 
@@ -61,6 +64,10 @@ def setKmhV3IdealParams(args, system):
         cpu.EnablePipeNukeCheck = True
         cpu.BankConflictCheck = True
         cpu.sbufferBankWriteAccurately = True
+        cpu.DcacheSetDivNum = 2
+
+        # value predictor
+        cpu.valuePred = IdealConstantLVP()
 
         # lsq
         cpu.LQEntries = 128
@@ -77,8 +84,12 @@ def setKmhV3IdealParams(args, system):
 
         # branch predictor
         if args.bp_type == 'DecoupledBPUWithBTB':
-            cpu.branchPred.ftq_size = 256
-            cpu.branchPred.fsq_size = 256
+            cpu.branchPred.ftq_size = 64
+            cpu.branchPred.fsq_size = 64
+            # TAGE table sizes and numWays tunning
+            cpu.branchPred.tage.tableSizes = [2048, 2048, 8192, 8192, 8192, 8192, 8192, 2048]
+            cpu.branchPred.tage.numWays = [2, 2, 4, 2, 2, 2, 2, 2]
+            # cpu.branchPred.microtage.enabled = False
 
         # l1 cache per core
         if args.caches:
@@ -87,6 +98,7 @@ def setKmhV3IdealParams(args, system):
             cpu.dcache.tag_load_read_ports = 100
             cpu.dcache.mshrs = 16
             cpu.dcache.simulate_dcache_refill = True
+            set_lsq_bank_conflict_cache_params(cpu, system)
 
     # l2 caches
     if args.l2cache:
@@ -103,9 +115,9 @@ def setKmhV3IdealParams(args, system):
                     # Configure XSDRRIP replacement policy (DRRIP mode)
                     # Each slice: 2MB/4 = 512KB, 8-way, 64B line → 1024 sets
                     l2_wrapper.slices[j].inner_cache.replacement_policy = XSDRRIPRP(mode=2, num_sets=1024)
-            system.tol2bus_list[i].forward_latency = 0  # 3->0
-            system.tol2bus_list[i].response_latency = 0  # 3->0
-            system.tol2bus_list[i].hint_wakeup_ahead_cycles = 0  # 2->0
+            system.tol2bus_list[i].forward_latency = 3  # 0->3
+            system.tol2bus_list[i].response_latency = 3  # 0->3
+            system.tol2bus_list[i].hint_wakeup_ahead_cycles = 1  # 0->1
 
             # Enable dual-port for DCache → L2 communication
             # ReqLayer[0]: ICache+DCache+ITB+DTB → L2, allow 2 requests per cycle
@@ -130,7 +142,7 @@ if __name__ == '__m5_main__':
     # If user didn't specify bp_type, set default based on ideal_kmhv3
     args.bp_type = 'DecoupledBPUWithBTB'
     args.l2_size = '2MB'
-
+    args.l3_size = '32MB'
     # Match the memories with the CPUs, based on the options for the test system
     TestMemClass = Simulation.setMemClass(args)
 

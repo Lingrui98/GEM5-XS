@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <memory>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -12,10 +14,15 @@
 
 #include "base/sat_counter.hh"
 #include "base/types.hh"
+#include "cpu/o3/limits.hh"
+#include "cpu/pred/btb/common.hh"
 #include "cpu/pred/btb/folded_hist.hh"
-#include "cpu/pred/btb/stream_struct.hh"
 #include "cpu/pred/btb/timed_base_pred.hh"
+
+#ifndef UNIT_TEST
 #include "params/BTBMGSC.hh"
+
+#endif
 
 namespace gem5
 {
@@ -26,11 +33,21 @@ namespace branch_prediction
 namespace btb_pred
 {
 
+// Conditional namespace wrapper for testing
+#ifdef UNIT_TEST
+namespace test {
+#endif
+
 class BTBMGSC : public TimedBaseBTBPredictor
 {
+    static constexpr unsigned MaxThreads = o3::MaxThreads;
   public:
+#ifdef UNIT_TEST
+    BTBMGSC();
+#else
     typedef BTBMGSCParams Params;
-
+    BTBMGSC(const Params &p);
+#endif
     // Contains the complete prediction result
     struct MgscPrediction
     {
@@ -39,6 +56,9 @@ class BTBMGSC : public TimedBaseBTBPredictor
         bool use_mgsc;                    // Whether to use MGSC prediction
         bool taken;                       // Final prediction = (use sc pred) ? (total_sum >= 0) : tage prediction
         bool taken_before_sc;             // Tage prediction (before SC)
+        bool tage_conf_high;
+        bool tage_conf_mid;
+        bool tage_conf_low;
         int16_t total_thres;              // Combined threshold
         std::vector<unsigned> bwIndex;    // BW table indices
         std::vector<unsigned> lIndex;     // L table indices
@@ -66,6 +86,9 @@ class BTBMGSC : public TimedBaseBTBPredictor
               use_mgsc(false),
               taken(false),
               taken_before_sc(false),
+              tage_conf_high(false),
+              tage_conf_mid(false),
+              tage_conf_low(false),
               total_thres(0),
               bwIndex(0),
               lIndex(0),
@@ -89,17 +112,20 @@ class BTBMGSC : public TimedBaseBTBPredictor
         }
 
         MgscPrediction(Addr btb_pc, int total_sum, bool use_mgsc, bool taken, bool taken_before_sc,
-                       int16_t total_thres, std::vector<unsigned> bwIndex, std::vector<unsigned> lIndex,
-                       std::vector<unsigned> iIndex, std::vector<unsigned> gIndex, std::vector<unsigned> pIndex,
-                       std::vector<unsigned> biasIndex, bool bw_weight_scale_diff, bool l_weight_scale_diff,
-                       bool i_weight_scale_diff, bool g_weight_scale_diff, bool p_weight_scale_diff,
-                       bool bias_weight_scale_diff, int bw_percsum, int l_percsum, int i_percsum, int g_percsum,
-                       int p_percsum, int bias_percsum)
+                       bool tage_conf_high, bool tage_conf_mid, bool tage_conf_low, int16_t total_thres,
+                       std::vector<unsigned> bwIndex, std::vector<unsigned> lIndex, std::vector<unsigned> iIndex,
+                       std::vector<unsigned> gIndex, std::vector<unsigned> pIndex, std::vector<unsigned> biasIndex,
+                       bool bw_weight_scale_diff, bool l_weight_scale_diff, bool i_weight_scale_diff,
+                       bool g_weight_scale_diff, bool p_weight_scale_diff, bool bias_weight_scale_diff, int bw_percsum,
+                       int l_percsum, int i_percsum, int g_percsum, int p_percsum, int bias_percsum)
             : btb_pc(btb_pc),
               total_sum(total_sum),
               use_mgsc(use_mgsc),
               taken(taken),
               taken_before_sc(taken_before_sc),
+              tage_conf_high(tage_conf_high),
+              tage_conf_mid(tage_conf_mid),
+              tage_conf_low(tage_conf_low),
               total_thres(total_thres),
               bwIndex(bwIndex),
               lIndex(lIndex),
@@ -124,7 +150,6 @@ class BTBMGSC : public TimedBaseBTBPredictor
     };
 
   public:
-    BTBMGSC(const Params &p);
     ~BTBMGSC();
 
     void tickStart() override;
@@ -134,41 +159,54 @@ class BTBMGSC : public TimedBaseBTBPredictor
     void putPCHistory(Addr startAddr, const boost::dynamic_bitset<> &history,
                       std::vector<FullBTBPrediction> &stagePreds) override;
 
-    std::shared_ptr<void> getPredictionMeta() override;
+    std::shared_ptr<void> getPredictionMeta(ThreadID tid = 0) override;
 
-    // speculative update all folded history, according history and pred.taken
-    void specUpdateHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred) override;
-    void specUpdatePHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred) override;
-    void specUpdateBwHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred) override;
-    void specUpdateIHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred) override;
-    void specUpdateLHist(const std::vector<boost::dynamic_bitset<>> &history, FullBTBPrediction &pred) override;
+    // Speculatively update all folded histories.
+    void specUpdateGHist(const boost::dynamic_bitset<> &history,
+                        FullBTBPrediction &pred,
+                        const DirectionHistoryUpdate &update) override;
+    void specUpdatePHist(const boost::dynamic_bitset<> &history,
+                         FullBTBPrediction &pred,
+                         const PathHistoryUpdate &update) override;
+    void specUpdateBwHist(const boost::dynamic_bitset<> &history,
+                          FullBTBPrediction &pred,
+                          const DirectionHistoryUpdate &update);
+    void specUpdateIHist(FullBTBPrediction &pred,
+                         const DirectionHistoryUpdate &update);
+    void specUpdateLHist(const std::vector<boost::dynamic_bitset<>> &history,
+                         FullBTBPrediction &pred,
+                         const DirectionHistoryUpdate &update);
 
-    // Recover all folded history after a misprediction, then update all folded history according to history and
-    // pred.taken
-    void recoverHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt,
+    // Recover all folded histories after a misprediction.
+    void recoverHist(const boost::dynamic_bitset<> &history, const FetchTarget &entry, int shamt,
                      bool cond_taken) override;
-    void recoverPHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt,
-                      bool cond_taken) override;
-    void recoverBwHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt,
-                       bool cond_taken) override;
-    void recoverIHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt,
-                      bool cond_taken) override;
-    void recoverLHist(const std::vector<boost::dynamic_bitset<>> &history, const FetchStream &entry, int shamt,
-                      bool cond_taken) override;
+    void recoverPHist(const boost::dynamic_bitset<> &history, const FetchTarget &entry,
+                      const PathHistoryUpdate &update) override;
+    void recoverBwHist(const boost::dynamic_bitset<> &history, const FetchTarget &entry, int shamt,
+                       bool cond_taken);
+    void recoverIHist(const FetchTarget &entry, int shamt,
+                      bool cond_taken);
+    void recoverLHist(const std::vector<boost::dynamic_bitset<>> &history, const FetchTarget &entry, int shamt,
+                      bool cond_taken);
 
     // Update predictor state based on actual branch outcomes
-    void update(const FetchStream &entry) override;
+    void update(const FetchTarget &entry) override;
 
-    void commitBranch(const FetchStream &stream, const DynInstPtr &inst) override;
+#ifndef UNIT_TEST
+    void commitBranch(const FetchTarget &stream, const DynInstPtr &inst) override;
+#endif
 
     void setTrace() override;
 
     // check folded hists after speculative update and recover
     void checkFoldedHist(const boost::dynamic_bitset<> &Ghistory, const boost::dynamic_bitset<> &PHistory,
                          const std::vector<boost::dynamic_bitset<>> &LHistory, const char *when);  // Check GHR folded
+    void checkFoldedHist(const boost::dynamic_bitset<> &Ghistory, const boost::dynamic_bitset<> &PHistory,
+                         const std::vector<boost::dynamic_bitset<>> &LHistory,
+                         ThreadID tid, const char *when);  // Check GHR folded
 
     // Calculate MGSC weight index
-    Addr getPcIndex(Addr pc, unsigned tableIndexBits);
+    Addr getPcIndex(Addr pc, unsigned tableIndexBits, uint8_t asidHash = 0);
 
   private:
     // Utility functions for reducing code duplication
@@ -181,7 +219,7 @@ class BTBMGSC : public TimedBaseBTBPredictor
     /**
      * Find weight in a weight table for a given PC
      */
-    int findWeight(const std::vector<int16_t> &weightTable, Addr pc);
+    int findWeight(const std::vector<int16_t> &weightTable, Addr pc, uint8_t asidHash);
 
     /**
      * Calculate scaled percsum using weight
@@ -191,7 +229,7 @@ class BTBMGSC : public TimedBaseBTBPredictor
     /**
      * Find threshold in a threshold table for a given PC
      */
-    int findThreshold(const std::vector<int16_t> &thresholdTable, Addr pc);
+    int findThreshold(const std::vector<int16_t> &thresholdTable, Addr pc, uint8_t asidHash);
 
     /**
      * Calculate if weight scale causes prediction difference
@@ -213,7 +251,7 @@ class BTBMGSC : public TimedBaseBTBPredictor
     /**
      * Update a threshold table and allocate new entry if needed
      */
-    void updatePCThresholdTable(Addr pc, bool update_direction);
+    void updatePCThresholdTable(Addr pc, uint8_t asidHash, bool update_direction);
 
     /**
      * Update the global threshold table and allocate new entry if needed
@@ -222,13 +260,16 @@ class BTBMGSC : public TimedBaseBTBPredictor
 
     // Look up predictions in MGSC tables for a stream of instructions
     void lookupHelper(const Addr &stream_start, const std::vector<BTBEntry> &btbEntries,
-                      const std::unordered_map<Addr, TageInfoForMGSC> &tageInfoForMgscs, CondTakens &results);
+                      const std::unordered_map<Addr, TageInfoForMGSC> &tageInfoForMgscs,
+                      CondTakens &results, ThreadID tid, uint8_t asidHash);
 
     // Calculate MGSC history index with folded history
-    Addr getHistIndex(Addr pc, unsigned tableIndexBits, uint64_t foldedHist);
+    Addr getHistIndex(Addr pc, unsigned tableIndexBits, uint64_t foldedHist,
+                      uint8_t asidHash = 0);
 
     // Calculate MGSC bias index
-    Addr getBiasIndex(Addr pc, unsigned tableIndexBits, bool lowbit0, bool lowbit1);
+    Addr getBiasIndex(Addr pc, unsigned tableIndexBits, bool lowbit0, bool lowbit1,
+                      uint8_t asidHash = 0);
 
     // Get offset within a block for a given PC
     Addr getOffset(Addr pc) { return (pc & (blockSize - 1)) >> 1; }
@@ -252,13 +293,16 @@ class BTBMGSC : public TimedBaseBTBPredictor
 
     // Helper method to generate prediction for a single BTB entry
     MgscPrediction generateSinglePrediction(const BTBEntry &btb_entry, const Addr &startPC,
-                                            const TageInfoForMGSC &tage_info);
+                                            const TageInfoForMGSC &tage_info,
+                                            ThreadID tid, uint8_t asidHash);
 
     // Helper method to prepare BTB entries for update
-    std::vector<BTBEntry> prepareUpdateEntries(const FetchStream &stream);
+    std::vector<BTBEntry> prepareUpdateEntries(const FetchTarget &stream);
 
     void updateSinglePredictor(const BTBEntry &entry, bool actual_taken, const MgscPrediction &pred,
-                               const FetchStream &stream);
+                               const FetchTarget &stream);
+    void recordPredictionStats(const MgscPrediction &pred, bool actual_taken, bool sc_pred_taken,
+                               bool tage_pred_taken);
 
     /** global backward branch history indexed tables */
     // number of global backward branch history indexed tables
@@ -315,12 +359,28 @@ class BTBMGSC : public TimedBaseBTBPredictor
     unsigned numCtrsPerLine;
     unsigned numCtrsPerLineBits;
 
-    // Folded history for index calculation
-    std::vector<GlobalBwFoldedHist> indexBwFoldedHist;
-    std::vector<std::vector<LocalFoldedHist>> indexLFoldedHist;
-    std::vector<ImliFoldedHist> indexIFoldedHist;
-    std::vector<GlobalFoldedHist> indexGFoldedHist;
-    std::vector<PathFoldedHist> indexPFoldedHist;
+    // Test switches for SC tables
+    bool forceUseSC;
+    bool allowMissingTageInfo;
+    bool enableBwTable;
+    bool enableLTable;
+    bool enableITable;
+    bool enableGTable;
+    bool enablePTable;
+    bool enableBiasTable;
+    bool enablePCThreshold;
+    Addr focusBranchPC;
+
+    struct ThreadHistoryState
+    {
+        std::vector<GlobalBwFoldedHist> indexBwFoldedHist;
+        std::vector<std::vector<LocalFoldedHist>> indexLFoldedHist;
+        std::vector<ImliFoldedHist> indexIFoldedHist;
+        std::vector<GlobalFoldedHist> indexGFoldedHist;
+        std::vector<PathFoldedHist> indexPFoldedHist;
+    };
+
+    std::vector<ThreadHistoryState> threadHistory;
 
     // The actual MGSC prediction tables (table x index x line)
     std::vector<std::vector<std::vector<int16_t>>> bwTable;
@@ -379,38 +439,152 @@ class BTBMGSC : public TimedBaseBTBPredictor
     std::vector<unsigned> pIndex;
     std::vector<unsigned> biasIndex;
 
-    // Statistics for MGSC predictor
+#ifdef UNIT_TEST
+    typedef uint64_t Scalar;
+#else
+    typedef statistics::Scalar Scalar;
+#endif
+
+    // Statistics for TAGE predictor
+#ifdef UNIT_TEST
+    struct MgscStats
+    {
+#else
     struct MgscStats : public statistics::Group
     {
-        statistics::Scalar scCorrectTageWrong;
-        statistics::Scalar scWrongTageCorrect;
-        statistics::Scalar scCorrectTageCorrect;
-        statistics::Scalar scWrongTageWrong;
-        statistics::Scalar scUsed;
-        statistics::Scalar scNotUsed;
+#endif
+        Scalar scCorrectTageWrong{};
+        Scalar scWrongTageCorrect{};
+        Scalar scCorrectTageCorrect{};
+        Scalar scWrongTageWrong{};
+        Scalar scUsed{};
+        Scalar scNotUsed{};
 
-        statistics::Scalar predHit;
-        statistics::Scalar predMiss;
-        statistics::Scalar scPredCorrect;
-        statistics::Scalar scPredWrong;
-        statistics::Scalar scPredMissTaken;
-        statistics::Scalar scPredMissNotTaken;
-        statistics::Scalar scPredCorrectTageWrong;
-        statistics::Scalar scPredWrongTageCorrect;
+        Scalar predHit{};
+        Scalar predMiss{};
+        Scalar scPredCorrect{};
+        Scalar scPredWrong{};
+        Scalar scPredMissTaken{};
+        Scalar scPredMissNotTaken{};
+        Scalar scPredCorrectTageWrong{};
+        Scalar scPredWrongTageCorrect{};
 
+        // Weight scale sensitivity (how often this table is decisive)
+        Scalar bwWeightScaleDiff{};
+        Scalar lWeightScaleDiff{};
+        Scalar iWeightScaleDiff{};
+        Scalar gWeightScaleDiff{};
+        Scalar pWeightScaleDiff{};
+        Scalar biasWeightScaleDiff{};
+
+        // Raw percsum correctness per table
+        Scalar bwPercsumCorrect{};
+        Scalar bwPercsumWrong{};
+        Scalar lPercsumCorrect{};
+        Scalar lPercsumWrong{};
+        Scalar iPercsumCorrect{};
+        Scalar iPercsumWrong{};
+        Scalar gPercsumCorrect{};
+        Scalar gPercsumWrong{};
+        Scalar pPercsumCorrect{};
+        Scalar pPercsumWrong{};
+        Scalar biasPercsumCorrect{};
+        Scalar biasPercsumWrong{};
+
+        // Threshold updates
+        Scalar pcThresholdInc{};
+        Scalar pcThresholdDec{};
+        Scalar globalThresholdInc{};
+        Scalar globalThresholdDec{};
+
+        // Use/non-use of SC under different TAGE confidences
+        Scalar scHighUseCorrect{};
+        Scalar scHighUseWrong{};
+        Scalar scMidUseCorrect{};
+        Scalar scMidUseWrong{};
+        Scalar scLowUseCorrect{};
+        Scalar scLowUseWrong{};
+        Scalar scHighBypass{};
+        Scalar scMidBypass{};
+        Scalar scLowBypass{};
+
+#ifndef UNIT_TEST
         MgscStats(statistics::Group *parent);
+#endif
     };
 
     MgscStats mgscStats;
 
+#ifndef UNIT_TEST
     TraceManager *mgscMissTrace;
+#endif
 
   public:
     // Recover folded history after misprediction
     void recoverFoldedHist(const boost::dynamic_bitset<> &history);
     unsigned getNumEntriesFirstLocalHistories() { return numEntriesFirstLocalHistories; };
 
+#ifdef UNIT_TEST
+    struct TestAccess
+    {
+        static unsigned numCtrsPerLine(const BTBMGSC &mgsc) { return mgsc.numCtrsPerLine; }
+        static unsigned numCtrsPerLineBits(const BTBMGSC &mgsc) { return mgsc.numCtrsPerLineBits; }
+
+        static unsigned bwTableIdxWidth(const BTBMGSC &mgsc) { return mgsc.bwTableIdxWidth; }
+        static unsigned lTableIdxWidth(const BTBMGSC &mgsc) { return mgsc.lTableIdxWidth; }
+        static unsigned iTableIdxWidth(const BTBMGSC &mgsc) { return mgsc.iTableIdxWidth; }
+        static unsigned gTableIdxWidth(const BTBMGSC &mgsc) { return mgsc.gTableIdxWidth; }
+        static unsigned pTableIdxWidth(const BTBMGSC &mgsc) { return mgsc.pTableIdxWidth; }
+        static unsigned biasTableIdxWidth(const BTBMGSC &mgsc) { return mgsc.biasTableIdxWidth; }
+
+        static bool &forceUseSC(BTBMGSC &mgsc) { return mgsc.forceUseSC; }
+        static bool &allowMissingTageInfo(BTBMGSC &mgsc) { return mgsc.allowMissingTageInfo; }
+        static bool &enableBwTable(BTBMGSC &mgsc) { return mgsc.enableBwTable; }
+        static bool &enableLTable(BTBMGSC &mgsc) { return mgsc.enableLTable; }
+        static bool &enableITable(BTBMGSC &mgsc) { return mgsc.enableITable; }
+        static bool &enableGTable(BTBMGSC &mgsc) { return mgsc.enableGTable; }
+        static bool &enablePTable(BTBMGSC &mgsc) { return mgsc.enablePTable; }
+        static bool &enableBiasTable(BTBMGSC &mgsc) { return mgsc.enableBiasTable; }
+        static bool &enablePCThreshold(BTBMGSC &mgsc) { return mgsc.enablePCThreshold; }
+        static Addr &focusBranchPC(BTBMGSC &mgsc) { return mgsc.focusBranchPC; }
+
+        static auto &bwTable(BTBMGSC &mgsc) { return mgsc.bwTable; }
+        static auto &lTable(BTBMGSC &mgsc) { return mgsc.lTable; }
+        static auto &iTable(BTBMGSC &mgsc) { return mgsc.iTable; }
+        static auto &gTable(BTBMGSC &mgsc) { return mgsc.gTable; }
+        static auto &pTable(BTBMGSC &mgsc) { return mgsc.pTable; }
+        static auto &biasTable(BTBMGSC &mgsc) { return mgsc.biasTable; }
+
+        static auto &updateThreshold(BTBMGSC &mgsc) { return mgsc.updateThreshold; }
+        static auto &pUpdateThreshold(BTBMGSC &mgsc) { return mgsc.pUpdateThreshold; }
+
+        static Addr getHistIndex(BTBMGSC &mgsc, Addr pc, unsigned tableIndexBits, uint64_t foldedHist)
+        {
+            return mgsc.getHistIndex(pc, tableIndexBits, foldedHist);
+        }
+
+        static Addr getBiasIndex(BTBMGSC &mgsc, Addr pc, unsigned tableIndexBits, bool lowbit0, bool lowbit1)
+        {
+            return mgsc.getBiasIndex(pc, tableIndexBits, lowbit0, lowbit1);
+        }
+
+        static std::tuple<unsigned, unsigned> posHash(BTBMGSC &mgsc, Addr pc, unsigned tableIdx)
+        {
+            return mgsc.posHash(pc, tableIdx);
+        }
+
+        static const std::unordered_map<Addr, MgscPrediction> &preds(const BTBMGSC &mgsc)
+        {
+            assert(!mgsc.threadMeta.empty());
+            assert(mgsc.threadMeta[0]);
+            return mgsc.threadMeta[0]->preds;
+        }
+    };
+#endif
+
   private:
+    void initStorage();
+
     // Metadata for MGSC predictions
     typedef struct MgscMeta
     {
@@ -444,12 +618,20 @@ class BTBMGSC : public TimedBaseBTBPredictor
         }
     } MgscMeta;
 
-    std::shared_ptr<MgscMeta> meta;
+    std::vector<std::shared_ptr<MgscMeta>> threadMeta;
+    ThreadID predictorTid(const std::vector<FullBTBPrediction> &stagePreds) const;
+    ThreadHistoryState &historyState(ThreadID tid);
+    const ThreadHistoryState &historyState(ThreadID tid) const;
 };
+
+// Close conditional namespace wrapper for testing
+#ifdef UNIT_TEST
+} // namespace test
+#endif
 }
 
 }
 
 }
 
-#endif  // __CPU_PRED_BTB_TAGE_HH__
+#endif  // __CPU_PRED_BTB_MGSC_HH__

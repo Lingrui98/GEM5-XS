@@ -6,11 +6,6 @@ on:
   # Removed pull_request trigger - moved to pr-quick-check.yml (Tier 1)
   # can be triggered manually
   workflow_dispatch:
-    inputs:
-      branch_name:
-        description: 'Branch to test (leave empty for current branch)'
-        required: false
-        type: string
 
 jobs:
   paralel_cpt_test:
@@ -19,7 +14,7 @@ jobs:
     continue-on-error: false
     name: XS-GEM5 - Running test checkpoints
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/build-dramsim
       - name: Build GEM5 opt
         run: |
@@ -33,7 +28,7 @@ jobs:
     continue-on-error: false
     name: XS-GEM5 - Running h test checkpoints
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/build-dramsim
       - name: Build GEM5 opt
         run: |
@@ -46,7 +41,7 @@ jobs:
     continue-on-error: false
     name: XS-GEM5 - Check memory corruption
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/build-dramsim
       - name: Build GEM5 debug
         run: CC=gcc CXX=g++ scons build/RISCV/gem5.debug --linker=gold -j64
@@ -56,30 +51,13 @@ jobs:
           bash util/memory_check/run-xs-with-valgrind.sh
           cd $GEM5_HOME
 
-  new_sim_script_test_gcb:
-    runs-on: [self-hosted, open]
-    continue-on-error: false
-    name: XS-GEM5 - Test new simulation script on RV64GCB
-    steps:
-      - uses: actions/checkout@v2
-      - uses: ./.github/actions/build-dramsim
-      - name: Build GEM5 opt
-        run: CC=gcc CXX=g++ scons build/RISCV/gem5.opt --linker=gold -j64
-      - name: XS-GEM5 - Test xiangshan.py simulation scripts
-        run: |
-          export GCBV_REF_SO="/nfs/home/share/gem5_ci/ref/normal/riscv64-nemu-interpreter-so"
-          export GCB_RESTORER="/nfs/home/share/gem5_ci/tools/normal-gcb-restorer.bin"
-          export GEM5_HOME=$(pwd)
-          mkdir -p $GEM5_HOME/util/xs_scripts/test
-          cd $GEM5_HOME/util/xs_scripts/test
-          bash ../kmh_6wide.sh /nfs/home/share/gem5_ci/checkpoints/gcb_test.zstd
 
   new_sim_script_test_gcbv:
     runs-on: [self-hosted, open]
     continue-on-error: false
     name: XS-GEM5 - Test new simulation script on RV64GCBV
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/build-dramsim
       - name: Build GEM5 opt
         run: CC=gcc CXX=g++ scons build/RISCV/gem5.opt --linker=gold -j64 --rvv-impl=simple
@@ -97,7 +75,7 @@ jobs:
     continue-on-error: false
     name: XS-GEM5 - Test Multi-core + RV64GCB
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - name: Build GEM5 opt
         run: |
           CC=clang CXX=clang++ scons build/RISCV_CHI/gem5.opt -j 48 --gold-linker
@@ -116,14 +94,13 @@ jobs:
     continue-on-error: false
     name: XS-GEM5 - Test fix L2TLB bugs
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/build-dramsim
       - name: Build GEM5 opt
         run: CC=gcc CXX=g++ scons build/RISCV/gem5.opt --linker=gold -j64
       - name: XS-GEM5 - Test xiangshan.py simulation scripts
         run: |
           export GCBV_REF_SO="/nfs/home/share/gem5_ci/ref/normal/riscv64-nemu-interpreter-so"
-          export GCB_RESTORER=""
           export GEM5_HOME=$(pwd)
           mkdir -p $GEM5_HOME/util/xs_scripts/test_l2tlb
           cd $GEM5_HOME/util/xs_scripts/test_l2tlb
@@ -134,7 +111,7 @@ jobs:
     continue-on-error: false
     name: XS-GEM5 - Test new simulation script on RV64GCBH
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v6
       - uses: ./.github/actions/build-dramsim
       - name: Build GEM5 opt
         run: CC=gcc CXX=g++ scons build/RISCV/gem5.opt --linker=gold -j64
@@ -147,4 +124,35 @@ jobs:
           cd $GEM5_HOME/util/xs_scripts/test_h
           bash ../kmh_6wide_h.sh /nfs/home/share/gem5_ci/checkpoints/gcbh_test.zstd
 
+  raw_linux_boot_test:
+    runs-on: [self-hosted, open]
+    continue-on-error: false
+    timeout-minutes: 30
+    name: XS-GEM5 - Boot raw Linux
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/build-dramsim
+      - name: Build GEM5 opt
+        run: |
+          CC=gcc CXX=g++ scons build/RISCV/gem5.opt --linker=gold -j64
+      - name: Boot Xiangshan raw Linux
+        run: |
+          export RAW_LINUX_BIN="${XS_LINUX_BIN:-/nfs/home/share/gem5_ci/ready-to-run/linux.bin}"
+          if [ ! -r "$RAW_LINUX_BIN" ]; then
+            echo "Missing raw linux image: $RAW_LINUX_BIN"
+            echo "Please provision the image at the default path or set XS_LINUX_BIN on the runner."
+            exit 1
+          fi
 
+          mkdir -p debug/raw_linux_ci
+          ./build/RISCV/gem5.opt -r -d debug/raw_linux_ci \
+            ./configs/example/kmhv3.py \
+            --raw-cpt \
+            --generic-rv-cpt "$RAW_LINUX_BIN" \
+            --disable-difftest
+      - name: Check boot result
+        run: |
+          test -f debug/raw_linux_ci/simout
+          tail -n 200 debug/raw_linux_ci/simout
+          grep -q "Hello, XiangShan!" debug/raw_linux_ci/simout
+          grep -q "m5_exit instruction encountered" debug/raw_linux_ci/simout

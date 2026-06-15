@@ -101,6 +101,8 @@ enum StallReason {
     ScalarReadyButNotIssued,  // B
     ResumeUnblock,  // B
     CommitSquash,  // BS
+    ROBFull,  // B
+    RegFull,  // B
     OtherStall,  // B
     NumStallReasons
 };
@@ -147,7 +149,6 @@ struct IEWStruct
     DynInstPtr mispredictInst[MaxThreads];
     Addr mispredPC[MaxThreads];
     InstSeqNum squashedSeqNum[MaxThreads];
-    uint64_t squashedStreamId[MaxThreads];
     uint64_t squashedTargetId[MaxThreads];
     uint64_t squashedLoopIter[MaxThreads];
     std::unique_ptr<PCStateBase> pc[MaxThreads];
@@ -156,6 +157,8 @@ struct IEWStruct
     bool branchMispredict[MaxThreads];
     bool branchTaken[MaxThreads];
     bool includeSquashInst[MaxThreads];
+
+    bool valuePredictionError[MaxThreads];
 };
 
 struct IssueStruct
@@ -163,6 +166,12 @@ struct IssueStruct
     int size;
 
     DynInstPtr insts[MaxWidth];
+};
+
+struct SquashInfo
+{
+    InstSeqNum squashSn;
+    ThreadID   squashTid;
 };
 
 struct SquashVersion
@@ -178,14 +187,23 @@ struct SquashVersion
         return (version + 1) % versionLimit;
     }
     bool largerThan(uint8_t other) const {
-        bool larger = version > other && version - other <= maxInflightSquash;
-        bool wrapped_larger =
-            version + versionLimit > other &&
-            version + versionLimit - other <= maxInflightSquash;
-        if (!(larger || wrapped_larger || (version == other))) {
+        const uint8_t distance = (version + versionLimit - other) % versionLimit;
+        if (distance == 0) {
+            return false;
+        }
+
+        if (distance <= maxInflightSquash) {
+            return true;
+        }
+
+        if (versionLimit - distance <= maxInflightSquash) {
+            return false;
+        }
+
+        if (version != other) {
             panic("SquashVersion: %d, other: %d\n", version, other);
         }
-        return larger || wrapped_larger;
+        return false;
     }
     void update(uint8_t v) {
         version = v;
@@ -196,7 +214,8 @@ struct SquashVersion
 
 struct ResolveQueueEntry
 {
-    uint64_t resolvedFSQId;
+    ThreadID resolvedTid;
+    uint64_t resolvedFTQId;
     std::vector<uint64_t> resolvedInstPC;
 };
 
@@ -220,29 +239,17 @@ struct TimeStruct
         StallReason blockReason;
     };
 
-    DecodeComm decodeInfo[MaxThreads];
+    DecodeComm decodeInfo[MaxThreads]; // decode to fetch
 
     struct RenameComm
     {
         StallReason blockReason;
     };
 
-    RenameComm renameInfo[MaxThreads];
+    RenameComm renameInfo[MaxThreads]; // rename to decode
 
     struct IewComm
     {
-        // Also eventually include skid buffer space.
-        unsigned freeLQEntries;
-        unsigned freeSQEntries;
-        unsigned dispatchedToLQ;
-        unsigned dispatchedToSQ;
-
-        unsigned ldstqCount;
-
-        unsigned dispatched;
-        bool usedIQ;
-        bool usedLSQ;
-
         StallReason robHeadStallReason;
         StallReason blockReason;
         StallReason lqHeadStallReason;
@@ -250,14 +257,18 @@ struct TimeStruct
 
         struct ResolvedCFIEntry
         {
-            uint64_t fsqId;
+            uint64_t ftqId;
             uint64_t pc;
         };
         /** Resolved control-flow PCs produced this cycle (fetch buffers/merges). */
         std::vector<ResolvedCFIEntry> resolvedCFIs;  // *F
+
+        unsigned iqCount;
+        unsigned ldstqCount;
+        unsigned robCount;
     };
 
-    IewComm iewInfo[MaxThreads];
+    IewComm iewInfo[MaxThreads]; // iew to rename, fetch
 
     struct CommitComm
     {
@@ -301,13 +312,11 @@ struct TimeStruct
 
         InstSeqNum doneMemSeqNum;
 
-        uint64_t doneFsqId; // F
-        uint64_t squashedStreamId; // F
+        InstSeqNum robheadSeqNum;
+
+        uint64_t doneFtqId; // F
         uint64_t squashedTargetId; // F
         unsigned squashedLoopIter; // F
-
-        /// Tell Rename how many free entries it has in the ROB
-        unsigned freeROBEntries; // *R
 
         bool isTrapSquash;
         bool squash; // *F, D, R, I
@@ -338,15 +347,163 @@ struct TimeStruct
 
     };
 
-    CommitComm commitInfo[MaxThreads];
-
-    bool decodeBlock[MaxThreads];
-    bool decodeUnblock[MaxThreads];
-    bool renameBlock[MaxThreads];
-    bool renameUnblock[MaxThreads];
-    bool iewBlock[MaxThreads];
-    bool iewUnblock[MaxThreads];
+    CommitComm commitInfo[MaxThreads];// commit to iew, rename, fetch
 };
+
+inline bool
+smtCanDonateRobHeadroom(StallReason reason)
+{
+    switch (reason) {
+      case NoStall:
+      case ROBFull:
+      case RegFull:
+      case MemDQBandwidth:
+      case IntDQBandwidth:
+      case FVDQBandwidth:
+      case VectorReadyButNotIssued:
+      case ScalarReadyButNotIssued:
+      case CommitSquash:
+        return false;
+      default:
+        return true;
+    }
+}
+
+inline bool
+smtIsMemoryPressureReason(StallReason reason)
+{
+    switch (reason) {
+      case DTlbStall:
+      case LoadL2Bound:
+      case LoadL3Bound:
+      case LoadMemBound:
+      case StoreL2Bound:
+      case StoreL3Bound:
+      case StoreMemBound:
+      case MemSquashed:
+      case MemNotReady:
+      case MemCommitRateLimit:
+      case Atomic:
+      case OtherMemStall:
+        return true;
+      default:
+        return false;
+    }
+}
+
+inline bool
+smtHasBorrowThrottleStall(const TimeStruct::IewComm &info)
+{
+    return smtCanDonateRobHeadroom(info.robHeadStallReason) ||
+           smtCanDonateRobHeadroom(info.lqHeadStallReason) ||
+           smtCanDonateRobHeadroom(info.sqHeadStallReason);
+}
+
+inline bool
+smtHasMemoryPressure(const TimeStruct::IewComm &info,
+                     unsigned ldstqHighWater = 0)
+{
+    if (ldstqHighWater != 0 && info.ldstqCount >= ldstqHighWater) {
+        return true;
+    }
+
+    return smtIsMemoryPressureReason(info.robHeadStallReason) ||
+           smtIsMemoryPressureReason(info.lqHeadStallReason) ||
+           smtIsMemoryPressureReason(info.sqHeadStallReason);
+}
+
+inline uint64_t
+smtBorrowPriority(const TimeStruct::IewComm &info)
+{
+    constexpr uint64_t backend_stall_penalty = 1ULL << 48;
+    constexpr uint64_t memory_pressure_penalty = 1ULL << 49;
+
+    uint64_t score = static_cast<uint64_t>(info.robCount) +
+                     static_cast<uint64_t>(info.iqCount) * 2 +
+                     static_cast<uint64_t>(info.ldstqCount) * 4;
+
+    if (smtHasBorrowThrottleStall(info)) {
+        score += backend_stall_penalty;
+    }
+    if (smtHasMemoryPressure(info)) {
+        score += memory_pressure_penalty;
+    }
+
+    return score;
+}
+
+struct SmtActiveThreadFreeze
+{
+    ThreadID previousActive = InvalidThreadID;
+    bool freezeCurrent = false;
+};
+
+class SmtActiveThreadArbiter
+{
+  public:
+    static constexpr uint64_t InvalidScore = static_cast<uint64_t>(-1);
+
+    SmtActiveThreadFreeze observe(ThreadID tid, uint64_t score)
+    {
+        if (score < bestScore) {
+            selectedTid = tid;
+            bestScore = score;
+        }
+
+        if (freezeActive) {
+            SmtActiveThreadFreeze freeze;
+            freeze.freezeCurrent = true;
+            return freeze;
+        }
+
+        if (firstActiveTid == InvalidThreadID) {
+            firstActiveTid = tid;
+            return {};
+        }
+
+        freezeActive = true;
+        SmtActiveThreadFreeze freeze;
+        freeze.previousActive = firstActiveTid;
+        freeze.freezeCurrent = true;
+        return freeze;
+    }
+
+    ThreadID selected() const { return selectedTid; }
+
+  private:
+    ThreadID selectedTid = InvalidThreadID;
+    ThreadID firstActiveTid = InvalidThreadID;
+    bool freezeActive = false;
+    uint64_t bestScore = InvalidScore;
+};
+
+
+struct StallSignals
+{
+    StallSignals()
+    {
+        for (int i = 0; i < MaxThreads; ++i) {
+            blockFetch[i] = false;
+            blockDecode[i] = false;
+            blockRename[i] = false;
+            blockIEW[i] = false;
+            fetchBlockReason[i] = StallReason::NoStall;
+            decodeBlockReason[i] = StallReason::NoStall;
+            renameBlockReason[i] = StallReason::NoStall;
+            iewBlockReason[i] = StallReason::NoStall;
+        }
+    }
+
+    bool blockFetch[MaxThreads];// decode to fetch
+    bool blockDecode[MaxThreads];// rename to decode
+    bool blockRename[MaxThreads];// iew to rename (if iew is stalling, rename all threads would be stalled)
+    bool blockIEW[MaxThreads];// commit to iew
+    StallReason fetchBlockReason[MaxThreads];// decode to fetch root cause
+    StallReason decodeBlockReason[MaxThreads];// rename to decode root cause
+    StallReason renameBlockReason[MaxThreads];// iew to rename root cause
+    StallReason iewBlockReason[MaxThreads];// commit to iew root cause
+};
+
 
 } // namespace o3
 } // namespace gem5
