@@ -1,0 +1,42 @@
+{
+  "id": "sway-mytools-cpt-backend",
+  "name": "sway-mytools-cpt-backend",
+  "title": "mytools: add cpt-mode gem5 backend for SWAY motivation runs",
+  "description": "",
+  "status": "completed",
+  "dev_type": "impl",
+  "scope": "infra",
+  "package": "mytools",
+  "priority": "P1",
+  "creator": "glr",
+  "assignee": "claude-opus-4-8",
+  "createdAt": "2026-06-15",
+  "completedAt": "2026-06-15",
+  "branch": "main",
+  "base_branch": "sway/phase-stranded-probe",
+  "worktree_path": "/nfs/home/goulingrui/project/GEM5-sway",
+  "current_phase": 3,
+  "next_action": [
+    {"phase": 1, "action": "implement"},
+    {"phase": 2, "action": "check"},
+    {"phase": 3, "action": "finish"}
+  ],
+  "commit": "1fb282cda03241868b6f491c69f1480cb8898fed",
+  "pr_url": null,
+  "subtasks": [],
+  "children": ["06-15-sway-batch-pending9-figure1"],
+  "parent": null,
+  "relatedFiles": [
+    "/nfs/home/goulingrui/project/mytools/tools/distributed-trace-scheduler/scripts/run_cpt_gem5.sh",
+    "/nfs/home/goulingrui/project/mytools/tools/distributed-trace-scheduler/configs/backend.gem5_cpt.sample.json",
+    "/nfs/home/goulingrui/project/mytools/tools/distributed-trace-scheduler/README.md",
+    "/nfs/home/goulingrui/project/GEM5-sway/configs/example/kmhv3.py",
+    "/nfs/home/goulingrui/project/papers/sway-paper/runs/smoke_blender_26411_v2/run.log",
+    "/nfs/home/goulingrui/project/papers/sway-paper/runs/cpt_smoke_dts/smoke_dts/blender_26411/sway_stranded_by_phase.csv"
+  ],
+  "notes": "Done. mytools commit 1fb282c on main. Smoke verified: scheduler -> run_cpt_gem5.sh -> blender_26411 500K insts W=50K, CSV shape 9 phases x 11 scopes matches spec. Also had to symlink ext/dramsim3/DRAMsim3 -> ~/project/GEM5/ext/dramsim3/DRAMsim3 in the worktree (submodule was absent; DRAMsim3 mem class wasn't registered without it). Unblocks 06-15-sway-batch-pending9-figure1.",
+  "meta": {
+    "owning_project": "/nfs/home/goulingrui/project/papers/sway-paper",
+    "sway_pending_id": "PENDING-9 / PENDING-11 (PLAN.md)"
+  }
+}
