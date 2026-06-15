@@ -1174,3 +1174,13 @@ class DecoupledBPUWithBTB(BranchPredictor):
     enableLoopPredictor = Param.Bool(False, "Use loop predictor to predict loop exit")
     enableJumpAheadPredictor = Param.Bool(False, "Use jump ahead predictor to skip no-need-to-predict blocks")
     resolveBlockThreshold = Param.Unsigned(8, "Consecutive resolve dequeue failures before blocking prediction once")
+
+    # SWAY phase-profiling parameters (PENDING-11 W sweep). phaseSizeByInst
+    # drives every phase-boundary CSV (BTBEntriesByPhase, topMispredictByPhase,
+    # sway_stranded_by_phase). subPhaseRatio defines how many sub-phases fit
+    # in one main phase. Previously C++ literals; exposed here so a SWAY
+    # sweep can vary W via the gem5 command line (-P) instead of rebuilding.
+    phaseSizeByInst = Param.Unsigned(100000,
+        "Instructions per main profiling phase (W in SWAY paper)")
+    subPhaseRatio = Param.Unsigned(10,
+        "Number of sub-phases per main phase")

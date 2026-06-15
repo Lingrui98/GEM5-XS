@@ -47,6 +47,10 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
       resolveBlockThreshold(p.resolveBlockThreshold),
       dbpBtbStats(this, p.numStages, p.fsq_size, maxInstsNum)
 {
+    // SWAY: profiling phase length is now a SimObject param so a single
+    // build can sweep W via -P system.cpu[0].branchPred.phaseSizeByInst=N.
+    phaseSizeByInst = p.phaseSizeByInst;
+    subPhaseRatio = p.subPhaseRatio;
     if (bpDBSwitches.size() > 0) {
         initDB();
     }
