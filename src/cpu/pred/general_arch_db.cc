@@ -7,10 +7,21 @@ static int callback(void *NotUsed, int argc, char **argv, char **azColName){
   return 0;
 }
 
+namespace
+{
+
+long long
+sqliteSignedInt(uint64_t value)
+{
+    return static_cast<long long>(static_cast<int64_t>(value));
+}
+
+} // anonymous namespace
+
 void
 TraceManager::init_table() {
   // create table
-  char sql[1024];
+  char sql[8192];
   int pos = 0;
   pos = sprintf(sql,
     "CREATE TABLE %s(" \
@@ -29,7 +40,7 @@ TraceManager::init_table() {
     }
   }
   pos += sprintf(sql+pos, ");");
-  assert(pos < 1024);
+  assert(pos < 8192);
   printf("%s\n", sql);
   char *zErrMsg;
   int rc = sqlite3_exec(_db, sql, callback, 0, &zErrMsg);
@@ -43,13 +54,14 @@ TraceManager::init_table() {
 void
 TraceManager::write_record(const Record &record)
 {
-    char sql[1024];
+    char sql[8192];
     int pos = 0;
     pos = sprintf(sql, "INSERT INTO %s(TICK", _name.c_str());
     for (auto it = _fields.begin(); it != _fields.end(); it++) {
         pos += sprintf(sql+pos, ",%s", it->first.c_str());
     }
-    pos += sprintf(sql+pos, ") VALUES(%ld", record._tick);
+    pos += sprintf(sql+pos, ") VALUES(%lld",
+        sqliteSignedInt(record._tick));
     for (auto it = _fields.begin(); it != _fields.end(); it++) {
         switch (it->second) {
             case UINT64:
@@ -60,7 +72,8 @@ TraceManager::write_record(const Record &record)
                     fatal("Can't find data for %s\n", it->first.c_str());
                 }
                 assert(data != m.end());
-                pos += sprintf(sql+pos, ",%ld", data->second);
+                pos += sprintf(sql+pos, ",%lld",
+                    sqliteSignedInt(data->second));
                 break;
             }
             case TEXT:
@@ -79,7 +92,7 @@ TraceManager::write_record(const Record &record)
         }
     }
     pos += sprintf(sql+pos, ");");
-    assert(pos < 1024);
+    assert(pos < 8192);
     char *zErrMsg;
     int rc = sqlite3_exec(_db, sql, callback, 0, &zErrMsg);
     if (rc != SQLITE_OK) {
@@ -125,4 +138,3 @@ DataBase::addAndGetTrace(const char *name, std::vector<std::pair<std::string, Da
 
 
 } // namespace gem5
-

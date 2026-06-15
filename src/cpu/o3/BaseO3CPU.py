@@ -44,13 +44,17 @@ from m5.objects.BaseCPU import BaseCPU
 from m5.objects.FuncScheduler import *
 #from m5.objects.O3Checker import O3Checker
 from m5.objects.BranchPredictor import *
+from m5.objects.ValuePredictor import *
 from m5.SimObject import *
 
 class SMTFetchPolicy(ScopedEnum):
     vals = [ 'RoundRobin', 'Branch', 'IQCount', 'LSQCount' ]
 
 class SMTQueuePolicy(ScopedEnum):
-    vals = [ 'Dynamic', 'Partitioned', 'Threshold' ]
+    vals = [ 'Dynamic', 'Partitioned', 'Threshold', 'DynamicBorrowing' ]
+
+class SMTLSQMode(ScopedEnum):
+    vals = [ 'Independent', 'Shared' ]
 
 class CommitPolicy(ScopedEnum):
     vals = [ 'RoundRobin', 'OldestReady' ]
@@ -66,7 +70,7 @@ class PerfRecord(ScopedEnum):
         # position tick
         'AtFetch', 'AtDecode', 'AtRename', 'AtDispQue', 'AtIssueQue', 'AtIssueArb', 'AtIssueReadReg',
         'AtFU', 'AtBypassVal', 'AtWriteVal', 'AtCommit',
-        'DisAsm', 'PC'
+        'Result', 'DisAsm', 'PC'
     ]
 
 class BaseO3CPU(BaseCPU):
@@ -128,7 +132,7 @@ class BaseO3CPU(BaseCPU):
     iewToDecodeDelay = Param.Cycles(1, "Issue/Execute/Writeback to decode "
                                     "delay")
     commitToDecodeDelay = Param.Cycles(1, "Commit to decode delay")
-    fetchToDecodeDelay = Param.Cycles(2, "Fetch to decode delay")
+    fetchToDecodeDelay = Param.Cycles(3, "Fetch to decode delay")
     decodeWidth = Param.Unsigned(6, "Decode width")
 
     iewToRenameDelay = Param.Cycles(1, "Issue/Execute/Writeback to rename "
@@ -200,8 +204,15 @@ class BaseO3CPU(BaseCPU):
 
     BankConflictCheck = Param.Bool(True, "open Bank conflict check")
     sbufferBankWriteAccurately = Param.Bool(False, "Sbuffer write to memory with bank conflict check")
-    EnableLdMissReplay = Param.Bool(True, "Replay Cache missed load instrution from ReplayQ if True")
+    DcacheSetBits = Param.Unsigned(8, "Dcache set bits for LSQ bank conflict model")
+    DcacheSetDivNum = Param.Unsigned(1, "Dcache set div num for LSQ bank conflict model (power of two)")
+    EnableLdMissReplay = Param.Bool(True, "Replay Cache missed load instrution from ReplayQueue if True")
     EnablePipeNukeCheck = Param.Bool(True, "Replay load if Raw violation is detected in loadPipe if True")
+    EnableReplayBasedMDP = Param.Bool(True,
+        "Use replay-based mem dependency prediction (loads don't stall in IQ, "
+        "but may replay in load pipe)")
+    EnableMDPStrictWait = Param.Bool(False,
+        "Enable StoreSet strict-wait in mem dep prediction (checkInstStrict)")
 
     numPhysIntRegs = Param.Unsigned(224,
             "Number of physical integer registers")
@@ -225,8 +236,10 @@ class BaseO3CPU(BaseCPU):
 
     smtNumFetchingThreads = Param.Unsigned(1, "SMT Number of Fetching Threads")
     smtFetchPolicy = Param.SMTFetchPolicy('RoundRobin', "SMT Fetch policy")
+    smtLSQMode = Param.SMTLSQMode('Independent',
+                                  "SMT LSQ mode: per-thread independent or shared quota")
     smtLSQPolicy    = Param.SMTQueuePolicy('Partitioned',
-                                           "SMT LSQ Sharing Policy")
+                                           "SMT shared LSQ allocation policy")
     smtLSQThreshold = Param.Int(100, "SMT LSQ Threshold Sharing Parameter")
     smtIQPolicy    = Param.SMTQueuePolicy('Partitioned',
                                           "SMT IQ Sharing Policy")
@@ -235,6 +248,16 @@ class BaseO3CPU(BaseCPU):
                                           "SMT ROB Sharing Policy")
     smtROBThreshold = Param.Int(100, "SMT ROB Threshold Sharing Parameter")
     smtCommitPolicy = Param.CommitPolicy('RoundRobin', "SMT Commit Policy")
+    smtBorrowThrottleCycles = Param.Unsigned(
+        8, "Cycles to keep a backend-stalled SMT thread throttled at fetch")
+    smtBorrowLdstqHighWater = Param.Unsigned(
+        0, "Explicit SMT borrowing LSQ high-water threshold; 0 uses percentage")
+    smtBorrowLdstqHighWaterPercent = Param.Percent(
+        75, "SMT borrowing LSQ high-water threshold as a percentage of LQ+SQ")
+    smtBorrowDonorHoldCycles = Param.Unsigned(
+        8, "Cycles to keep an SMT thread marked as a ROB borrowing donor")
+    smtBorrowDonorReserveEntries = Param.Unsigned(
+        8, "Minimum ROB entries reserved for a borrowing donor to resume")
 
     branchPred = Param.BranchPredictor(DecoupledBPUWithBTB(),
                                        "Branch Predictor")
@@ -247,8 +270,14 @@ class BaseO3CPU(BaseCPU):
 
     store_prefetch_train = Param.Bool(True, "Training store prefetcher with store addresses")
 
+    # value predictor
+    valuePred = Param.ValuePredictor(NULL, "valuepred unit")
+    enableSelectiveVPFlush = Param.Bool(False,
+        "Enable selective rollback for value prediction misprediction")
+
     enable_loadFusion = Param.Bool(False, "Enable load fusion")
 
+    enableMoveElimination = Param.Bool(True, "Enable register move elimination")
     enableConstantFolding = Param.Bool(False, "Enable Constant Folding (add-immediate elimination)")
     enableMovImmElimination = Param.Bool(False, "Enable MOVI elimination")
 

@@ -73,6 +73,7 @@ MBTB::MBTB(unsigned numEntries, unsigned tagBits, unsigned numWays, unsigned num
       tagBits(tagBits)
 {
     setNumDelay(numDelay);
+    btbStats.init(numWays);
 #else
 // Production constructor
 MBTB::MBTB(const Params &p)
@@ -81,7 +82,6 @@ MBTB::MBTB(const Params &p)
     numEntries(p.numEntries),
     numWays(p.numWays),
     tagBits(p.tagBits),
-    usingBasetable(p.usingMbtbBaseEiterTage),
     btbStats(this, p.numWays)
 {
     // MBTB doesn't support ahead-pipelined stages
@@ -218,9 +218,7 @@ MBTB::processEntries(const std::vector<TickedBTBEntry>& entries, Addr startAddr)
         DPRINTF(BTB, "BTB: lookup hit, dumping hit entry\n");
         btbStats.predHit++;
         btbStats.predHitNum += hitNum;
-#ifndef UNIT_TEST
         btbStats.predHitCount.sample(hitNum);
-#endif
         for (auto &entry: processed_entries) {
             printTickedBTBEntry(entry);
         }
@@ -300,8 +298,9 @@ MBTB::putPCHistory(Addr startAddr,
                          std::vector<FullBTBPrediction> &stagePreds)
 {
     meta = std::make_shared<BTBMeta>();
+    const uint8_t asidHash = stagePreds.empty() ? 0 : stagePreds.front().asidHash;
     // Lookup all matching entries in BTB
-    auto find_entries = lookup(startAddr, meta);
+    auto find_entries = lookup(startAddr, asidHash, meta);
 
     // Process BTB entries
     auto processed_entries = processEntries(find_entries, startAddr);
@@ -314,20 +313,11 @@ MBTB::putPCHistory(Addr startAddr,
 }
 
 std::shared_ptr<void>
-MBTB::getPredictionMeta()
+MBTB::getPredictionMeta(ThreadID tid)
 {
+    (void)tid;
     return meta;
 }
-
-void
-MBTB::specUpdateHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred) {}
-
-void
-MBTB::recoverHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt, bool cond_taken)
-{
-    // MBTB doesn't support ahead-pipelined stages, nothing to recover
-}
-
 
 /**
  * Helper function to lookup entries in a single block
@@ -335,7 +325,7 @@ MBTB::recoverHist(const boost::dynamic_bitset<> &history, const FetchStream &ent
  * @return Vector of matching BTB entries
  */
 std::vector<MBTB::TickedBTBEntry>
-MBTB::lookupSingleBlock(Addr block_pc)
+MBTB::lookupSingleBlock(Addr block_pc, uint8_t asidHash)
 {
     std::vector<TickedBTBEntry> res;
     if (block_pc & 0x1) {
@@ -346,11 +336,11 @@ MBTB::lookupSingleBlock(Addr block_pc)
     auto& target_sram = (sram_id == 0) ? sram0 : sram1;
     auto& target_mru = (sram_id == 0) ? mru0 : mru1;
     
-    Addr btb_idx = getIndex(block_pc);
+    Addr btb_idx = getIndex(block_pc, asidHash);
     auto& btb_set = target_sram[btb_idx];
     assert(btb_idx < numSets);
 
-    Addr current_tag = getTag(block_pc);
+    Addr current_tag = getTag(block_pc, asidHash);
     DPRINTF(BTB, "BTB: Doing tag comparison for SRAM%d index 0x%lx tag %#lx\n",
         sram_id, btb_idx, current_tag);
         
@@ -365,7 +355,7 @@ MBTB::lookupSingleBlock(Addr block_pc)
 }
 
 std::vector<MBTB::TickedBTBEntry>
-MBTB::lookup(Addr block_pc, std::shared_ptr<BTBMeta> meta)
+MBTB::lookup(Addr block_pc, uint8_t asidHash, std::shared_ptr<BTBMeta> meta)
 {
     std::vector<TickedBTBEntry> res;
     if (block_pc & 0x1) {
@@ -376,15 +366,15 @@ MBTB::lookup(Addr block_pc, std::shared_ptr<BTBMeta> meta)
     // Calculate 32B aligned address
     Addr alignedPC = block_pc & ~(blockSize - 1);
     // Lookup first 32B block
-    res = lookupSingleBlock(alignedPC);
+    res = lookupSingleBlock(alignedPC, asidHash);
     // Lookup next 32B block
-    auto nextBlockRes = lookupSingleBlock(alignedPC + blockSize);
+    auto nextBlockRes = lookupSingleBlock(alignedPC + blockSize, asidHash);
     // Merge results
     res.insert(res.end(), nextBlockRes.begin(), nextBlockRes.end());
 
     // lookup victim cache if victim cache is enabled
     if (victimCacheSize > 0) {
-        auto victimResults = lookupVictimCache(block_pc);
+        auto victimResults = lookupVictimCache(block_pc, asidHash);
         if (!victimResults.empty()) {
             DPRINTF(BTB, "Victim cache hit for lookup at %#lx\n", block_pc);
             btbStats.victimCacheHit++;
@@ -417,7 +407,7 @@ MBTB::lookup(Addr block_pc, std::shared_ptr<BTBMeta> meta)
  * Note: This is only called in L1 BTB during update
  */
 void
-MBTB::getAndSetNewBTBEntry(FetchStream &stream)
+MBTB::getAndSetNewBTBEntry(FetchTarget &stream)
 {
     DPRINTF(BTB, "getAndSetNewBTBEntry called for pc %#lx\n", stream.startPC);
     // Get prediction metadata from previous stages
@@ -460,7 +450,7 @@ MBTB::getAndSetNewBTBEntry(FetchStream &stream)
     }
 
     // Set tag and update stream metadata for use in update()
-    entry_to_write.tag = getTag(entry_to_write.pc);
+    entry_to_write.tag = getTag(entry_to_write.pc, stream.asidHash);
     stream.updateNewBTBEntry = entry_to_write;
     stream.updateIsOldEntry = is_old_entry;
 }
@@ -470,7 +460,7 @@ MBTB::getAndSetNewBTBEntry(FetchStream &stream)
  * Also check BTB prediction status
  */
 void
-MBTB::checkPredictionHit(const FetchStream &stream, const BTBMeta* meta)
+MBTB::checkPredictionHit(const FetchTarget &stream, const BTBMeta* meta)
 {
     bool pred_branch_hit = false;
     for (auto &e : meta->hit_entries) {
@@ -498,7 +488,7 @@ MBTB::checkPredictionHit(const FetchStream &stream, const BTBMeta* meta)
  * 5. Update MRU information
  */
 void
-MBTB::updateBTBEntry(const BTBEntry& entry, const FetchStream &stream)
+MBTB::updateBTBEntry(const BTBEntry& entry, const FetchTarget &stream)
 {
     btbStats.updateTotal++;
     // Select SRAM based on entry PC's 32B-aligned address
@@ -508,7 +498,7 @@ MBTB::updateBTBEntry(const BTBEntry& entry, const FetchStream &stream)
     auto& target_mru = (sram_id == 0) ? mru0 : mru1;
     
     // Calculate index and tag for this entry
-    Addr btb_idx = getIndex(entry.pc);
+    Addr btb_idx = getIndex(entry.pc, stream.asidHash);
 
     // Look for matching entry in the target SRAM
     bool found = false;
@@ -557,14 +547,14 @@ MBTB::updateBTBEntry(const BTBEntry& entry, const FetchStream &stream)
 BTBEntry
 MBTB::buildUpdatedEntry(const BTBEntry& req_entry,
                         const BTBEntry* existing_entry,
-                        const FetchStream &stream)
+                        const FetchTarget &stream)
 {
     // For conditional branches, prefer the existing entry to preserve up-to-date ctr
     auto entry_to_write = (req_entry.isCond && existing_entry)
                               ? BTBEntry(*existing_entry)
                               : req_entry;
     // Always recalculate tag based on the actual PC being written
-    entry_to_write.tag = getTag(entry_to_write.pc);
+    entry_to_write.tag = getTag(entry_to_write.pc, stream.asidHash);
     entry_to_write.resolved = false; // reset resolved status
 
     // Update saturating counter and alwaysTaken
@@ -584,7 +574,6 @@ MBTB::buildUpdatedEntry(const BTBEntry& req_entry,
     if (entry_to_write.isIndirect && stream.exeTaken && stream.getControlPC() == entry_to_write.pc) {
         entry_to_write.target = stream.exeBranchInfo.target;
     }
-
     return entry_to_write;
 }
 
@@ -683,30 +672,21 @@ MBTB::commitToVictimCache(int vc_idx, const TickedBTBEntry &ticked_entry)
  * 5. Update MRU information
  */
 void
-MBTB::update(const FetchStream &stream)
+MBTB::update(const FetchTarget &stream)
 {
     DPRINTF(BTB, "BTB: update called for pc %#lx\n", stream.startPC);
     // 1. Check prediction hit status, for stats recording
     checkPredictionHit(stream,
         std::static_pointer_cast<BTBMeta>(stream.predMetas[getComponentIdx()]).get());
-    if (!usingBasetable) {
-        // only update btb entry for control squash T-> NT or NT -> T
-        if (stream.squashType == SQUASH_CTRL) {
-            warn_if(stream.exeBranchInfo.pc > stream.updateEndInstPC, "exeBranchInfo.pc > updateEndInstPC");
-            updateBTBEntry(stream.exeBranchInfo, stream);
-        }
-    }else {
-        auto entries_need_update = prepareUpdateEntries(stream);
-        for (auto &entry : entries_need_update) {
-            updateBTBEntry(entry, stream);
-        }
-    }
 
+    auto entries_need_update = prepareUpdateEntries(stream);
+    for (auto &entry : entries_need_update) {
+        updateBTBEntry(entry, stream);
+    }
 }
 
-
 std::vector<BTBEntry>
-MBTB::prepareUpdateEntries(const FetchStream &stream) {
+MBTB::prepareUpdateEntries(const FetchTarget &stream) {
     auto all_entries = stream.updateBTBEntries;
 
     // Add potential new BTB entry if it's a btb miss during prediction
@@ -733,7 +713,7 @@ MBTB::prepareUpdateEntries(const FetchStream &stream) {
  * Victim cache operations implementation
  */
 std::vector<MBTB::TickedBTBEntry>
-MBTB::lookupVictimCache(Addr block_pc)
+MBTB::lookupVictimCache(Addr block_pc, uint8_t asidHash)
 {
     std::vector<TickedBTBEntry> results;
     Addr alignedPC = block_pc & ~(blockSize - 1);
@@ -745,7 +725,7 @@ MBTB::lookupVictimCache(Addr block_pc)
         Addr entryAlignedPC = entry.pc & ~(blockSize - 1);
         // Check if this entry is in either of the two 32B blocks we're looking for
         if (entryAlignedPC == alignedPC || entryAlignedPC == (alignedPC + blockSize)) {
-            Addr current_tag = getTag(entry.pc);
+            Addr current_tag = getTag(entry.pc, asidHash);
             if (entry.tag == current_tag) {
                 results.push_back(entry);
                 DPRINTF(BTB, "Victim cache hit for pc %#lx\n", entry.pc);
@@ -811,8 +791,9 @@ MBTB::insertVictimCache(const TickedBTBEntry& evicted_entry)
 }
 
 #ifndef UNIT_TEST
+
 void
-MBTB::commitBranch(const FetchStream &stream, const DynInstPtr &inst)
+MBTB::commitBranch(const FetchTarget &stream, const DynInstPtr &inst)
 {
     auto meta = std::static_pointer_cast<BTBMeta>(stream.predMetas[getComponentIdx()]);
     auto &hit_entries = meta->hit_entries;
@@ -957,13 +938,18 @@ MBTB::BTBStats::BTBStats(statistics::Group* parent, int numWays) :
     ADD_STAT(returnHits, statistics::units::Count::get(), "returns committed that was predicted hit"),
     ADD_STAT(returnMisses, statistics::units::Count::get(), "returns committed that was predicted miss"),
 
-    ADD_STAT(victimCacheHit, statistics::units::Count::get(), "victim cache hits"),
-    ADD_STAT(predHitCount, statistics::units::Count::get(), "number of hit entries encountered on mbtb hit")
+    ADD_STAT(victimCacheHit, statistics::units::Count::get(), "victim cache hits")
 
 {
-    predHitCount.init(0, numWays * 2, 1);   // max 4ways * 2(halfAligned) + VC
+    init(numWays);
 }
 #endif
+
+void
+MBTB::BTBStats::init(int numWays)
+{
+    predHitCount.init(0, numWays * 2, 1);
+}
 
 // Close conditional namespace wrapper for testing
 #ifdef UNIT_TEST

@@ -54,13 +54,13 @@
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/limits.hh"
+#include "cpu/o3/smt_sched.hh"
 #include "cpu/pc_event.hh"
 #include "cpu/pred/bpred_unit.hh"
 #include "cpu/pred/btb/decoupled_bpred.hh"
-#include "cpu/pred/ftb/decoupled_bpred.hh"
-#include "cpu/pred/stream/decoupled_bpred.hh"
 #include "cpu/timebuf.hh"
 #include "cpu/translation.hh"
+#include "cpu/valuepred/valuepred_unit.hh"
 #include "enums/SMTFetchPolicy.hh"
 #include "mem/packet.hh"
 #include "mem/port.hh"
@@ -234,6 +234,22 @@ class Fetch
     /** To probe when a fetch request is successfully sent. */
     ProbePointArg<RequestPtr> *ppFetchRequestSent;
 
+    // SMT Decode Scheduler
+    SMTScheduler* decodeScheduler;
+
+    // Counters from backend structures (to be passed in)
+    InstsCounter* lsqCounter;
+    InstsCounter* iqCounter;
+    InstsCounter* robCounter;
+
+    unsigned smtBorrowThrottleCycles[MaxThreads];
+    unsigned smtBorrowThrottleHoldCycles;
+    unsigned smtLdstqHighWater;
+
+    // Configuration parameters
+    std::string smtDecodePolicy ="multi_priority";
+    int delayedSchedulerDelay;
+
   public:
     /** Fetch constructor. */
     Fetch(CPU *_cpu, const BaseO3CPUParams &params);
@@ -248,6 +264,8 @@ class Fetch
 
     /** Sets the main backwards communication time buffer pointer. */
     void setTimeBuffer(TimeBuffer<TimeStruct> *time_buffer);
+
+    void setStallSignals(StallSignals* stall_signals) { stallSig = stall_signals; }
 
     /** Sets pointer to list of active threads. */
     void setActiveThreads(std::list<ThreadID> *at_ptr);
@@ -298,9 +316,18 @@ class Fetch
 
     /** For priority-based fetch policies, need to keep update priorityList */
     void deactivateThread(ThreadID tid);
+
+    // Function to initialize scheduler
+    void initDecodeScheduler();
+
+    // Select a thread that is not fetch-blocked, using scheduler
+    ThreadID selectUnstalledThread();
   private:
     /** Reset this pipeline stage */
     void resetStage();
+
+    /** Retry queued I-cache packets once, stopping at the first new block. */
+    void retryPendingIcacheRequests();
 
     /** Changes the status of this stage to active, and indicates this
      * to the CPU.
@@ -352,8 +379,6 @@ class Fetch
     /**
      * update branch predictors
      */
-    void updateBranchPredictors();
-
     /**
      * Looks up the branch predictor, gets a prediction, and updates the PC.
      * @param inst The dynamic instruction object.
@@ -439,9 +464,6 @@ class Fetch
                           const DynInstPtr squashInst,
                           const InstSeqNum seq_num, ThreadID tid);
 
-    /** Checks if a thread is stalled. */
-    bool checkStall(ThreadID tid) const;
-
     /** Updates overall fetch stage status; to be called at the end of each
      * cycle. */
     FetchStatus updateFetchStatus();
@@ -510,38 +532,14 @@ class Fetch
             StaticInstPtr curMacroop, const PCStateBase &this_pc,
             const PCStateBase &next_pc, bool trace);
 
-    /** Returns the appropriate thread to fetch, given the fetch policy. */
-    ThreadID getFetchingThread();
-
-    /** Returns the appropriate thread to fetch using a round robin policy. */
-    ThreadID roundRobin();
-
-    /** Returns the appropriate thread to fetch using the IQ count policy. */
-    ThreadID iqCount();
-
-    /** Returns the appropriate thread to fetch using the LSQ count policy. */
-    ThreadID lsqCount();
-
-    /** Returns the appropriate thread to fetch using the branch count
-     * policy. */
-    ThreadID branchCount();
-
     /** Pipeline the next I-cache access to the current one. */
     void pipelineIcacheAccesses(ThreadID tid);
 
     /** Profile the reasons of fetch stall. */
     void profileStall(ThreadID tid);
 
-
-    bool ftqEmpty() { return isDecoupledFrontend() && usedUpFetchTargets; }
-
     /** Set the reasons of all fetch stalls. */
     void setAllFetchStalls(StallReason stall);
-
-    /** Select the thread to fetch from.
-     * @return Thread ID to fetch from, or InvalidThreadID if none available
-     */
-    ThreadID selectFetchThread();
 
     /** Check decoupled frontend (FTQ) availability.
      * @param tid Thread ID
@@ -626,10 +624,6 @@ class Fetch
     /** BPredUnit. */
     branch_prediction::BPredUnit *branchPred;
 
-    branch_prediction::stream_pred::DecoupledStreamBPU *dbsp;
-
-    branch_prediction::ftb_pred::DecoupledBPUWithFTB *dbpftb;
-
     branch_prediction::btb_pred::DecoupledBPUWithBTB *dbpbtb;
 
     /** Maximum number of resolve entries buffered in fetch before training. */
@@ -642,7 +636,7 @@ class Fetch
     std::unique_ptr<TraceFetch> traceFetch;
 
     /** PC of each thread. */
-    std::unique_ptr<PCStateBase> pc[MaxThreads];
+    // std::unique_ptr<PCStateBase> pc[MaxThreads];
 
     /** Macroop of each thread. */
     StaticInstPtr macroop[MaxThreads];
@@ -666,7 +660,7 @@ class Fetch
     };
 
     /** Tracks which stages are telling fetch to stall. */
-    Stalls stalls[MaxThreads];
+    StallSignals* stallSig;
 
     /** Decode to fetch delay. */
     Cycles decodeToFetchDelay;
@@ -689,80 +683,11 @@ class Fetch
     /** Is the cache blocked?  If so no threads can access it. */
     bool cacheBlocked;
 
-    /** The packet that is waiting to be retried. */
+    /** Packets waiting for the next cache-issued retry callback. */
     std::vector<PacketPtr> retryPkt;
-
-    /** The thread that is waiting on the cache to tell fetch to retry. */
-    ThreadID retryTid;
 
     /** Cache block size. */
     unsigned int cacheBlkSize;
-
-    /**
-     * Fetch buffer structure to encapsulate instruction fetch data.
-     * Encapsulates buffer data, PC tracking, validity state, and size.
-     * Designed to prepare for 2fetch implementation with potential multi-stream support.
-     */
-    struct FetchBuffer
-    {
-        /** Pointer to the fetch data buffer */
-        uint8_t *data;
-
-        /** PC of the first instruction loaded into the fetch buffer */
-        Addr startPC;
-
-        /** Whether the fetch buffer data is valid */
-        bool valid;
-
-        /** Size of the fetch buffer in bytes. Set by Fetch class during init. */
-        unsigned size;
-
-        /** Constructor initializes buffer with default size */
-        FetchBuffer() : data(nullptr), startPC(0), valid(false), size(0) {
-        }
-
-        /** Destructor is not needed as Fetch class manages memory */
-        ~FetchBuffer() {
-        }
-
-        /** Reset buffer state */
-        void reset() {
-            valid = false;
-            startPC = 0;
-            // No need to clear data as it will be overwritten
-        }
-
-        /** Check if a PC is within the current buffer range */
-        bool contains(Addr pc) const {
-            return valid && (pc >= startPC) && (pc < startPC + size);
-        }
-
-        /** Get offset of PC within the buffer */
-        unsigned getOffset(Addr pc) const {
-            assert(contains(pc));
-            return pc - startPC;
-        }
-
-        /** Set buffer data and update metadata */
-        void setData(Addr pc, const uint8_t* src_data, unsigned bytes_copied) {
-            startPC = pc;
-            valid = true;
-            memcpy(data, src_data, bytes_copied);
-        }
-
-        /** Get end PC of the buffer */
-        Addr getEndPC() const {
-            return startPC + size;
-        }
-    };
-
-    /** Fetch buffer for each thread */
-    FetchBuffer fetchBuffer[MaxThreads];
-
-    /** The size of the fetch buffer in bytes. Default is 66 bytes,
-    *  make sure we could decode tail 4bytes if it is in [62, 66)
-     */
-    unsigned fetchBufferSize;
 
     // Constants for misaligned fetch handling
     static constexpr unsigned CACHE_LINE_SIZE_BYTES = 64;
@@ -936,8 +861,77 @@ class Fetch
         }
     };
 
-    /** Cache request for each thread, replacing multiple redundant state variables */
-    CacheRequest cacheReq[MaxThreads];
+    /** The size of the fetch buffer in bytes. Default is 66 bytes,
+    *  make sure we could decode tail 4bytes if it is in [62, 66)
+     */
+    unsigned fetchBufferSize;
+
+    /**
+     * Fetch buffer structure to encapsulate instruction fetch data.
+     * Encapsulates buffer data, PC tracking, validity state, and size.
+     * Designed to prepare for 2fetch implementation with potential multi-stream support.
+     */
+    struct FetchBuffer
+    {
+        std::unique_ptr<PCStateBase> fetchpc;
+        CacheRequest cacheReq;
+
+        /** Pointer to the fetch data buffer */
+        uint8_t *data;
+
+        /** PC of the first instruction loaded into the fetch buffer */
+        Addr startPC;
+
+        /** Whether the fetch buffer data is valid */
+        bool valid;
+
+        /** Size of the fetch buffer in bytes. Set by Fetch class during init. */
+        unsigned size;
+
+        /** Constructor initializes buffer with default size */
+        FetchBuffer() : data(nullptr), startPC(0), valid(false), size(0) {
+        }
+
+        /** Destructor is not needed as Fetch class manages memory */
+        ~FetchBuffer() {
+        }
+
+        /** Reset buffer state */
+        void reset() {
+            valid = false;
+            startPC = 0;
+            // No need to clear data as it will be overwritten
+        }
+
+        /** Check if a PC is within the current buffer range */
+        bool contains(Addr pc) const {
+            return valid && (pc >= startPC) && (pc < startPC + size);
+        }
+
+        /** Get offset of PC within the buffer */
+        unsigned getOffset(Addr pc) const {
+            assert(contains(pc));
+            return pc - startPC;
+        }
+
+        /** Set buffer data and update metadata */
+        void setData(Addr pc, const uint8_t* src_data, unsigned bytes_copied) {
+            startPC = pc;
+            valid = true;
+            memcpy(data, src_data, bytes_copied);
+        }
+
+        /** Get end PC of the buffer */
+        Addr getEndPC() const {
+            return startPC + size;
+        }
+    };
+
+    /** Fetch buffer for each thread */
+    FetchBuffer threads[MaxThreads];
+
+    // /** Cache request for each thread, replacing multiple redundant state variables */
+    // CacheRequest cacheReq[MaxThreads];
 
     /** The size of the fetch queue in micro-ops */
     unsigned fetchQueueSize;
@@ -973,34 +967,20 @@ class Fetch
     /** Event used to delay fault generation of translation faults */
     FinishTranslationEvent finishTranslationEvent;
 
-    /** Decoupled frontend related */
-    bool isDecoupledFrontend();
-
-    bool isStreamPred() const { return branchPred->isStream(); }
-
-    bool isFTBPred() const { return branchPred->isFTB(); }
+    // NOTE: This Fetch implementation is decoupled+BTB-only; no coupled mode.
 
     bool isBTBPred() const { return branchPred->isBTB(); }
 
-    bool usedUpFetchTargets;
+    // Decoupled+BTB-only: fetch consumes the supplying FSQ entry directly.
+    // If no head is available, fetch stalls (no extra "supply" state machine).
+    bool ftqEmpty(ThreadID tid) const { return !dbpbtb || !dbpbtb->ftqHasFetching(tid); }
+
+    // Number of dynamic instructions fetched within the current FTQ entry.
+    // Used to explicitly notify the BPU when an entry is consumed (Phase5 prep).
+    unsigned ftqEntryFetchedInsts[MaxThreads]{};
 
     /** fetch stall reasons */
     std::vector<StallReason> stallReason;
-
-    bool currentFetchTargetInLoop{false};
-
-    std::pair<Addr, std::vector<branch_prediction::ftb_pred::LoopBuffer::InstDesc>> currentFtqEntryInsts;
-
-    bool notTakenBranchEncountered{false};
-
-    /** Check if we need a new FTQ entry for fetch */
-    bool needNewFTQEntry(ThreadID tid);
-
-    /** Get the start PC of the next FTQ entry and update fetchBufferPC */
-    Addr getNextFTQStartPC(ThreadID tid);
-
-    /** Apply trace-mode control-PC override to a decoupled-frontend demand PC. */
-    Addr getDecoupledDemandPC(ThreadID tid, Addr fallback_pc);
 
     /**
      * Check if the thread can fetch instructions
@@ -1078,8 +1058,12 @@ class Fetch
          * the pipeline.
          */
         statistics::Scalar idleCycles;
+
+        statistics::Vector smtidleCycles;
         /** Total number of cycles spent blocked. */
         statistics::Scalar blockedCycles;
+
+        statistics::Vector smtblockedCycles;
         /** Total number of cycles spent in any other state. */
         statistics::Scalar miscStallCycles;
         /** Total number of cycles spent in waiting for drains. */
@@ -1115,6 +1099,10 @@ class Fetch
         statistics::Vector fetchStatusDist;
         /** Number of decode stalls */
         statistics::Scalar decodeStalls;
+
+        statistics::Vector smtdecodeStalls;
+
+        statistics::Vector smtftqempty;
         /** Number of decode stalls per cycle */
         statistics::Formula decodeStallRate;
         /** Unutilized issue-pipeline slots while there is no backend-stall */
@@ -1150,14 +1138,17 @@ class Fetch
         statistics::Scalar traceMetaCleanupCommitCalls;
     } fetchStats;
 
-    SquashVersion localSquashVer;
+    SquashVersion localSquashVer[MaxThreads];
 
 public:
     const FetchStatGroup &getFetchStats() { return fetchStats; }
 
   private:
 
-    bool waitForVsetvl = false;
+    bool waitForVsetvl [MaxThreads];
+
+    /** Value predictor */
+    valuepred::VPUnit *valuePred;
 };
 
 } // namespace o3

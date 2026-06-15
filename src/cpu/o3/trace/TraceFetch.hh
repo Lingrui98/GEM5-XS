@@ -91,9 +91,6 @@ class TraceFetch
     /** Called by Fetch::performInstructionFetch to model coupled mispredict stalls. */
     bool maybeStallFetch(ThreadID tid);
 
-    /** Trace-mode helper: choose the control-PC view used to supply decoupled BPU. */
-    Addr getControlPCView(ThreadID tid, Addr fallbackPC);
-
     /** Trace-mode checkMemoryNeeds fast path (called from Fetch::checkMemoryNeeds). */
     StallReason checkMemoryNeeds(ThreadID tid, const PCStateBase &this_pc);
 

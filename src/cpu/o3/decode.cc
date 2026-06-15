@@ -72,6 +72,7 @@ Decode::Decode(CPU *_cpu, const BaseO3CPUParams &params)
       iewToDecodeDelay(params.iewToDecodeDelay),
       commitToDecodeDelay(params.commitToDecodeDelay),
       fetchToDecodeDelay(params.fetchToDecodeDelay),
+      decodeToFetchDelay(params.decodeToFetchDelay),
       decodeWidth(params.decodeWidth),
       numThreads(params.numThreads),
       enableLoadFusion(params.enable_loadFusion),
@@ -83,18 +84,22 @@ Decode::Decode(CPU *_cpu, const BaseO3CPUParams &params)
              decodeWidth, static_cast<int>(MaxWidth));
 
     // @todo: Make into a parameter
-    skidBufferMax = (fetchToDecodeDelay + 1) *  params.fetchWidth;
-    for (int tid = 0; tid < MaxThreads; tid++) {
-        stalls[tid] = {false};
-        decodeStatus[tid] = Idle;
-        bdelayDoneSeqNum[tid] = 0;
-        squashInst[tid] = nullptr;
-        squashAfterDelaySlot[tid] = 0;
+    for (int i=0;i<numThreads;i++) {
+        fixedbuffer[i] = boost::circular_buffer<DynInstPtr>(decodeWidth);
     }
+    // This buffer preserves the fetch->decode pipeline contents when decode
+    // stalls while TimeBuffer keeps advancing. Its depth matches the original
+    // forward pipeline window; fetch is backpressured before full to absorb
+    // both the decode->fetch feedback delay and the request already issued in
+    // the current cycle before decode computes backpressure.
+    const auto stallGroupDepth = fetchToDecodeDelay + 1;
+    stallBuffer = boost::circular_buffer<DynInstPtr>(
+        decodeWidth * stallGroupDepth);
+    eachstallSize = boost::circular_buffer<int>(stallGroupDepth);
+
 
     decodeStalls.resize(decodeWidth, StallReason::NoStall);
-
-   statistics::registerDumpCallback([this]() {
+    statistics::registerDumpCallback([this]() {
         int idx = 0;
         for (auto it : this->fusionType) {
             this->stats.fusedInsts.subname(idx, it.first);
@@ -114,21 +119,13 @@ Decode::startupStage()
 void
 Decode::clearStates(ThreadID tid)
 {
-    decodeStatus[tid] = Idle;
-    stalls[tid].rename = false;
+
 }
 
 void
 Decode::resetStage()
 {
     _status = Inactive;
-
-    // Setup status, make sure stall signals are clear.
-    for (ThreadID tid = 0; tid < numThreads; ++tid) {
-        decodeStatus[tid] = Idle;
-
-        stalls[tid].rename = false;
-    }
 }
 
 std::string
@@ -141,8 +138,14 @@ Decode::DecodeStats::DecodeStats(CPU *cpu)
     : statistics::Group(cpu, "decode"),
       ADD_STAT(idleCycles, statistics::units::Cycle::get(),
                "Number of cycles decode is idle"),
+      ADD_STAT(smtidleCycles, statistics::units::Cycle::get(),
+             "Number of cycles fetch was idle per tid"),
       ADD_STAT(blockedCycles, statistics::units::Cycle::get(),
                "Number of cycles decode is blocked"),
+      ADD_STAT(smtblockedCycles, statistics::units::Cycle::get(),
+             "Number of cycles fetch has spent blocked per tid"),
+      ADD_STAT(smtnotactiveCycles, statistics::units::Cycle::get(),
+             "Number of cycles fetch no active per tid"),
       ADD_STAT(runCycles, statistics::units::Cycle::get(),
                "Number of cycles decode is running"),
       ADD_STAT(unblockCycles, statistics::units::Cycle::get(),
@@ -182,6 +185,16 @@ Decode::DecodeStats::DecodeStats(CPU *cpu)
     mispredictedByPC.flags(statistics::total);
     mispredictedByNPC.flags(statistics::total);
     fusedInsts.init(128).flags(statistics::nozero);
+
+    smtidleCycles
+            .init(4)
+            .flags(statistics::total);
+    smtblockedCycles
+            .init(4)
+            .flags(statistics::total);
+    smtnotactiveCycles
+            .init(4)
+            .flags(statistics::total);
 }
 
 void
@@ -226,8 +239,7 @@ void
 Decode::drainSanityCheck() const
 {
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
-        assert(insts[tid].empty());
-        assert(skidBuffer[tid].empty());
+        assert(fixedbuffer[tid].empty());
     }
 }
 
@@ -235,8 +247,7 @@ bool
 Decode::isDrained() const
 {
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
-        if (!insts[tid].empty() || !skidBuffer[tid].empty() ||
-                (decodeStatus[tid] != Running && decodeStatus[tid] != Idle))
+        if (!fixedbuffer[tid].empty())
             return false;
     }
     return true;
@@ -247,10 +258,6 @@ Decode::checkStall(ThreadID tid) const
 {
     bool ret_val = false;
 
-    if (stalls[tid].rename) {
-        DPRINTF(Decode,"[tid:%i] Stall fom Rename stage detected.\n", tid);
-        ret_val = true;
-    }
 
     return ret_val;
 }
@@ -261,55 +268,8 @@ Decode::fetchInstsValid()
     return fromFetch->size > 0;
 }
 
-bool
-Decode::block(ThreadID tid)
-{
-    DPRINTF(Decode, "[tid:%i] Blocking.\n", tid);
-
-    // Add the current inputs to the skid buffer so they can be
-    // reprocessed when this stage unblocks.
-    skidInsert(tid);
-
-    // If the decode status is blocked or unblocking then decode has not yet
-    // signalled fetch to unblock. In that case, there is no need to tell
-    // fetch to block.
-    if (decodeStatus[tid] != Blocked) {
-        // Set the status to Blocked.
-        decodeStatus[tid] = Blocked;
-
-        if (toFetch->decodeUnblock[tid]) {
-            toFetch->decodeUnblock[tid] = false;
-        } else {
-            toFetch->decodeBlock[tid] = true;
-            wroteToTimeBuffer = true;
-        }
-
-        return true;
-    }
-
-    return false;
-}
-
-bool
-Decode::unblock(ThreadID tid)
-{
-    // Decode is done unblocking only if the skid buffer is empty.
-    if (skidBuffer[tid].empty()) {
-        DPRINTF(Decode, "[tid:%i] Done unblocking.\n", tid);
-        toFetch->decodeUnblock[tid] = true;
-        wroteToTimeBuffer = true;
-
-        decodeStatus[tid] = Running;
-        return true;
-    }
-
-    DPRINTF(Decode, "[tid:%i] Currently unblocking.\n", tid);
-
-    return false;
-}
-
 void
-Decode::squash(const DynInstPtr &inst, ThreadID tid)
+Decode::selfSquash(const DynInstPtr &inst, ThreadID tid)
 {
     DPRINTF(Decode, "[tid:%i] [sn:%llu] Squashing due to incorrect branch "
             "prediction detected at decode.\n", tid, inst->seqNum);
@@ -348,30 +308,23 @@ Decode::squash(const DynInstPtr &inst, ThreadID tid)
 
     InstSeqNum squash_seq_num = inst->seqNum;
 
-    // Might have to tell fetch to unblock.
-    if (decodeStatus[tid] == Blocked ||
-        decodeStatus[tid] == Unblocking) {
-        toFetch->decodeUnblock[tid] = 1;
-    }
+    stallSig->blockFetch[tid] = true; // tell fetch don't send new insts
 
-    // Set status to squashing.
-    decodeStatus[tid] = Squashing;
+    fixedbuffer[tid].clear();
 
-    for (int i=0; i<fromFetch->size; i++) {
-        if (fromFetch->insts[i]->threadNumber == tid &&
-            fromFetch->insts[i]->seqNum > squash_seq_num) {
-            fromFetch->insts[i]->setSquashed();
+    auto delIt = stallBuffer.begin();
+    for (auto it0 = eachstallSize.begin(); it0 != eachstallSize.end();) {
+        int size = *it0;
+        auto start_it = delIt;
+        auto end_it = start_it + size;
+        if ((*start_it)->threadNumber == tid) {
+            delIt = stallBuffer.erase(start_it, end_it);
+            it0 = eachstallSize.erase(it0);
         }
-    }
-
-    // Clear the instruction list and skid buffer in case they have any
-    // insts in them.
-    while (!insts[tid].empty()) {
-        insts[tid].pop();
-    }
-
-    while (!skidBuffer[tid].empty()) {
-        skidBuffer[tid].pop();
+        else {
+            delIt = end_it;
+            it0++;
+        }
     }
 
     // Squash instructions up until this one
@@ -383,89 +336,28 @@ Decode::squash(ThreadID tid)
 {
     DPRINTF(Decode, "[tid:%i] Squashing.\n",tid);
 
-    if (decodeStatus[tid] == Blocked ||
-        decodeStatus[tid] == Unblocking) {
-        if (FullSystem) {
-            toFetch->decodeUnblock[tid] = 1;
-        } else {
-            // In syscall emulation, we can have both a block and a squash due
-            // to a syscall in the same cycle.  This would cause both signals
-            // to be high.  This shouldn't happen in full system.
-            // @todo: Determine if this still happens.
-            if (toFetch->decodeBlock[tid])
-                toFetch->decodeBlock[tid] = 0;
-            else
-                toFetch->decodeUnblock[tid] = 1;
+    fixedbuffer[tid].clear();
+
+    auto delIt = stallBuffer.begin();
+    for (auto it0 = eachstallSize.begin(); it0 != eachstallSize.end();) {
+        int size = *it0;
+        auto start_it = delIt;
+        auto end_it = start_it + size;
+        if ((*start_it)->threadNumber == tid) {
+            delIt = stallBuffer.erase(start_it, end_it);
+            it0 = eachstallSize.erase(it0);
+        }
+        else {
+            delIt = end_it;
+            it0++;
         }
     }
 
-    // Set status to squashing.
-    decodeStatus[tid] = Squashing;
-
-    // Go through incoming instructions from fetch and squash them.
-    unsigned squash_count = 0;
-
-    for (int i=0; i<fromFetch->size; i++) {
-        if (fromFetch->insts[i]->threadNumber == tid) {
-            fromFetch->insts[i]->setSquashed();
-            squash_count++;
-        }
-    }
-
-    // Clear the instruction list and skid buffer in case they have any
-    // insts in them.
-    while (!insts[tid].empty()) {
-        insts[tid].pop();
-    }
-
-    while (!skidBuffer[tid].empty()) {
-        skidBuffer[tid].pop();
-    }
-
-    return squash_count;
+    return 0;
 }
 
 void
-Decode::skidInsert(ThreadID tid)
-{
-    DynInstPtr inst = NULL;
-
-    while (!insts[tid].empty()) {
-        inst = insts[tid].front();
-
-        insts[tid].pop();
-
-        assert(tid == inst->threadNumber);
-
-        skidBuffer[tid].push(inst);
-
-        DPRINTF(Decode, "Inserting [tid:%d][sn:%lli] PC: %s into decode "
-                "skidBuffer %i\n", inst->threadNumber, inst->seqNum,
-                inst->pcState(), skidBuffer[tid].size());
-    }
-
-    // @todo: Eventually need to enforce this by not letting a thread
-    // fetch past its skidbuffer
-    assert(skidBuffer[tid].size() <= skidBufferMax);
-}
-
-bool
-Decode::skidsEmpty()
-{
-    list<ThreadID>::iterator threads = activeThreads->begin();
-    list<ThreadID>::iterator end = activeThreads->end();
-
-    while (threads != end) {
-        ThreadID tid = *threads++;
-        if (!skidBuffer[tid].empty())
-            return false;
-    }
-
-    return true;
-}
-
-void
-Decode::updateStatus()
+Decode::updateActivate()
 {
     bool any_unblocking = false;
 
@@ -475,7 +367,7 @@ Decode::updateStatus()
     while (threads != end) {
         ThreadID tid = *threads++;
 
-        if (decodeStatus[tid] == Unblocking) {
+        if (!stallSig->blockDecode[tid]) {
             any_unblocking = true;
             break;
         }
@@ -503,144 +395,201 @@ Decode::updateStatus()
 }
 
 void
-Decode::sortInsts()
+Decode::moveInstsToBuffer()
 {
-    int insts_from_fetch = fromFetch->size;
-    for (int i = 0; i < insts_from_fetch; ++i) {
-        const DynInstPtr &inst = fromFetch->insts[i];
-        if (localSquashVer.largerThan(inst->getVersion())) {
-            inst->setSquashed();
+    auto tryMoveHeadGroupToFixedBuffer = [&]() -> bool {
+        if (stallBuffer.empty()) {
+            return false;
         }
-        insts[inst->threadNumber].push(inst);
+
+        // stallbuffer moves to fixedbuffer in strict FIFO order.
+        ThreadID tid = stallBuffer.front()->threadNumber;
+        if (!fixedbuffer[tid].empty()) {
+            return false;
+        }
+
+        int insts_from_stall = eachstallSize.front();
+        eachstallSize.pop_front();
+        for (int i = 0; i < insts_from_stall; ++i) {
+            const DynInstPtr &inst = stallBuffer.front();
+            assert(tid == inst->threadNumber);
+            if (localSquashVer[tid].largerThan(inst->getVersion())) {
+                inst->setSquashed();
+            }
+            assert(!fixedbuffer[inst->threadNumber].full());
+            fixedbuffer[inst->threadNumber].push_back(inst);
+            stallBuffer.pop_front();
+        }
+
+        return true;
+    };
+
+    // Model one stage advance before latching the next cycle's input so a
+    // full stall buffer can still accept a new fetch bundle when its head
+    // group moves forward in the same cycle.
+    const bool moved_group = tryMoveHeadGroupToFixedBuffer();
+
+    // do not support mixed thread instructions in one fetch group
+    int insts_from_fetch = fromFetch->size;
+    if (insts_from_fetch != 0) {
+        ThreadID tid = fromFetch->insts[0]->threadNumber;
+
+        // move to stallbuffer
+        panic_if(eachstallSize.full(), "Decode stallbuffer overflow, has %d stalls\n", eachstallSize.size() + 1);
+        eachstallSize.push_back(insts_from_fetch);
+        for (int i = 0; i < insts_from_fetch; i++) {
+            stallBuffer.push_back(fromFetch->insts[i]);
+        }
+    }
+
+    DPRINTF(Decode, "Decode stall buffer has %d stalls\n",
+            eachstallSize.size());
+
+    if (stallBuffer.empty()) {
+        return;
+    }
+
+    // If nothing advanced before latching new input, allow the current head
+    // (possibly the just-arrived group) to fill an empty stage this cycle.
+    if (!moved_group) {
+        tryMoveHeadGroupToFixedBuffer();
     }
 }
 
 void
-Decode::readStallSignals(ThreadID tid)
+Decode::checkSquash()
 {
-    if (fromRename->renameBlock[tid]) {
-        stalls[tid].rename = true;
+    for (int i = 0;i < numThreads; i++) {
+        if (fromCommit->commitInfo[i].squash) {
+            DPRINTF(Decode, "[tid:%i] Squashing instructions due to squash "
+                    "from commit.\n", i);
+            squash(i);
+            localSquashVer[i].update(
+                fromCommit->commitInfo[i].squashVersion.getVersion());
+            DPRINTF(Decode, "Updating squash version to %u\n",
+                    localSquashVer[i].getVersion());
+        }
     }
-
-    if (fromRename->renameUnblock[tid]) {
-        assert(stalls[tid].rename);
-        stalls[tid].rename = false;
-    }
-}
-
-bool
-Decode::checkSignalsAndUpdate(ThreadID tid)
-{
-    // Check if there's a squash signal, squash if there is.
-    // Check stall signals, block if necessary.
-    // If status was blocked
-    //     Check if stall conditions have passed
-    //         if so then go to unblocking
-    // If status was Squashing
-    //     check if squashing is not high.  Switch to running this cycle.
-
-    // Update the per thread stall statuses.
-    readStallSignals(tid);
-
-    // Check squash signals from commit.
-    if (fromCommit->commitInfo[tid].squash) {
-
-        DPRINTF(Decode, "[tid:%i] Squashing instructions due to squash "
-                "from commit.\n", tid);
-
-        squash(tid);
-
-        localSquashVer.update(fromCommit->commitInfo[tid].squashVersion.getVersion());
-        DPRINTF(Decode, "Updating squash version to %u\n",
-                localSquashVer.getVersion());
-
-        return true;
-    }
-
-    if (checkStall(tid)) {
-        blockReason = fromRename->renameInfo[tid].blockReason;
-        return block(tid);
-    }
-
-    if (decodeStatus[tid] == Blocked) {
-        DPRINTF(Decode, "[tid:%i] Done blocking, switching to unblocking.\n",
-                tid);
-
-        decodeStatus[tid] = Unblocking;
-
-        unblock(tid);
-
-        return true;
-    }
-
-    if (decodeStatus[tid] == Squashing) {
-        // Switch status to running if decode isn't being told to block or
-        // squash this cycle.
-        DPRINTF(Decode, "[tid:%i] Done squashing, switching to running.\n",
-                tid);
-
-        decodeStatus[tid] = Running;
-
-        return false;
-    }
-
-    // If we've reached this point, we have not gotten any signals that
-    // cause decode to change its status.  Decode remains the same as before.
-    return false;
 }
 
 void
 Decode::tick()
 {
     toRename->fetchStallReason = fromFetch->fetchStallReason;
-
     wroteToTimeBuffer = false;
-
-    bool status_change = false;
-
     toRenameIndex = 0;
+    blockReason = StallReason::NoStall;
+    setAllStalls(StallReason::NoStall);
 
-    list<ThreadID>::iterator threads = activeThreads->begin();
-    list<ThreadID>::iterator end = activeThreads->end();
+    moveInstsToBuffer();
 
-    sortInsts();
+    checkSquash();
 
-    //Check stall and squash signals.
-    while (threads != end) {
-        ThreadID tid = *threads++;
+    // check threads stall & status
+    ThreadID blocked_tid = InvalidThreadID;
+    SmtActiveThreadArbiter active_arbiter;
+    auto freezeActiveThread = [this](ThreadID tid) {
+        stallSig->blockFetch[tid] = true;
+        stallSig->fetchBlockReason[tid] = StallReason::OtherFragStall;
+        toFetch->decodeInfo[tid].blockReason =
+            stallSig->fetchBlockReason[tid];
+    };
+    const auto fetchFeedbackReserve =
+        numThreads > 1 ? fetchToDecodeDelay : decodeToFetchDelay + 1;
+    const bool fifoBackpressured =
+        !stallBuffer.empty() &&
+        eachstallSize.size() + fetchFeedbackReserve >=
+            eachstallSize.capacity();
+    const ThreadID fifoHeadTid =
+        !stallBuffer.empty() ? stallBuffer.front()->threadNumber : InvalidThreadID;
+    const StallReason fifoBlockReason =
+        (fifoBackpressured && fifoHeadTid != InvalidThreadID &&
+         stallSig->blockDecode[fifoHeadTid]) ?
+            stallSig->decodeBlockReason[fifoHeadTid] :
+            (fifoBackpressured ? StallReason::OtherFragStall :
+                                 StallReason::NoStall);
+    for (int i = 0; i < numThreads; i++) {
+        bool block = stallSig->blockDecode[i];
+        bool active = !block && !fixedbuffer[i].empty();
 
-        DPRINTF(Decode,"Processing [tid:%i]\n",tid);
-        status_change =  checkSignalsAndUpdate(tid) || status_change;
-
-        decode(status_change, tid);
-
-        toFetch->decodeInfo[tid].blockReason = blockReason;
-    }
-
-    if (status_change) {
-        updateStatus();
-    }
-
-    ThreadID tid = *threads;
-    if (stalls[tid].rename) {
-        // stall from rename, pass rename stall
-        setAllStalls(fromRename->renameInfo[tid].blockReason);
-    } else if (toRenameIndex == 0) {
-        if (decodeStalls[0] != StallReason::NoStall) {
-            setAllStalls(decodeStalls[0]);
-        } else {
-            // warn("decode have other Stall Reason!");
+        if (block){
+            ++stats.smtblockedCycles[i];
         }
-    } else {
-        // no stall from decode, pass fetch stall(no stall/FetchFragStall/fetch all stall)
+
+        if (!active)
+        {
+            ++stats.smtnotactiveCycles[i];
+        }
+
+        stallSig->blockFetch[i] = block || fifoBackpressured;
+        stallSig->fetchBlockReason[i] =
+            stallSig->blockFetch[i] ?
+                (block ? stallSig->decodeBlockReason[i] : fifoBlockReason) :
+                StallReason::NoStall;
+        toFetch->decodeInfo[i].blockReason = stallSig->fetchBlockReason[i];
+        if (active) {
+            const auto freeze = active_arbiter.observe(
+                i, smtBorrowPriority(fromIEW->iewInfo[i]));
+            if (freeze.previousActive != InvalidThreadID) {
+                freezeActiveThread(freeze.previousActive);
+            }
+            if (freeze.freezeCurrent) {
+                freezeActiveThread(i);
+            }
+        } else if (block && blocked_tid == InvalidThreadID) {
+            blocked_tid = i;
+        }
+    }
+    const ThreadID tid = active_arbiter.selected();
+    if (tid == InvalidThreadID) {
+        // all threads are stalled, no need to process
+        if (blocked_tid != InvalidThreadID) {
+            setAllStalls(stallSig->fetchBlockReason[blocked_tid]);
+            blockReason = stallSig->fetchBlockReason[blocked_tid];
+        }
+        toRename->decodeStallReason = decodeStalls;
+        updateActivate();
+        return;
+    }
+    DPRINTF(Decode,"Processing [tid:%i]\n",tid);
+
+    decodeInsts(tid);
+    ++stats.runCycles;
+    if (stallSig->blockDecode[tid]) {
+        setAllStalls(stallSig->decodeBlockReason[tid]);
+    } else if (toRenameIndex > 0 && decodeStalls[0] == StallReason::NoStall) {
         for (int i = 0; i < decodeStalls.size(); i++) {
-            if (i < toRenameIndex) {    // decode success, no stall
+            if (i < toRenameIndex) {
                 decodeStalls.at(i) = StallReason::NoStall;
-            } else {    // no insts to decode, pass fetch frag stall
+            } else {
                 decodeStalls.at(i) = fromFetch->fetchStallReason.at(i);
             }
         }
     }
+    stallSig->fetchBlockReason[tid] =
+        stallSig->blockFetch[tid] ? blockReason : StallReason::NoStall;
+    toFetch->decodeInfo[tid].blockReason = stallSig->fetchBlockReason[tid];
+    updateActivate();
+
+    // if (stalls[tid].rename) {
+    //     // stall from rename, pass rename stall
+    //     setAllStalls(fromRename->renameInfo[tid].blockReason);
+    // } else if (toRenameIndex == 0) {
+    //     if (decodeStalls[0] != StallReason::NoStall) {
+    //         setAllStalls(decodeStalls[0]);
+    //     } else {
+    //         // warn("decode have other Stall Reason!");
+    //     }
+    // } else {
+    //     // no stall from decode, pass fetch stall(no stall/FetchFragStall/fetch all stall)
+    //     for (int i = 0; i < decodeStalls.size(); i++) {
+    //         if (i < toRenameIndex) {    // decode success, no stall
+    //             decodeStalls.at(i) = StallReason::NoStall;
+    //         } else {    // no insts to decode, pass fetch frag stall
+    //             decodeStalls.at(i) = fromFetch->fetchStallReason.at(i);
+    //         }
+    //     }
+    // }
 
     toRename->decodeStallReason = decodeStalls;
 
@@ -652,58 +601,11 @@ Decode::tick()
 }
 
 void
-Decode::decode(bool &status_change, ThreadID tid)
-{
-    // If status is Running or idle,
-    //     call decodeInsts()
-    // If status is Unblocking,
-    //     buffer any instructions coming from fetch
-    //     continue trying to empty skid buffer
-    //     check if stall conditions have passed
-
-    if (decodeStatus[tid] == Blocked) {
-        ++stats.blockedCycles;
-        setAllStalls(blockReason);
-    } else if (decodeStatus[tid] == Squashing) {
-        ++stats.squashCycles;
-        setAllStalls(StallReason::SquashStall);
-    }
-
-    // Decode should try to decode as many instructions as its bandwidth
-    // will allow, as long as it is not currently blocked.
-    if (decodeStatus[tid] == Running ||
-        decodeStatus[tid] == Idle) {
-        DPRINTF(Decode, "[tid:%i] Not blocked, so attempting to run "
-                "stage.\n",tid);
-
-        decodeInsts(tid);
-    } else if (decodeStatus[tid] == Unblocking) {
-        // Make sure that the skid buffer has something in it if the
-        // status is unblocking.
-        assert(!skidsEmpty());
-
-        // If the status was unblocking, then instructions from the skid
-        // buffer were used.  Remove those instructions and handle
-        // the rest of unblocking.
-        decodeInsts(tid);
-
-        if (fetchInstsValid()) {
-            // Add the current inputs to the skid buffer so they can be
-            // reprocessed when this stage unblocks.
-            skidInsert(tid);
-        }
-
-        status_change = unblock(tid) || status_change;
-    }
-}
-
-void
 Decode::decodeInsts(ThreadID tid)
 {
     // Instructions can come either from the skid buffer or the list of
     // instructions coming from fetch, depending on decode's status.
-    int insts_available = decodeStatus[tid] == Unblocking ?
-        skidBuffer[tid].size() : insts[tid].size();
+    int insts_available = fixedbuffer[tid].size();
 
     std::queue<StallReason> decode_stalls;
 
@@ -714,6 +616,7 @@ Decode::decodeInsts(ThreadID tid)
                 " early.\n",tid);
         // Should I change the status to idle?
         ++stats.idleCycles;
+        ++stats.smtidleCycles[tid];
 
         StallReason stall = StallReason::NoStall;
         for (auto iter : fromFetch->fetchStallReason) {
@@ -724,17 +627,9 @@ Decode::decodeInsts(ThreadID tid)
         }
         setAllStalls(stall);
         return;
-    } else if (decodeStatus[tid] == Unblocking) {
-        DPRINTF(Decode, "[tid:%i] Unblocking, removing insts from skid "
-                "buffer.\n",tid);
-        ++stats.unblockCycles;
-    } else if (decodeStatus[tid] == Running) {
-        ++stats.runCycles;
     }
 
-    std::queue<DynInstPtr>
-        &insts_to_decode = decodeStatus[tid] == Unblocking ?
-        skidBuffer[tid] : insts[tid];
+    auto& insts_to_decode = fixedbuffer[tid];
 
     DPRINTF(Decode, "[tid:%i] Sending instruction to rename.\n",tid);
 
@@ -754,7 +649,7 @@ Decode::decodeInsts(ThreadID tid)
 
         DynInstPtr inst = std::move(insts_to_decode.front());
 
-        insts_to_decode.pop();
+        insts_to_decode.pop_front();
 
         DPRINTF(Decode, "[tid:%i] Processing instruction [sn:%lli] with "
                 "PC %s\n", tid, inst->seqNum, inst->pcState());
@@ -799,6 +694,18 @@ Decode::decodeInsts(ThreadID tid)
         }
 #endif
 
+        if (inst->staticInst->isVectorConfig()) {
+            inst->setSerializeBefore();
+            inst->setSerializeAfter();
+            decode_stalls.push(StallReason::SerializeStall);
+            breakDecode = StallReason::SerializeStall;
+            DPRINTF(Decode,
+                    "[tid:%i] [sn:%llu] Vector config decoded, set serialize barrier and stop decoding younger "
+                    "instructions.\n",
+                    tid, inst->seqNum);
+            break;
+        }
+
         // Ensure that if it was predicted as a branch, it really is a
         // branch.
         if (inst->readPredTaken() && !inst->isControl()) {
@@ -808,7 +715,7 @@ Decode::decodeInsts(ThreadID tid)
 
             // Might want to set some sort of boolean and just do
             // a check at the end
-            squash(inst, inst->threadNumber);
+            selfSquash(inst, inst->threadNumber);
 
             decode_stalls.push(StallReason::InstMisPred);
             breakDecode = StallReason::InstMisPred;
@@ -871,7 +778,7 @@ Decode::decodeInsts(ThreadID tid)
 
                 // Might want to set some sort of boolean and just do
                 // a check at the end
-                squash(inst, inst->threadNumber);
+                selfSquash(inst, inst->threadNumber);
 
                 decode_stalls.push(StallReason::InstMisPred);
                 breakDecode = StallReason::InstMisPred;
@@ -900,7 +807,7 @@ Decode::decodeInsts(ThreadID tid)
             inst->setPredTaken(true);
             inst->setPredTarg(*target);
             // must squash after setting inst real target because it cannot be computed from static inst
-            squash(inst, inst->threadNumber);
+            selfSquash(inst, inst->threadNumber);
             break;
         }
         if (inst->isNonSpeculative() && inst->readPredTaken()) {
@@ -911,9 +818,16 @@ Decode::decodeInsts(ThreadID tid)
             inst->setPredTarg(*npc);
         }
     }
-
     for (auto &fused_inst : fusionInst) {
         toRename->insts[toRename->size++] = fused_inst;
+    }
+
+    if (insts_available) {
+        // current cycle insts was not all processed, need to block fetch in next cycle
+        stallSig->blockFetch[tid] = true;
+        if (breakDecode == StallReason::NoStall) {
+            breakDecode = StallReason::OtherFragStall;
+        }
     }
 
     // this stage is totally stalled, set all decode stalls
@@ -928,7 +842,6 @@ Decode::decodeInsts(ThreadID tid)
     // and put all those instructions into the skid buffer.
     if (!insts_to_decode.empty()) {
         blockReason = breakDecode;
-        block(tid);
     }
 
     // Record that decode has written to the time buffer for activity
@@ -1012,7 +925,6 @@ Decode::checkAndFuseInsts(std::vector<DynInstPtr> &vec, DynInstPtr& cur)
     instruction->setVersion(inst_pair[1]->getVersion());
     instruction->setTid(inst_pair[1]->threadNumber);
     instruction->thread = inst_pair[1]->thread;
-    instruction->setFsqId(inst_pair[1]->fsqId);
     instruction->setFtqId(inst_pair[1]->ftqId);
 
     instruction->instListIt = cpu->instList.insert(inst_pair[0]->instListIt, instruction);

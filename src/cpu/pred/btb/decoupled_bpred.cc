@@ -1,16 +1,18 @@
 #include "cpu/pred/btb/decoupled_bpred.hh"
 
+#include <algorithm>
 #include <array>
 
+#include "arch/riscv/regs/misc.hh"
 #include "base/debug_helper.hh"
 #include "base/output.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/pred/btb/folded_hist.hh"
+#include "cpu/thread_context.hh"
 #include "debug/BTB.hh"
 #include "debug/DecoupleBPHist.hh"
 #include "debug/DecoupleBPVerbose.hh"
-#include "debug/JumpAheadPredictor.hh"
 #include "debug/Override.hh"
 #include "debug/Profiling.hh"
 #include "sim/core.hh"
@@ -22,13 +24,29 @@ namespace branch_prediction
 namespace btb_pred
 {
 
+uint8_t
+DecoupledBPUWithBTB::getThreadAsidHash(ThreadID tid) const
+{
+    if (!cpu) {
+        return 0;
+    }
+
+    const RegVal satp =
+        cpu->readMiscRegNoEffect(RiscvISA::MiscRegIndex::MISCREG_SATP, tid);
+    const uint16_t asid = (satp >> 44) & mask(16);
+    return foldAsidHash16To4(asid);
+}
+
+void
+DecoupledBPUWithBTB::consumeFetchTarget(unsigned fetched_inst_num, ThreadID tid)
+{
+    ftq.fetching(tid).fetchInstNum = fetched_inst_num;
+    ftq.finishTarget(tid);
+}
+
 DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     : BPredUnit(p),
-      enableLoopBuffer(p.enableLoopBuffer),
-      enableLoopPredictor(p.enableLoopPredictor),
-      enableJumpAheadPredictor(p.enableJumpAheadPredictor),
-      fetchTargetQueue(p.ftq_size),
-      fetchStreamQueueSize(p.fsq_size),
+
       predictWidth(p.predictWidth),
       maxInstsNum(p.predictWidth / 2),
       historyBits(p.maxHistLen),
@@ -43,10 +61,20 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
       // uras(p.uras),
       bpDBSwitches(p.bpDBSwitches),
       numStages(p.numStages),
-      historyManager(16), // TODO: fix this
+      ftqEntries(p.ftq_size),
+      ftqMode(p.smtFTQMode),
+      ftqPolicy(p.smtFTQPolicy),
+      smtFTQThreshold(p.smtFTQThreshold),
+      ftq(p.numThreads, p.ftq_size),
       resolveBlockThreshold(p.resolveBlockThreshold),
       dbpBtbStats(this, p.numStages, p.fsq_size, maxInstsNum)
 {
+    panic_if(ftqMode == SMTFTQMode::Shared &&
+             ftqPolicy == SMTFTQPolicy::Threshold &&
+             smtFTQThreshold > ftqEntries,
+             "SMT FTQ threshold (%u) exceeds total FTQ entries (%u)",
+             smtFTQThreshold, ftqEntries);
+
     if (bpDBSwitches.size() > 0) {
         initDB();
     }
@@ -83,36 +111,31 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
         printf("\n");
     }
 
-    predsOfEachStage.resize(numStages);
-    for (unsigned i = 0; i < numStages; i++) {
-        predsOfEachStage[i].predSource = i;
-        clearPreds();
+    historyManagers.reserve(numThreads);
+    resolveDequeueFailCounters.assign(numThreads, 0);
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        historyManagers.emplace_back(16);
     }
 
-    s0PC = 0x80000000;
+    for (int tid=0;tid<numThreads; tid++) {
+        auto& thread = threads[tid];
 
-    s0History.resize(historyBits, 0);
-    s0PHistory.resize(historyBits, 0);
-    s0BwHistory.resize(historyBits, 0);
-    s0IHistory.resize(historyBits, 0);
-    s0LHistory.resize(mgsc->getNumEntriesFirstLocalHistories());
-    for (unsigned int i = 0; i < mgsc->getNumEntriesFirstLocalHistories(); ++i) {
-        s0LHistory[i].resize(historyBits, 0);
+        thread.s0PC = 0x80000000;
+        thread.predsOfEachStage.resize(numStages);
+        for (unsigned i = 0; i < numStages; i++) {
+            thread.predsOfEachStage[i].predSource = i;
+        }
+        thread.s0History.resize(historyBits, 0);
+        thread.s0PHistory.resize(historyBits, 0);
+        thread.s0BwHistory.resize(historyBits, 0);
+        thread.s0LHistory.resize(mgsc->getNumEntriesFirstLocalHistories());
+        for (unsigned int i = 0; i < mgsc->getNumEntriesFirstLocalHistories(); ++i) {
+            thread.s0LHistory[i].resize(historyBits, 0);
+        }
+        thread.commitHistory.resize(historyBits, 0);
+        thread.squashing = true;
     }
-    fetchTargetQueue.setName(name());
 
-    commitHistory.resize(historyBits, 0);
-    squashing = true;
-    bpuState = BpuState::IDLE;
-
-    lp = LoopPredictor(16, 4, enableLoopDB);
-    lb.setLp(&lp);
-
-    jap = JumpAheadPredictor(16, 4);
-
-    if (!enableLoopPredictor && enableLoopBuffer) {
-        fatal("loop buffer cannot be enabled without loop predictor\n");
-    }
     commitFsqEntryHasInstsVector.resize(maxInstsNum+1, 0);
     lastPhaseFsqEntryNumCommittedInstDist.resize(maxInstsNum+1, 0);
     commitFsqEntryFetchedInstsVector.resize(maxInstsNum+1, 0);
@@ -123,75 +146,160 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     });
 }
 
+bool
+DecoupledBPUWithBTB::sharedFTQMode() const
+{
+    return ftqMode == SMTFTQMode::Shared;
+}
+
+unsigned
+DecoupledBPUWithBTB::activeFTQThreads() const
+{
+    if (!sharedFTQMode()) {
+        return 1;
+    }
+
+    if (!cpu) {
+        return std::max(1u, numThreads);
+    }
+
+    return std::max(1, cpu->numActiveThreads());
+}
+
+unsigned
+DecoupledBPUWithBTB::totalFTQEntries() const
+{
+    unsigned total = 0;
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        total += ftq.size(tid);
+    }
+    return total;
+}
+
+unsigned
+DecoupledBPUWithBTB::sharedFTQAllocation(unsigned entries) const
+{
+    const unsigned active_threads = activeFTQThreads();
+
+    switch (ftqPolicy) {
+      case SMTFTQPolicy::Dynamic:
+        return entries;
+      case SMTFTQPolicy::Partitioned:
+        return entries / active_threads;
+      case SMTFTQPolicy::Threshold:
+        return active_threads == 1 ? entries : std::min(entries, smtFTQThreshold);
+      default:
+        panic("Invalid SMT FTQ sharing policy");
+    }
+}
+
+unsigned
+DecoupledBPUWithBTB::logicalMaxFTQEntries(ThreadID tid) const
+{
+    if (!sharedFTQMode()) {
+        return ftqEntries;
+    }
+
+    return sharedFTQAllocation(ftqEntries);
+}
+
+unsigned
+DecoupledBPUWithBTB::logicalFreeFTQEntries(ThreadID tid) const
+{
+    const unsigned local_max = logicalMaxFTQEntries(tid);
+    const unsigned local_used = ftq.size(tid);
+    const unsigned local_free = local_used >= local_max ? 0 : local_max - local_used;
+
+    if (!sharedFTQMode()) {
+        return local_free;
+    }
+
+    const unsigned total_used = totalFTQEntries();
+    const unsigned shared_free = total_used >= ftqEntries ? 0 : ftqEntries - total_used;
+    return std::min(local_free, shared_free);
+}
+
+bool
+DecoupledBPUWithBTB::ftqFull(ThreadID tid) const
+{
+    return logicalFreeFTQEntries(tid) == 0;
+}
+
+ThreadID
+DecoupledBPUWithBTB::scheduleThread()
+{
+    for (ThreadID offset = 0; offset < numThreads; ++offset) {
+        const ThreadID tid = (nextPredictTid + offset) % numThreads;
+
+        if (cpu) {
+            auto *tc = cpu->getContext(tid);
+            if (!tc || tc->status() != gem5::ThreadContext::Active) {
+                continue;
+            }
+        }
+
+        nextPredictTid = (tid + 1) % numThreads;
+        return tid;
+    }
+
+    return InvalidThreadID;
+}
+
 
 void
 DecoupledBPUWithBTB::tick()
 {
     DPRINTF(Override, "DecoupledBPUWithBTB::tick()\n");
 
+    ThreadID curTid = scheduleThread();
+    if (curTid == InvalidThreadID) {
+        return;
+    }
+
     // On squash, reset state if there was a valid prediction.
-    if (squashing) {
-        bpuState = BpuState::IDLE;
-        numOverrideBubbles = 0;
-        tage->dryRunCycle(s0PC);
-        DPRINTF(Override, "Squashing, BPU state updated.\n");
-        squashing = false;
+    bool squashOccurred = false;
+    for (int tid = 0; tid < numThreads; tid++) {
+        if (threads[tid].squashing) {
+            if (tid == curTid) {
+                squashOccurred = true;
+            }
+            threads[tid].validprediction = false;
+            threads[tid].numOverrideBubbles = 0;
+            tage->dryRunCycle(threads[tid].s0PC);
+            DPRINTF(Override, "Squashing, BPU state updated.\n");
+            threads[tid].squashing = false;
+        }
+    }
+
+    if (squashOccurred) {
+        DPRINTF(Override, "Squash occurred for current thread, skip predict.\n");
         return;
     }
 
     // 1. Request new prediction if FSQ not full and we are idle
-    if (bpuState == BpuState::IDLE && !streamQueueFull()) {
-        if (blockPredictionPending) {
+    if (!threads[curTid].validprediction && !ftqFull(curTid)) {
+        if (threads[curTid].blockPredictionPending) {
             DPRINTF(Override, "Prediction blocked to prioritize resolve update\n");
             dbpBtbStats.predictionBlockedForUpdate++;
-            blockPredictionPending = false;
+            threads[curTid].blockPredictionPending = false;
         } else {
-            requestNewPrediction();
-            bpuState = BpuState::PREDICTOR_DONE;
+            requestNewPrediction(curTid);
         }
     }
 
-    // 2. Handle pending prediction if available
-    if (bpuState == BpuState::PREDICTOR_DONE) {
-        DPRINTF(Override, "Generating final prediction for PC %#lx\n", s0PC);
-        numOverrideBubbles = generateFinalPredAndCreateBubbles();
-        bpuState = BpuState::PREDICTION_OUTSTANDING;
+    for (int tid = 0; tid < numThreads; tid++) {
+        processNewPrediction(tid);
 
-        // Clear each predictor's output
-        for (int i = 0; i < numStages; i++) {
-            predsOfEachStage[i].btbEntries.clear();
+        // Decrement override bubbles counter
+        auto& numOverrideBubbles = threads[tid].numOverrideBubbles;
+        if (numOverrideBubbles > 0) {
+            numOverrideBubbles--;
+            dbpBtbStats.overrideBubbleNum++;
+            DPRINTF(Override, "Consuming override bubble, %d remaining\n", numOverrideBubbles);
         }
-    }
-
-    if (bpuState == BpuState::PREDICTION_OUTSTANDING && numOverrideBubbles > 0) {
-        tage->dryRunCycle(s0PC);
-    }
-
-    // 3. Process enqueue operations and bubble counter
-    tryEnqFetchTarget();
-
-    // check if:
-    // 1. FSQ has space
-    // 2. there's no bubble
-    // 3. PREDICTION_OUTSTANDING
-    if (validateFSQEnqueue()) {
-        // Create new FSQ entry with the current prediction
-        processNewPrediction(true);
-
-        DPRINTF(Override, "FSQ entry enqueued, prediction state reset\n");
-        bpuState = BpuState::IDLE;
-    }
-
-
-    // Decrement override bubbles counter
-    if (numOverrideBubbles > 0) {
-        numOverrideBubbles--;
-        dbpBtbStats.overrideBubbleNum++;
-        DPRINTF(Override, "Consuming override bubble, %d remaining\n", numOverrideBubbles);
     }
 
     DPRINTF(Override, "Prediction cycle complete\n");
-
 }
 
 /**
@@ -201,29 +309,44 @@ DecoupledBPUWithBTB::tick()
  * from each predictor component by sending the current PC and history
  */
 void
-DecoupledBPUWithBTB::requestNewPrediction()
+DecoupledBPUWithBTB::requestNewPrediction(ThreadID tid)
 {
+    auto& thread = threads[tid];
+    auto& predsOfEachStage = threads[tid].predsOfEachStage;
+    const uint8_t asid_hash = getThreadAsidHash(tid);
 
-        DPRINTF(Override, "Requesting new prediction for PC %#lx\n", s0PC);
+    DPRINTF(Override, "Requesting new prediction for PC %#lx\n", thread.s0PC);
 
-        // Initialize prediction state for each stage
-        for (int i = 0; i < numStages; i++) {
-            predsOfEachStage[i].bbStart = s0PC;
-        }
+    // Reset all stage-local prediction fields before components fill them.
+    clearPreds(tid);
+    for (int i = 0; i < numStages; i++) {
+        predsOfEachStage[i].tid = tid;
+        predsOfEachStage[i].asidHash = asid_hash;
+        predsOfEachStage[i].bbStart = thread.s0PC;
+        predsOfEachStage[i].predSource = i;
+    }
 
-        // Query each predictor component with current PC and history
-        for (int i = 0; i < numComponents; i++) {
-            components[i]->putPCHistory(s0PC, s0History, predsOfEachStage);  //s0History not used
-        }
+    // Query each predictor component with current PC and history
+    for (int i = 0; i < numComponents; i++) {
+        components[i]->putPCHistory(thread.s0PC, thread.s0History, predsOfEachStage);  //s0History not used
+    }
 
+    generateFinalPredAndCreateBubbles(tid);
+
+    DPRINTF(Override, "Generating final prediction for PC %#lx\n", thread.s0PC);
+
+    threads[tid].validprediction = true;
 }
 
 // this function collects predictions from all stages and generate bubbles
-// when loop buffer is active, predictions are from saved stream
-unsigned
-DecoupledBPUWithBTB::generateFinalPredAndCreateBubbles()
+// when loop buffer is active, predictions are from saved target
+void
+DecoupledBPUWithBTB::generateFinalPredAndCreateBubbles(ThreadID tid)
 {
     DPRINTF(Override, "In generateFinalPredAndCreateBubbles().\n");
+
+    auto& predsOfEachStage = threads[tid].predsOfEachStage;
+    auto& finalPred = threads[tid].finalPred;
 
     // 1. Debug output: dump predictions from all stages
     for (int i = 0; i < numStages; i++) {
@@ -246,6 +369,53 @@ DecoupledBPUWithBTB::generateFinalPredAndCreateBubbles()
     // Store the chosen prediction as our final prediction
     finalPred = *chosenPrediction;
 
+    finalPred.s1Source = -1;//meaning fallthrough
+    finalPred.s3Source = -1;
+
+    if (predsOfEachStage[0].btbEntries.size() != 0) {
+        for (auto entry : predsOfEachStage[0].btbEntries){
+            if (entry.isIndirect || entry.isDirect || entry.ctr >= 0 ||entry.alwaysTaken){
+                finalPred.s1Source = entry.source;
+                break;
+            }
+        }
+    }
+
+    bool found_s3_taken = false;
+    bool na_s3_taken_but_have_cond = false;
+
+    for (BTBEntry entry : predsOfEachStage[2].btbEntries) {
+        if (entry.isDirect || entry.isIndirect || entry.ctr >= 0 || entry.alwaysTaken) {
+            found_s3_taken = true;
+        }else if (entry.isCond){
+            //only use when there's no taken prediction in s3
+            na_s3_taken_but_have_cond = true;
+        }
+    }
+
+    if (found_s3_taken) {
+        auto pred_taken_entry = finalPred.getTakenEntry();
+        if (pred_taken_entry.valid) {
+            if (pred_taken_entry.isReturn) {
+                finalPred.s3Source = ras->getComponentIdx();
+            } else if (pred_taken_entry.isIndirect && ittage->tageHit()) {
+                finalPred.s3Source = ittage->getComponentIdx();
+            }else if (pred_taken_entry.isCond) {
+                finalPred.s3Source = tage->getComponentIdx();
+            } else {
+                finalPred.s3Source = mbtb->getComponentIdx();
+            }
+        }else {
+            if (na_s3_taken_but_have_cond) {
+                finalPred.s3Source = tage->getComponentIdx();
+            }else {
+                finalPred.s3Source = -1;
+            }
+        }
+    }
+
+
+
     // 3. Calculate override bubbles needed for pipeline consistency
     // Override bubbles are needed when earlier stages predict differently from later stages
     unsigned first_hit_stage = 0;
@@ -266,9 +436,8 @@ DecoupledBPUWithBTB::generateFinalPredAndCreateBubbles()
         if (ubtb->isEnabled()) {
             ubtb->updateUsingS3Pred(predsOfEachStage[numStages - 1]);
         }
-        auto it = fetchStreamQueue.find(fsqId - 1);
-        if (it != fetchStreamQueue.end() && abtb->isEnabled()) {
-            auto previous_block_startpc = it->second.startPC;
+        if (abtb->isEnabled() && !ftq.empty(tid)) {
+            auto previous_block_startpc = ftq.back(tid).startPC;
             abtb->updateUsingS3Pred(predsOfEachStage[numStages - 1], previous_block_startpc);
         } else if (abtb->isEnabled()) {
             abtb->updateUsingS3Pred(predsOfEachStage[numStages - 1], 0);
@@ -289,144 +458,76 @@ DecoupledBPUWithBTB::generateFinalPredAndCreateBubbles()
     dbpBtbStats.predsOfEachStage[first_hit_stage]++;
 
     // Clear stage predictions for next cycle
-    clearPreds();
+    clearPreds(tid);
 
     DPRINTF(Override, "Prediction complete: override bubbles=%d\n", first_hit_stage);
-    return first_hit_stage;
+    threads[tid].numOverrideBubbles = first_hit_stage;
 }
 
-bool
-DecoupledBPUWithBTB::trySupplyFetchWithTarget(Addr fetch_demand_pc, bool &fetch_target_in_loop)
-{
-    return fetchTargetQueue.trySupplyFetchWithTarget(fetch_demand_pc, fetch_target_in_loop);
-}
-
-/**
- * @brief Interface between fetch stage and branch predictor for instruction prediction
- *
- * This function is called by the fetch stage to get branch prediction information
- * for the current fetch address. It checks the Fetch Target Queue (FTQ) for available
- * prediction entries and returns the prediction result for the current PC.
- *
- * Key operations:
- * 1. Check if a prediction is available in the FTQ
- * 2. Compare current PC against the prediction entry's PC range
- * 3. Determine if current instruction is a predicted branch
- * 4. Update PC for taken branches or advance to next instruction for not-taken
- * 5. Handle entry dequeuing when prediction stream is exhausted
- *
- * @param inst The static instruction being fetched
- * @param seqNum The sequence number of the instruction
- * @param pc Current program counter (updated with prediction target if taken)
- * @param tid Thread ID
- * @param currentLoopIter Reference to current loop iteration counter
- *
- * @return A pair containing:
- *   - First value: Whether the branch is predicted taken
- *   - Second value: Whether we've exhausted the current FTQ entry
- */
-std::pair<bool, bool>
-DecoupledBPUWithBTB::decoupledPredict(const StaticInstPtr &inst,
-                               const InstSeqNum &seqNum, PCStateBase &pc,
-                               ThreadID tid, unsigned &currentLoopIter)
-{
-    DPRINTF(DecoupleBP, "looking up pc %#lx, Supplying target ID %lu\n",
-        pc.instAddr(), fetchTargetQueue.getSupplyingTargetId());
-
-    // Check if fetch target queue has prediction available
-    auto target_avail = fetchTargetQueue.fetchTargetAvailable();
-    if (!target_avail) {
-        dbpBtbStats.ftqNotValid++;
-        DPRINTF(DecoupleBP,
-                "No ftq entry to fetch, return dummy prediction\n");
-        // Return (not taken, exhausted entry) to indicate no valid prediction
-        return std::make_pair(false, true);
-    }
-
-    // Get current prediction entry from FTQ
-    const auto &target_to_fetch = fetchTargetQueue.getTarget();
-    DPRINTF(DecoupleBP, "Responsing fetch with");
-    printFetchTarget(target_to_fetch, "");
-    // Extract prediction entry information
-    auto start = target_to_fetch.startPC;    // Start of basic block
-    auto end = target_to_fetch.endPC;        // End of basic block
-    auto taken_pc = target_to_fetch.takenPC; // Branch instruction address if taken
-    // Verify current PC is within the predicted entry range
-    assert(start <= pc.instAddr() && pc.instAddr() < end);
-
-    // Check if current PC matches predicted branch address and is taken
-    bool taken = pc.instAddr() == taken_pc && target_to_fetch.taken;
-    bool run_out_of_this_entry = false;
-    // Clone PC for potential updates
-    std::unique_ptr<PCStateBase> target(pc.clone());
-
-    // Handle taken prediction by updating PC to target address
-    if (taken) {
-        auto &rtarget = target->as<GenericISA::PCStateWithNext>();
-        rtarget.pc(target_to_fetch.target);   // Set new PC to predicted target
-
-        // Set next PC (NPC) for pipeline logic
-        rtarget.npc(target_to_fetch.target + 4);
-        rtarget.uReset();
-
-        DPRINTF(DecoupleBP,
-                "Predicted pc: %#lx, upc: %u, npc(meaningless): %#lx, instSeqNum: %lu\n",
-                target->instAddr(), rtarget.upc(), rtarget.npc(), seqNum);
-
-        // Update passed-in PC reference with prediction
-        set(pc, *target);
-
-        run_out_of_this_entry = true;
-    } else {
-        // For not-taken branches or non-branches, advance to next instruction
-        inst->advancePC(*target);
-
-        // Check if we've reached the end of the current basic block
-        if (target->instAddr() >= end) {
-            run_out_of_this_entry = true;
-        }
-    }
-
-    // Increment instruction counter for current FTQ entry
-    currentFtqEntryInstNum++;
-    if (run_out_of_this_entry) {
-        processFetchTargetCompletion(target_to_fetch);
-    }
-
-    DPRINTF(DecoupleBP, "Predict it %staken to %#lx\n", taken ? "" : "not ",
-            target->instAddr());
-
-    return std::make_pair(taken, run_out_of_this_entry);
-}
-
-/**
- * @brief Process the completion of a fetch target queue entry
- *
- * This function handles the logic when a fetch target queue entry is exhausted:
- * - Dequeues the entry from FTQ
- * - Updates instruction count statistics in the corresponding FSQ entry
- * - Resets instruction counter for the next FTQ entry
- *
- * @param target_to_fetch The FTQ entry being completed
- */
+// this function enqueues fsq and update s0PC and s0History
 void
-DecoupledBPUWithBTB::processFetchTargetCompletion(const FtqEntry &target_to_fetch)
+DecoupledBPUWithBTB::processNewPrediction(ThreadID tid)
 {
-    DPRINTF(DecoupleBP, "running out of ftq entry %lu with %d insts\n",
-            fetchTargetQueue.getSupplyingTargetId(), currentFtqEntryInstNum);
 
-    // Get stream ID for the current fetch target before removing from FTQ
-    const auto fsqId = target_to_fetch.fsqID;
+    // Check if a prediction is available to enqueue
+    if (!threads[tid].validprediction) {
+        DPRINTF(Override, "No prediction available to enqueue into FSQ\n");
+        return;
+    }
 
-    // Remove the current entry from FTQ
-    fetchTargetQueue.finishCurrentFetchTarget();
-    // Update instruction count in the fetch stream entry
-    auto it = fetchStreamQueue.find(fsqId);
-    assert(it != fetchStreamQueue.end());
-    it->second.fetchInstNum = currentFtqEntryInstNum;
+    // Check for override bubbles
+    // When higher stages override lower stages, bubbles are needed for pipeline consistency
+    if (threads[tid].numOverrideBubbles > 0) {
+        DPRINTF(Override, "Waiting for %u override bubbles before enqueuing\n", threads[tid].numOverrideBubbles);
+        return;
+    }
 
-    // Reset instruction counter for next FTQ entry
-    currentFtqEntryInstNum = 0;
+    // Monitor FSQ size for statistics
+    dbpBtbStats.fsqEntryDist.sample(ftq.size(tid), 1);
+    if (ftqFull(tid)) {
+        dbpBtbStats.fsqFullCannotEnq++;
+        DPRINTF(Override, "FSQ is full (%lu entries)\n", ftq.size(tid));
+        return;
+    }
+
+    auto& s0PC = threads[tid].s0PC;
+
+    // Validate PC value
+    if (s0PC == MaxAddr) {
+        DPRINTF(DecoupleBP, "Invalid PC value %#lx, cannot make prediction\n", s0PC);
+        return;
+    }
+
+    DPRINTF(DecoupleBP, "Creating new prediction for PC %#lx\n", s0PC);
+
+    // 1. Create a new fetch target entry with prediction information
+    FetchTarget entry = createFetchTargetEntry(tid);
+
+    // 2. Update global PC state to target or fall-through
+    s0PC = threads[tid].finalPred.getTarget(predictWidth);;
+
+    // 3. Update history information
+    updateHistoryForPrediction(entry);
+
+    // 4. Fill ahead pipeline
+    fillAheadPipeline(entry);
+
+    if (enablePredFSQTrace) {
+        predTraceManager->write_record(PredictionTrace(ftq.backId(tid), entry));
+    }
+
+    // 5. Add entry to fetch target queue
+    ftq.insert(entry);
+    threads[tid].validprediction = false;
+
+    // 6. Debug output and update statistics
+    dumpFsq("after insert new target");
+    DPRINTF(DecoupleBP, "Inserted fetch target %lu starting at PC %#lx\n",
+            ftq.backId(tid), entry.startPC);
+
+    // 7. Increment statistics
+    printTarget(entry);
+    dbpBtbStats.fsqEntryEnqueued++;
 }
 
 /**
@@ -434,13 +535,12 @@ DecoupledBPUWithBTB::processFetchTargetCompletion(const FtqEntry &target_to_fetc
  *
  * This function encapsulates the shared logic between different types of squashes:
  * - Setting squashing state
- * - Finding and updating the stream
+ * - Finding and updating the target
  * - Recovering history information
  * - Clearing predictions
  * - Updating FTQ and FSQ state
  *
  * @param target_id ID of the target being squashed
- * @param stream_id ID of the stream being squashed
  * @param squash_type Type of squash (CTRL/OTHER/TRAP)
  * @param squash_pc PC where the squash occurred
  * @param redirect_pc PC to redirect to after squash
@@ -450,8 +550,7 @@ DecoupledBPUWithBTB::processFetchTargetCompletion(const FtqEntry &target_to_fetc
  * @param control_inst_size Size of the control instruction (for control squash)
  */
 void
-DecoupledBPUWithBTB::handleSquash(unsigned target_id,
-                                 unsigned stream_id,
+DecoupledBPUWithBTB::handleSquash(ThreadID tid, unsigned target_id,
                                  SquashType squash_type,
                                  const PCStateBase &squash_pc,
                                  Addr redirect_pc,
@@ -461,62 +560,56 @@ DecoupledBPUWithBTB::handleSquash(unsigned target_id,
                                  unsigned control_inst_size)
 {
     // Set squashing state
-    squashing = true;
+    threads[tid].squashing = true;
 
-    // Find the stream being squashed
-    auto stream_it = fetchStreamQueue.find(stream_id);
-    if (stream_it == fetchStreamQueue.end()) {
-        assert(!fetchStreamQueue.empty());
-        DPRINTF(DecoupleBP, "The squashing stream is insane, ignore squash on it");
+    // Find the target being squashed
+    if (!ftq.hasTarget(target_id, tid)) {
+        DPRINTF(DecoupleBP,
+                "Ignore squash for tid %u on missing FTQ target %u; "
+                "recovering predictor state from redirect PC %#lx\n",
+                tid, target_id, redirect_pc);
+        ftq.clear(tid);
+        clearPreds(tid);
+        threads[tid].validprediction = false;
+        threads[tid].s0PC = redirect_pc;
         return;
     }
 
-    // Get reference to the stream
-    auto &stream = stream_it->second;
+    // Get reference to the target
+    auto &target = ftq.get(target_id, tid);
 
-    // Update stream state
-    stream.resolved = true;
-    stream.exeTaken = actually_taken;
-    stream.squashPC = squash_pc.instAddr();
-    stream.squashType = squash_type;
+    // Update target state
+    target.resolved = true;
+    target.exeTaken = actually_taken;
+    target.squashPC = squash_pc.instAddr();
+    target.squashType = squash_type;
 
     // Special handling for control squash - create branch info
     if (squash_type == SQUASH_CTRL && static_inst) {
         // Use full branch info with static_inst if available
-        stream.exeBranchInfo = BranchInfo(squash_pc.instAddr(), redirect_pc, static_inst, control_inst_size);
+        target.exeBranchInfo = BranchInfo(squash_pc.instAddr(), redirect_pc, static_inst, control_inst_size);
         dumpFsq("Before control squash");
     }
 
-    // Remove streams after the squashed one
-    squashStreamAfter(stream_id);
+    // Remove targets after the squashed one
+    ftq.squashAfter(target_id, tid);
 
     // Recover history using the extracted function
-    recoverHistoryForSquash(stream, stream_id, squash_pc, is_conditional, actually_taken, squash_type, redirect_pc);
+    recoverHistoryForSquash(target, target_id, squash_pc, is_conditional, actually_taken, squash_type, redirect_pc);
 
     // Clear predictions for next cycle
-    clearPreds();
+    clearPreds(tid);
 
-    // Update PC and stream ID
-    s0PC = redirect_pc;
-    fsqId = stream_id + 1;
-
-    // Squash fetch target queue and redirect to new PC
-    fetchTargetQueue.squash(target_id + 1, fsqId, redirect_pc);
-
-    // Additional debugging for control squash
-    if (squash_type == SQUASH_CTRL) {
-        fetchTargetQueue.dump("After control squash");
-    }
+    // Update PC and target ID
+    threads[tid].s0PC = redirect_pc;
 
     DPRINTF(DecoupleBP,
-            "After squash, FSQ head Id=%lu, s0pc=%#lx, demand stream Id=%lu, "
-            "Fetch demanded target Id=%lu\n",
-            fsqId, s0PC, fetchTargetQueue.getEnqState().streamId,
-            fetchTargetQueue.getSupplyingTargetId());
+            "After squash, fsqId(next alloc)=%lu, fetchHeadFsqId=%lu, s0pc=%#lx\n",
+            ftq.backId(tid) + 1, ftq.frontId(tid), redirect_pc);
 }
 
 void
-DecoupledBPUWithBTB::controlSquash(unsigned target_id, unsigned stream_id,
+DecoupledBPUWithBTB::controlSquash(unsigned target_id,
                             const PCStateBase &control_pc,
                             const PCStateBase &corr_target,
                             const StaticInstPtr &static_inst,
@@ -536,122 +629,118 @@ DecoupledBPUWithBTB::controlSquash(unsigned target_id, unsigned stream_id,
     bool is_conditional = static_inst->isCondCtrl();
     bool is_indirect = static_inst->isIndirectCtrl();
 
-    auto stream_it = fetchStreamQueue.find(stream_id);
-    if (stream_it == fetchStreamQueue.end()) {
-        DPRINTF(DecoupleBP, "The squashing stream is insane, ignore squash on it");
+    if (!ftq.hasTarget(target_id, tid)) {
+        DPRINTF(DecoupleBP, "The squashing target is insane, ignore squash on it");
         return;
     }
-    auto &stream = stream_it->second;
+    auto &target = ftq.get(target_id, tid);
     // Get target address
     Addr real_target = corr_target.instAddr();
     if (!fromCommit && static_inst->isReturn() && !static_inst->isNonSpeculative()) {
         // get ret addr from ras meta
-        real_target = ras->getTopAddrFromMetas(stream);
+        real_target = ras->getTopAddrFromMetas(target);
         // TODO: set real target to dynamic inst
     }
 
     // Detailed debugging for control squash
     DPRINTF(DecoupleBP,
-            "Control squash: ftq_id=%d, fsq_id=%d,"
+            "Control squash: ftq_id=%d,"
             " control_pc=%#lx, real_target=%#lx, is_conditional=%u, "
             "is_indirect=%u, actually_taken=%u, branch seq: %lu\n",
-            target_id, stream_id, control_pc.instAddr(),
+            target_id, control_pc.instAddr(),
             real_target, is_conditional, is_indirect,
             actually_taken, seq);
 
     // Call shared squash handling logic
-    handleSquash(target_id, stream_id, SQUASH_CTRL, control_pc,
+    handleSquash(tid, target_id, SQUASH_CTRL, control_pc,
                 real_target, is_conditional, actually_taken, static_inst, control_inst_size);
 }
 
 void
-DecoupledBPUWithBTB::nonControlSquash(unsigned target_id, unsigned stream_id,
+DecoupledBPUWithBTB::nonControlSquash(unsigned target_id,
                                const PCStateBase &inst_pc,
                                const InstSeqNum seq, ThreadID tid, const unsigned &currentLoopIter)
 {
     dbpBtbStats.nonControlSquash++;
     DPRINTF(DecoupleBP,
-            "non control squash: target id: %d, stream id: %d, inst_pc: %#lx, "
+            "non control squash: target id: %d, inst_pc: %#lx, "
             "seq: %lu\n",
-            target_id, stream_id, inst_pc.instAddr(), seq);
+            target_id, inst_pc.instAddr(), seq);
 
     // Call shared squash handling logic
-    handleSquash(target_id, stream_id, SQUASH_OTHER, inst_pc, inst_pc.instAddr());
+    handleSquash(tid, target_id, SQUASH_OTHER, inst_pc, inst_pc.instAddr());
 }
 
 void
-DecoupledBPUWithBTB::trapSquash(unsigned target_id, unsigned stream_id,
+DecoupledBPUWithBTB::trapSquash(unsigned target_id,
                          Addr last_committed_pc, const PCStateBase &inst_pc,
                          ThreadID tid, const unsigned &currentLoopIter)
 {
     dbpBtbStats.trapSquash++;
     DPRINTF(DecoupleBP,
-            "Trap squash: target id: %d, stream id: %d, inst_pc: %#lx\n",
-            target_id, stream_id, inst_pc.instAddr());
+            "Trap squash: target id: %d, inst_pc: %#lx\n",
+            target_id, inst_pc.instAddr());
 
     // Call shared squash handling logic
-    handleSquash(target_id, stream_id, SQUASH_TRAP, inst_pc, inst_pc.instAddr());
+    handleSquash(tid, target_id, SQUASH_TRAP, inst_pc, inst_pc.instAddr());
 }
 
 void
-DecoupledBPUWithBTB::update(unsigned stream_id, ThreadID tid)
+DecoupledBPUWithBTB::commit(unsigned target_id, ThreadID tid)
 {
     // No need to dequeue when queue is empty
-    if (fetchStreamQueue.empty())
+    if (ftq.empty(tid)) {
         return;
+    }
 
-    auto it = fetchStreamQueue.begin();
-
-    // Process all streams that have been committed (stream_id >= stream's id)
-    while (it != fetchStreamQueue.end() && stream_id >= it->first) {
-        auto &stream = it->second;
+    // Process all targets that have been committed (target_id >= head target id).
+    while (!ftq.empty(tid) && target_id >= ftq.frontId(tid)) {
+        auto &target = ftq.front(tid);
 
         DPRINTF(DecoupleBP,
-                "Commit stream start %#lx, which is predicted, "
+                "Commit target start %#lx, which is predicted, "
                 "final br addr: %#lx, final target: %#lx, pred br addr: %#lx, "
                 "pred target: %#lx\n",
-                stream.startPC, stream.exeBranchInfo.pc, stream.exeBranchInfo.target, stream.predBranchInfo.pc,
-                stream.predBranchInfo.target);
+                target.startPC, target.exeBranchInfo.pc, target.exeBranchInfo.target, target.predBranchInfo.pc,
+                target.predBranchInfo.target);
 
         // Update statistics
-        updateStatistics(stream);
+        updateStatistics(target);
 
         // Update predictor components
-        updatePredictorComponents(stream);
+        updatePredictorComponents(target);
 
-        it = fetchStreamQueue.erase(it);
+        ftq.commitTarget(tid);
         dbpBtbStats.fsqEntryCommitted++;
     }
 
-    DPRINTF(DecoupleBP, "after commit stream, fetchStreamQueue size: %lu\n", fetchStreamQueue.size());
+    DPRINTF(DecoupleBP, "after commit target, fetchTargetQueue size: %lu\n", ftq.size(tid));
 
-    if (it != fetchStreamQueue.end()) {
-        printStream(it->second);
-    }
+    if (!ftq.empty(tid))
+        printTarget(ftq.front(tid));
 
-    historyManager.commit(stream_id);
+    historyManagers[tid].commit(target_id);
 }
 
 bool
-DecoupledBPUWithBTB::resolveUpdate(unsigned &stream_id)
+DecoupledBPUWithBTB::resolveUpdate(unsigned &target_id, ThreadID tid)
 {
-    auto stream_it = fetchStreamQueue.find(stream_id);
-    if (stream_it == fetchStreamQueue.end()) {
-        DPRINTF(DecoupleBP, "Stream id %u not found in fetchStreamQueue, cannot update predictors\n", stream_id);
+    if (!ftq.hasTarget(target_id, tid)) {
+        DPRINTF(DecoupleBP, "Target id %u not found in fetchTargetQueue, cannot update predictors\n", target_id);
         return true;
     }
 
-    auto &stream = stream_it->second;
+    auto &target = ftq.get(target_id, tid);
 
-    // Update predictor components only if the stream is hit or taken
-    if (!(stream.isHit || stream.exeTaken)) {
+    // Update predictor components only if the target is hit or taken
+    if (!(target.isHit || target.exeTaken)) {
         return true;
     }
 
     // Phase 1: probe all resolved-update components to ensure no blocker
     for (int i = 0; i < numComponents; ++i) {
         if (components[i]->getResolvedUpdate()) {
-            if (!components[i]->canResolveUpdate(stream)) {
+            if (!components[i]->canResolveUpdate(target)) {
                 return false;
             }
         }
@@ -660,7 +749,7 @@ DecoupledBPUWithBTB::resolveUpdate(unsigned &stream_id)
     // Phase 2: all clear, perform updates once
     for (int i = 0; i < numComponents; ++i) {
         if (components[i]->getResolvedUpdate()) {
-            components[i]->doResolveUpdate(stream);
+            components[i]->doResolveUpdate(target);
         }
     }
 
@@ -668,317 +757,89 @@ DecoupledBPUWithBTB::resolveUpdate(unsigned &stream_id)
 }
 
 void
-DecoupledBPUWithBTB::notifyResolveSuccess()
+DecoupledBPUWithBTB::notifyResolveSuccess(ThreadID tid)
 {
-    resolveDequeueFailCounter = 0;
+    resolveDequeueFailCounters[tid] = 0;
 }
 
 void
-DecoupledBPUWithBTB::notifyResolveFailure()
+DecoupledBPUWithBTB::notifyResolveFailure(ThreadID tid)
 {
-    resolveDequeueFailCounter++;
-    if (resolveDequeueFailCounter >= resolveBlockThreshold) {
-        blockPredictionOnce();
-        resolveDequeueFailCounter = 0;
+    auto &failCounter = resolveDequeueFailCounters[tid];
+    failCounter++;
+    if (failCounter >= resolveBlockThreshold) {
+        blockPredictionOnce(tid);
+        failCounter = 0;
     }
 }
 
 void
-DecoupledBPUWithBTB::blockPredictionOnce()
+DecoupledBPUWithBTB::blockPredictionOnce(ThreadID tid)
 {
-    blockPredictionPending = true;
+    threads[tid].blockPredictionPending = true;
 }
 
 void
-DecoupledBPUWithBTB::prepareResolveUpdateEntries(unsigned &stream_id)
+DecoupledBPUWithBTB::prepareResolveUpdateEntries(unsigned &target_id, ThreadID tid)
 {
-    auto stream_it = fetchStreamQueue.find(stream_id);
-    if (stream_it == fetchStreamQueue.end()) {
-        DPRINTF(DecoupleBP, "Stream id %u not found in fetchStreamQueue, cannot update predictors\n", stream_id);
+    if (!ftq.hasTarget(target_id, tid)) {
+        DPRINTF(DecoupleBP, "Target id %u not found in fetchTargetQueue, cannot update predictors\n", target_id);
         return;
     }
-    auto &stream = stream_it->second;
+    auto &target = ftq.get(target_id, tid);
 
-    if (stream.isHit || stream.exeTaken) {
-        // Prepare stream for update
-        stream.setUpdateInstEndPC(predictWidth);
-        stream.setUpdateBTBEntries();
+    if (target.isHit || target.exeTaken) {
+        // Prepare target for update
+        target.setUpdateInstEndPC(predictWidth);
+        target.setUpdateBTBEntries();
 
         // only mbtb can generate new entry
         if (mbtb->isEnabled()) {
-            mbtb->getAndSetNewBTBEntry(stream);
+            mbtb->getAndSetNewBTBEntry(target);
         }
     }
 }
 
 void
-DecoupledBPUWithBTB::markCFIResolved(unsigned &stream_id, uint64_t resolvedInstPC)
+DecoupledBPUWithBTB::markCFIResolved(unsigned &target_id, uint64_t resolvedInstPC, ThreadID tid)
 {
 
-    auto stream_it = fetchStreamQueue.find(stream_id);
-    if (stream_it == fetchStreamQueue.end()) {
-        DPRINTF(DecoupleBP, "Stream id %u not found in fetchStreamQueue, cannot update predictors\n", stream_id);
+    if (!ftq.hasTarget(target_id, tid)) {
+        DPRINTF(DecoupleBP, "Target id %u not found in fetchTargetQueue, cannot update predictors\n", target_id);
         return;
     }
-    auto &stream = stream_it->second;
+    auto &target = ftq.get(target_id, tid);
 
-    if (stream.updateNewBTBEntry.pc == resolvedInstPC) {
-        stream.updateNewBTBEntry.resolved = true;
+    if (target.updateNewBTBEntry.pc == resolvedInstPC) {
+        target.updateNewBTBEntry.resolved = true;
     }
 
-    stream.markBTBEntryResolved(resolvedInstPC);
+    target.markBTBEntryResolved(resolvedInstPC);
 }
 
 void
-DecoupledBPUWithBTB::updatePredictorComponents(FetchStream &stream)
+DecoupledBPUWithBTB::updatePredictorComponents(FetchTarget &target)
 {
-    // Update predictor components only if the stream is hit or taken
-    if (stream.isHit || stream.exeTaken) {
-        // Prepare stream for update
-        stream.setUpdateInstEndPC(predictWidth);
-        stream.setUpdateBTBEntries();
+    // Update predictor components only if the target is hit or taken
+    if (target.isHit || target.exeTaken) {
+        // Prepare target for update
+        target.setUpdateInstEndPC(predictWidth);
+        target.setUpdateBTBEntries();
 
         // only mbtb can generate new entry
         if (mbtb->isEnabled()) {
-            mbtb->getAndSetNewBTBEntry(stream);
+            mbtb->getAndSetNewBTBEntry(target);
         }
 
         // Update predictor components
         for (int i = 0; i < numComponents; ++i) {
             if (!components[i]->getResolvedUpdate()) {
-                components[i]->update(stream);
+                components[i]->update(target);
             }
         }
     }
 }
 
-
-void
-DecoupledBPUWithBTB::squashStreamAfter(unsigned squash_stream_id)
-{
-    // Erase all streams after the squashed one
-    // upper_bound returns the first element greater than squash_stream_id
-    auto erase_it = fetchStreamQueue.upper_bound(squash_stream_id);
-    while (erase_it != fetchStreamQueue.end()) {
-        DPRINTF(DecoupleBP || erase_it->second.startPC == ObservingPC,
-                "Erasing stream %lu when squashing %d\n", erase_it->first,
-                squash_stream_id);
-        printStream(erase_it->second);
-        fetchStreamQueue.erase(erase_it++);
-    }
-}
-
-bool
-DecoupledBPUWithBTB::validateFSQEnqueue()
-{
-    // Monitor FSQ size for statistics
-    dbpBtbStats.fsqEntryDist.sample(fetchStreamQueue.size(), 1);
-    if (streamQueueFull()) {
-        dbpBtbStats.fsqFullCannotEnq++;
-        DPRINTF(Override, "FSQ is full (%lu entries)\n", fetchStreamQueue.size());
-        return false;
-    }
-
-    // 1. Check if a prediction is available to enqueue
-    if (bpuState != BpuState::PREDICTION_OUTSTANDING) {
-        DPRINTF(Override, "No prediction available to enqueue into FSQ\n");
-        return false;
-    }
-
-    // 2. Validate PC value
-    if (s0PC == MaxAddr) {
-        DPRINTF(DecoupleBP, "Invalid PC value %#lx, cannot make prediction\n", s0PC);
-        return false;
-    }
-
-    // 3. Check for override bubbles
-    // When higher stages override lower stages, bubbles are needed for pipeline consistency
-    if (numOverrideBubbles > 0) {
-        DPRINTF(Override, "Waiting for %u override bubbles before enqueuing\n", numOverrideBubbles);
-        return false;
-    }
-
-    // Ensure FSQ has space for the new entry
-    assert(!streamQueueFull());
-    return true;
-}
-
-
-void
-DecoupledBPUWithBTB::setTakenEntryWithStream(FtqEntry &ftq_entry, const FetchStream &stream_entry)
-{
-    ftq_entry.taken = true;
-    ftq_entry.takenPC = stream_entry.getControlPC();
-    ftq_entry.target = stream_entry.getTakenTarget();
-    ftq_entry.endPC = stream_entry.predEndPC;
-}
-
-void
-DecoupledBPUWithBTB::setNTEntryWithStream(FtqEntry &ftq_entry, Addr end_pc)
-{
-    ftq_entry.taken = false;
-    ftq_entry.takenPC = 0;
-    ftq_entry.target = 0;
-    ftq_entry.endPC = end_pc;
-}
-/**
- * @brief Validate FTQ and FSQ state before enqueueing a fetch target
- *
- * This function checks:
- * 1. If FTQ has space for new entries
- * 2. If FSQ has valid entries
- * 3. If the requested stream exists in the FSQ
- *
- * @return true if validation passes, false otherwise
- */
-bool
-DecoupledBPUWithBTB::validateFTQEnqueue()
-{
-    // 1. Check if FTQ can accept new entries
-    if (fetchTargetQueue.full()) {
-        DPRINTF(DecoupleBP, "Cannot enqueue - FTQ is full\n");
-        dbpBtbStats.ftqFullCannotEnq++;
-        return false;
-    }
-
-    // 2. Check if FSQ has valid entries
-    if (fetchStreamQueue.empty()) {
-        dbpBtbStats.fsqEmpty++;
-        DPRINTF(DecoupleBP, "Cannot enqueue - FSQ is empty\n");
-        return false;
-    }
-
-    // 3. Get FTQ enqueue state and find corresponding stream
-    auto &ftq_enq_state = fetchTargetQueue.getEnqState();
-    auto streamIt = fetchStreamQueue.find(ftq_enq_state.streamId);
-
-    if (streamIt == fetchStreamQueue.end()) {
-        dbpBtbStats.fsqNotValid++;
-        DPRINTF(DecoupleBP, "Cannot enqueue - Stream ID %lu not found in FSQ\n",
-                ftq_enq_state.streamId);
-        if (streamQueueFull()) {
-            // fetch hungry, but fsq is full, cannot enqueue to ftq
-            dbpBtbStats.fsqFullFetchHungry++;
-        }
-        return false;
-    }
-
-    // Validation check - reject invalid / empty FTQ ranges early.
-    if (ftq_enq_state.pc >= streamIt->second.predEndPC) {
-        warn("Warning: FTQ enqueue PC %#lx is beyond FSQ end %#lx\n",
-             ftq_enq_state.pc, streamIt->second.predEndPC);
-        recoverFromStaleEnqueue(ftq_enq_state.streamId, ftq_enq_state.pc);
-        return false;
-    }
-
-    return true;
-}
-
-void
-DecoupledBPUWithBTB::recoverFromStaleEnqueue(FetchStreamId stream_id, Addr demand_pc)
-{
-    auto erase_it = fetchStreamQueue.lower_bound(stream_id);
-    while (erase_it != fetchStreamQueue.end()) {
-        DPRINTF(DecoupleBP,
-                "Dropping stale FSQ stream %lu during enqueue resync to %#lx\n",
-                erase_it->first, demand_pc);
-        erase_it = fetchStreamQueue.erase(erase_it);
-    }
-
-    historyManager.discardFrom(stream_id);
-    rebuildGlobalHistoryFromManager();
-    clearPreds();
-    numOverrideBubbles = 0;
-    bpuState = BpuState::IDLE;
-    squashing = true;
-    s0PC = demand_pc;
-    fsqId = stream_id;
-    fetchTargetQueue.discardPending(stream_id, demand_pc);
-}
-
-void
-DecoupledBPUWithBTB::rebuildGlobalHistoryFromManager()
-{
-    s0History.reset();
-    for (const auto &entry : historyManager.getSpeculativeHist()) {
-        if (entry.shamt == 0) {
-            continue;
-        }
-        s0History <<= entry.shamt;
-        s0History[0] = entry.cond_taken;
-    }
-}
-
-/**
- * @brief Creates a FTQ entry from a stream entry at specific PC
- *
- * @param stream The fetch stream to use as source
- * @param ftq_enq_state The fetch target enqueue state to use
- * @return FtqEntry The created fetch target queue entry
- */
-FtqEntry
-DecoupledBPUWithBTB::createFtqEntryFromStream(
-    const FetchStream &stream, const FetchTargetEnqState &ftq_enq_state)
-{
-    FtqEntry ftq_entry;
-    ftq_entry.startPC = ftq_enq_state.pc;
-    ftq_entry.fsqID = ftq_enq_state.streamId;
-
-    // Configure based on taken/not-taken
-    if (stream.getTaken()) {
-        setTakenEntryWithStream(ftq_entry, stream);
-    } else {
-        setNTEntryWithStream(ftq_entry, stream.predEndPC);
-    }
-
-    return ftq_entry;
-}
-
-void
-DecoupledBPUWithBTB::tryEnqFetchTarget()
-{
-    DPRINTF(DecoupleBP, "Attempting to enqueue fetch target into FTQ\n");
-
-    // 1. Validate FTQ and FSQ state before proceeding
-    if (!validateFTQEnqueue()) {
-        return; // Validation failed, cannot proceed
-    }
-
-    // 2. Get FTQ enqueue state and find corresponding stream
-    auto &ftq_enq_state = fetchTargetQueue.getEnqState();
-    auto streamIt = fetchStreamQueue.find(ftq_enq_state.streamId);
-    assert(streamIt != fetchStreamQueue.end()); // This should never fail since we validated
-
-    // 3. Get fetch stream and process it
-    auto &stream_to_enq = streamIt->second;
-
-    DPRINTF(DecoupleBP, "Processing stream %lu (PC: %#lx)\n",
-            streamIt->first, ftq_enq_state.pc);
-    printStream(stream_to_enq);
-
-    // 4. Create FTQ entry from stream
-    FtqEntry ftq_entry = createFtqEntryFromStream(stream_to_enq, ftq_enq_state);
-
-    // 5. Update FTQ enqueue state for next entry
-    ftq_enq_state.pc = ftq_entry.taken ? stream_to_enq.getBranchInfo().target : ftq_entry.endPC;
-    ftq_enq_state.streamId++;
-
-    DPRINTF(DecoupleBP, "Updated FTQ state: PC=%#lx, next stream ID=%lu\n",
-            ftq_enq_state.pc, ftq_enq_state.streamId);
-
-    // 6. Enqueue the entry and verify state
-    fetchTargetQueue.enqueue(ftq_entry);
-    assert(ftq_enq_state.streamId <= fsqId + 1);
-
-    // 7. Trace the entry
-    if (enablePredFTQTrace) {
-        ftqTraceManager->write_record(FtqTrace(ftq_enq_state.nextEnqTargetId-1, ftq_entry.fsqID, ftq_entry));
-    }
-
-    // 8. Debug output
-    printFetchTarget(ftq_entry, "Insert to FTQ");
-    fetchTargetQueue.dump("After insert new entry");
-}
 
 void
 DecoupledBPUWithBTB::histShiftIn(int shamt, bool taken, boost::dynamic_bitset<> &history)
@@ -1009,15 +870,24 @@ DecoupledBPUWithBTB::pHistShiftIn(int shamt, bool taken, boost::dynamic_bitset<>
 }
 
 /**
- * @brief Creates a new FetchStream entry with prediction information
+ * @brief Creates a new FetchTarget entry with prediction information
  *
- * @return FetchStream The created fetch stream
+ * @return FetchTarget The created fetch target
  */
-FetchStream
-DecoupledBPUWithBTB::createFetchStreamEntry()
+FetchTarget
+DecoupledBPUWithBTB::createFetchTargetEntry(ThreadID tid)
 {
-    // Create a new fetch stream entry
-    FetchStream entry;
+    auto& s0PC = threads[tid].s0PC;
+    auto& s0History = threads[tid].s0History;
+    auto& s0PHistory = threads[tid].s0PHistory;
+    auto& s0BwHistory = threads[tid].s0BwHistory;
+    auto& s0LHistory = threads[tid].s0LHistory;
+    auto& finalPred = threads[tid].finalPred;
+
+    // Create a new fetch target entry
+    FetchTarget entry;
+    entry.tid = tid;
+    entry.asidHash = finalPred.asidHash;
     entry.startPC = s0PC;
 
     // Extract branch prediction information
@@ -1025,7 +895,7 @@ DecoupledBPUWithBTB::createFetchStreamEntry()
     Addr fallThroughAddr = finalPred.getFallThrough(predictWidth);
     Addr nextPC = finalPred.getTarget(predictWidth);
 
-    // Configure stream entry with prediction details
+    // Configure target entry with prediction details
     entry.isHit = !finalPred.btbEntries.empty();
     entry.falseHit = false;
     entry.predBTBEntries = finalPred.btbEntries;
@@ -1042,15 +912,17 @@ DecoupledBPUWithBTB::createFetchStreamEntry()
     entry.history = s0History;
     entry.phistory = s0PHistory;
     entry.bwhistory = s0BwHistory;
-    entry.ihistory = s0IHistory;
     entry.lhistory = s0LHistory;
     entry.predTick = finalPred.predTick;
     entry.predSource = finalPred.predSource;
     entry.overrideReason = finalPred.overrideReason;
 
+    entry.s1Source = finalPred.s1Source;
+    entry.s3Source = finalPred.s3Source;
+
     // Save predictors' metadata
     for (int i = 0; i < numComponents; i++) {
-        entry.predMetas[i] = components[i]->getPredictionMeta();
+        entry.predMetas[i] = components[i]->getPredictionMeta(tid);
     }
 
     // Initialize default resolution state
@@ -1063,129 +935,56 @@ DecoupledBPUWithBTB::createFetchStreamEntry()
  * @brief fill ahead pipeline entry.previousPCs
  */
 void
-DecoupledBPUWithBTB::fillAheadPipeline(FetchStream &entry)
+DecoupledBPUWithBTB::fillAheadPipeline(FetchTarget &entry)
 {
+    ThreadID tid = entry.tid;
     // Handle ahead pipelined predictors
     unsigned max_ahead_pipeline_stages = 0;
     for (int i = 0; i < numComponents; i++) {
         max_ahead_pipeline_stages = std::max(max_ahead_pipeline_stages, components[i]->aheadPipelinedStages);
     }
 
-    // Get previous PCs from fetchStreamQueue if needed
+    // Get previous PCs from fetchTargetQueue if needed
     if (max_ahead_pipeline_stages > 0) {
         for (int i = 0; i < max_ahead_pipeline_stages; i++) {
-            auto it = fetchStreamQueue.find(fsqId - max_ahead_pipeline_stages + i);
-            if (it != fetchStreamQueue.end()) {
+            auto id = ftq.backId(tid) + 1 - max_ahead_pipeline_stages + i;
+            if (ftq.hasTarget(id, tid)) {
                 // FIXME: it may not work well with jump ahead predictor
-                entry.previousPCs.push(it->second.getRealStartPC());
+                entry.previousPCs.push(ftq.get(id, tid).getRealStartPC());
             }
         }
     }
 }
 
-// this function enqueues fsq and update s0PC and s0History
 void
-DecoupledBPUWithBTB::processNewPrediction(bool create_new_stream)
+DecoupledBPUWithBTB::checkHistories(const boost::dynamic_bitset<> &history,
+                                    const boost::dynamic_bitset<> &phistory,
+                                    ThreadID tid)
 {
-    DPRINTF(DecoupleBP, "Creating new prediction for PC %#lx\n", s0PC);
-
-    // 1. Create a new fetch stream entry with prediction information
-    FetchStream entry = createFetchStreamEntry();
-
-    // 2. Update global PC state to target or fall-through
-    s0PC = finalPred.getTarget(predictWidth);;
-
-    // 3. Update history information
-    updateHistoryForPrediction(entry);
-
-    // 4. Fill ahead pipeline
-    fillAheadPipeline(entry);
-
-    // 5. Add entry to fetch stream queue
-    auto [insertIt, inserted] = fetchStreamQueue.emplace(fsqId, entry);
-    assert(inserted);
-    //printf("curr tick: %lu\n", entry.predTick);
-    //printf("curr fsqId: %lu\n", fsqId);
-
-    // 6. Record prediction to database if enabled
-    if (enablePredFSQTrace) {
-        predTraceManager->write_record(PredictionTrace(fsqId, entry));
-    }
-
-    // 7. Debug output and update statistics
-    dumpFsq("after insert new stream");
-    DPRINTF(DecoupleBP, "Inserted fetch stream %lu starting at PC %#lx\n",
-            fsqId, entry.startPC);
-
-    // 8. Update FSQ ID and increment statistics
-    fsqId++;
-    printStream(entry);
-    dbpBtbStats.fsqEntryEnqueued++;
-
-}
-
-void
-DecoupledBPUWithBTB::checkHistory(const boost::dynamic_bitset<> &history)
-{
-    // This function performs a crucial validation of branch history consistency
-    // It rebuilds the "ideal" history from HistoryManager's records and compares
-    // it with the actual history being used by the branch predictor
-
-    // Initialize counter for total history bits and a bitset for rebuilt history
-    unsigned ideal_size = 0;
-    boost::dynamic_bitset<> ideal_hash_hist(historyBits, 0);
-
-    // Iterate through all speculative history entries stored in HistoryManager
-    for (const auto entry: historyManager.getSpeculativeHist()) {
-        // Only process entries that have non-zero shift amount (actual branches)
-        if (entry.shamt != 0) {
-            // Accumulate total history bits
-            ideal_size += entry.shamt;
-            DPRINTF(DecoupleBPVerbose, "pc: %#lx, shamt: %lu, cond_taken: %d\n", entry.pc,
-                    entry.shamt, entry.cond_taken);
-
-            // Rebuild history by shifting and setting bits based on recorded outcomes
-            // This emulates how history would be built if all branches were predicted perfectly
-            ideal_hash_hist <<= entry.shamt;
-            ideal_hash_hist[0] = entry.cond_taken;
-        }
-    }
-
-    // Determine how many bits to compare (minimum of ideal size and actual history bits)
-    unsigned comparable_size = std::min(ideal_size, historyBits);
-
-    // Prepare actual history for comparison by creating a copy
-    boost::dynamic_bitset<> sized_real_hist(history);
-
-    // Resize both histories to the comparable size for accurate comparison
-    ideal_hash_hist.resize(comparable_size);
-    sized_real_hist.resize(comparable_size);
-
-    // boost::to_string(ideal_hash_hist, buf1);
-    // boost::to_string(sized_real_hist, buf2);
-    DPRINTF(DecoupleBP,
-            "Ideal size:\t%u, real history size:\t%u, comparable size:\t%u\n",
-            ideal_size, historyBits, comparable_size);
-    // DPRINTF(DecoupleBP, "Ideal history:\t%s\nreal history:\t%s\n",
-    //         buf1.c_str(), buf2.c_str());
-
-    assert(ideal_hash_hist == sized_real_hist);
+    DPRINTF(DecoupleBP, "Checking GHR/PHR speculative history replay\n");
+    assert(historyManagers[tid].checkGHist(history, historyBits));
+    assert(historyManagers[tid].checkPHist(phistory, historyBits));
 }
 
 void
 DecoupledBPUWithBTB::resetPC(Addr new_pc)
 {
-    s0PC = new_pc;
-    fetchTargetQueue.resetPC(new_pc);
+    for (int i = 0; i < numThreads; i++)
+        threads[i].s0PC = new_pc;
+}
+
+void
+DecoupledBPUWithBTB::resetPC(ThreadID tid, Addr new_pc)
+{
+    threads[tid].s0PC = new_pc;
 }
 
 Addr
 DecoupledBPUWithBTB::getPreservedReturnAddr(const DynInstPtr &dynInst)
 {
     DPRINTF(DecoupleBP, "acquiring reutrn address for inst pc %#lx from decode\n", dynInst->pcState().instAddr());
-    auto fsqid = dynInst->getFsqId();
-    auto it = fetchStreamQueue.find(fsqid);
-    auto retAddr = ras->getTopAddrFromMetas(it->second);
+    auto ftqid = dynInst->getFtqId();
+    auto retAddr = ras->getTopAddrFromMetas(ftq.get(ftqid, dynInst->threadNumber));
     DPRINTF(DecoupleBP, "get ret addr %#lx\n", retAddr);
     return retAddr;
 }
@@ -1193,68 +992,77 @@ DecoupledBPUWithBTB::getPreservedReturnAddr(const DynInstPtr &dynInst)
 /**
  * @brief Updates global history based on prediction results
  *
- * @param entry The fetch stream entry to update history for
+ * @param entry The fetch target entry to update history for
  */
 void
-DecoupledBPUWithBTB::updateHistoryForPrediction(FetchStream &entry)
+DecoupledBPUWithBTB::updateHistoryForPrediction(FetchTarget &entry)
 {
-    // Update component-specific history, for TAGE/ITTAGE/MGSC
-    for (int i = 0; i < numComponents; i++) {
-        // use old s0History to update folded history, then use finalPred to update folded history
-        components[i]->specUpdateHist(s0History, finalPred);
-        if(components[i]->needMoreHistories){
-            components[i]->specUpdatePHist(s0PHistory, finalPred);
-            components[i]->specUpdateBwHist(s0BwHistory, finalPred);
-            components[i]->specUpdateIHist(s0IHistory, finalPred);
-            components[i]->specUpdateLHist(s0LHistory, finalPred);
-        }
+    ThreadID tid = entry.tid;
+    auto& s0History = threads[tid].s0History;
+    auto& s0PHistory = threads[tid].s0PHistory;
+    auto& s0BwHistory = threads[tid].s0BwHistory;
+    auto& s0LHistory = threads[tid].s0LHistory;
+    auto& finalPred = threads[tid].finalPred;
+
+    const auto ghist_update = finalPred.getGHistUpdate();
+    const auto bwhist_update = finalPred.getBwHistUpdate();
+    const auto phist_update = finalPred.getPHistUpdate();
+
+    // RAS updates its speculative stack, not folded history.
+    if (ras->isEnabled()) {
+        ras->specUpdateState(finalPred);
     }
 
-    // Get prediction information for history updates
-    int shamt;
-    bool taken;
-    std::tie(shamt, taken) = finalPred.getHistInfo();
+    // Update component-local folded histories.
+    for (int i = 0; i < numComponents; i++) {
+        // use old histories to update predictor-local folded histories
+        components[i]->specUpdateGHist(s0History, finalPred, ghist_update);
+        components[i]->specUpdatePHist(s0PHistory, finalPred, phist_update);
+    }
+    if (mgsc->isEnabled()) {
+        mgsc->specUpdateBwHist(s0BwHistory, finalPred, bwhist_update);
+        mgsc->specUpdateIHist(finalPred, bwhist_update);
+        mgsc->specUpdateLHist(s0LHistory, finalPred, ghist_update);
+    }
 
     // Update global history
-    histShiftIn(shamt, taken, s0History);
+    histShiftIn(ghist_update.shamt, ghist_update.taken, s0History);
 
     // Update history manager and verify TAGE folded history
-    historyManager.addSpeculativeHist(
-        entry.startPC, shamt, taken, entry.predBranchInfo, fsqId);
-
-    // Get prediction information for global backward history updates
-    int bw_shamt;
-    bool bw_taken;
-    std::tie(bw_shamt, bw_taken) = finalPred.getBwHistInfo();
-
-    // Get prediction information for path history updates
-    auto [p_pc, p_target, p_taken]= finalPred.getPHistInfo(); // p_taken = taken
+    historyManagers[tid].addSpeculativeHist(
+        entry.startPC, entry.history, entry.phistory, ghist_update,
+        phist_update, entry.predBranchInfo, ftq.backId(tid) + 1);
 
     // Update global backward history
-    histShiftIn(bw_shamt, bw_taken, s0BwHistory);
+    histShiftIn(bwhist_update.shamt, bwhist_update.taken, s0BwHistory);
 
     // Update path history
-    pHistShiftIn(2, p_taken, s0PHistory, p_pc, p_target);
-
-    // Update imli history
-    histShiftIn(bw_shamt, bw_taken, s0IHistory);  //s0IHistory is not used
+    pHistShiftIn(phist_update.shamt, phist_update.taken, s0PHistory,
+                 phist_update.pc, phist_update.target);
 
     // Update local history
-    histShiftIn(shamt, taken,
-        s0LHistory[mgsc->getPcIndex(finalPred.bbStart, log2(mgsc->getNumEntriesFirstLocalHistories()))]);
+    const Addr localHistoryIndex =
+        mgsc->getPcIndex(finalPred.bbStart,
+                         log2(mgsc->getNumEntriesFirstLocalHistories()),
+                         finalPred.asidHash);
+    histShiftIn(ghist_update.shamt, ghist_update.taken,
+        s0LHistory[localHistoryIndex]);
 
 #ifndef NDEBUG
     if (tage->isEnabled()) {
-        tage->checkFoldedHist(s0PHistory, "speculative update");
+        tage->checkFoldedHist(
+            tage->usesPathHistory() ? s0PHistory : s0History, tid,
+            "speculative update");
     }
     if (ittage->isEnabled()) {
-        ittage->checkFoldedHist(s0PHistory, "speculative update");
+        ittage->checkFoldedHist(s0PHistory, tid, "speculative update");
     }
     if (microtage->isEnabled()) {
-        microtage->checkFoldedHist(s0PHistory, "speculative update");
+        microtage->checkFoldedHist(s0PHistory, tid, "speculative update");
     }
     if (mgsc->isEnabled()) {
-        mgsc->checkFoldedHist(s0History, s0PHistory, s0LHistory, "speculative update");
+        mgsc->checkFoldedHist(s0History, s0PHistory, s0LHistory, tid,
+                              "speculative update");
     }
 #endif
 }
@@ -1262,8 +1070,8 @@ DecoupledBPUWithBTB::updateHistoryForPrediction(FetchStream &entry)
 /**
  * @brief Recovers branch history during a squash event
  *
- * @param stream The stream being squashed
- * @param stream_id ID of the stream being squashed
+ * @param target The target being squashed
+ * @param target_id ID of the target being squashed
  * @param squash_pc PC where the squash occurred
  * @param is_conditional Whether the branch is conditional
  * @param actually_taken Whether the branch was actually taken
@@ -1271,88 +1079,107 @@ DecoupledBPUWithBTB::updateHistoryForPrediction(FetchStream &entry)
  */
 void
 DecoupledBPUWithBTB::recoverHistoryForSquash(
-    FetchStream &stream,
-    unsigned stream_id,
+    FetchTarget &target,
+    unsigned target_id,
     const PCStateBase &squash_pc,
     bool is_conditional,
     bool actually_taken,
     SquashType squash_type,
     Addr redirect_pc)
 {
-    //printf("recover stream_id: %u\n", stream_id);
-    // Restore history from the stream
-    s0History = stream.history;
-    s0PHistory = stream.phistory;
-    s0BwHistory = stream.bwhistory;
-    s0IHistory = stream.ihistory;
-    s0LHistory = stream.lhistory;
+    ThreadID tid = target.tid;
+    auto& s0History = threads[tid].s0History;
+    auto& s0PHistory = threads[tid].s0PHistory;
+    auto& s0BwHistory = threads[tid].s0BwHistory;
+    auto& s0LHistory = threads[tid].s0LHistory;
 
-    // Get actual history shift information
-    int real_shamt;
-    bool real_taken;
-    std::tie(real_shamt, real_taken) = stream.getHistInfoDuringSquash(
+    //printf("recover target_id: %u\n", target_id);
+    // Restore history from the target
+    s0History = target.history;
+    s0PHistory = target.phistory;
+    s0BwHistory = target.bwhistory;
+    s0LHistory = target.lhistory;
+
+    // Get actual history update information.
+    const auto ghist_update = target.getGHistUpdateDuringSquash(
         squash_pc.instAddr(), is_conditional, actually_taken);
+    const auto bwhist_update = target.getBwHistUpdateDuringSquash(
+        squash_pc.instAddr(), is_conditional, actually_taken, redirect_pc);
+    const auto phist_update = target.getPHistUpdateDuringSquash(
+        squash_pc.instAddr(), actually_taken, redirect_pc);
 
-    // Get actual history shift information
-    int real_bw_shamt;
-    bool real_bw_taken;
-    std::tie(real_bw_shamt, real_bw_taken) = stream.getBwHistInfoDuringSquash(
-    squash_pc.instAddr(), is_conditional, actually_taken, redirect_pc);
+    // RAS recovers its speculative stack, not folded history.
+    if (ras->isEnabled()) {
+        ras->recoverState(target);
+    }
+    if (abtb->isEnabled()) {
+        abtb->recoverState(target);
+    }
 
-    // Recover component-specific history
+    // Recover component-local folded histories.
     for (int i = 0; i < numComponents; ++i) {
-        components[i]->recoverHist(s0History, stream, real_shamt, real_taken);
-        if(components[i]->needMoreHistories){
-            components[i]->recoverPHist(s0PHistory, stream, real_shamt, real_taken);
-            components[i]->recoverBwHist(s0BwHistory, stream, real_bw_shamt, real_bw_taken);
-            components[i]->recoverIHist(s0IHistory, stream, real_bw_shamt, real_bw_taken); //s0IHistory is not used
-            components[i]->recoverLHist(s0LHistory, stream, real_shamt, real_taken);
-        }
+        components[i]->recoverHist(s0History, target, ghist_update.shamt,
+                                   ghist_update.taken);
+        components[i]->recoverPHist(s0PHistory, target, phist_update);
+    }
+    if (mgsc->isEnabled()) {
+        mgsc->recoverBwHist(s0BwHistory, target, bwhist_update.shamt,
+                            bwhist_update.taken);
+        mgsc->recoverIHist(target, bwhist_update.shamt,
+                           bwhist_update.taken);
+        mgsc->recoverLHist(s0LHistory, target, ghist_update.shamt,
+                           ghist_update.taken);
     }
 
     // Update global history with actual outcome
-    histShiftIn(real_shamt, real_taken, s0History);
+    histShiftIn(ghist_update.shamt, ghist_update.taken, s0History);
 
     // Update path history with actual outcome
-    pHistShiftIn(2, real_taken, s0PHistory, squash_pc.instAddr(), redirect_pc);
+    pHistShiftIn(phist_update.shamt, phist_update.taken, s0PHistory,
+                 phist_update.pc, phist_update.target);
 
     // Update global backward history with actual outcome
-    histShiftIn(real_bw_shamt, real_bw_taken, s0BwHistory);
-
-    // Update imli history with actual outcome
-    histShiftIn(real_bw_shamt, real_bw_taken, s0IHistory);  //s0IHistory is not used
+    histShiftIn(bwhist_update.shamt, bwhist_update.taken, s0BwHistory);
 
     // Update local history with actual outcome
-    histShiftIn(real_shamt, real_taken,
-                s0LHistory[mgsc->getPcIndex(stream.startPC, log2(mgsc->getNumEntriesFirstLocalHistories()))]);
+    const Addr localHistoryIndex =
+        mgsc->getPcIndex(target.startPC,
+                         log2(mgsc->getNumEntriesFirstLocalHistories()),
+                         target.asidHash);
+    histShiftIn(ghist_update.shamt, ghist_update.taken,
+                s0LHistory[localHistoryIndex]);
 
     // Update history manager with appropriate branch info
     if (squash_type == SQUASH_CTRL) {
-        historyManager.squash(stream_id, real_shamt, real_taken, stream.exeBranchInfo);
+        historyManagers[tid].squash(target_id, ghist_update,
+                                    phist_update,
+                                    target.exeBranchInfo);
     } else {
-        historyManager.squash(stream_id, real_shamt, real_taken, BranchInfo());
+        historyManagers[tid].squash(target_id, ghist_update,
+                                    phist_update, BranchInfo());
     }
 
     // Perform history consistency checks when not a fast build variant
 #ifndef NDEBUG
-    checkHistory(s0History);
+    checkHistories(s0History, s0PHistory, tid);
     if (tage->isEnabled()) {
-        tage->checkFoldedHist(s0PHistory,
+        tage->checkFoldedHist(
+            tage->usesPathHistory() ? s0PHistory : s0History, tid,
             squash_type == SQUASH_CTRL ? "control squash" :
             squash_type == SQUASH_OTHER ? "non control squash" : "trap squash");
     }
     if (ittage->isEnabled()) {
-        ittage->checkFoldedHist(s0PHistory,
+        ittage->checkFoldedHist(s0PHistory, tid,
             squash_type == SQUASH_CTRL ? "control squash" :
             squash_type == SQUASH_OTHER ? "non control squash" : "trap squash");
     }
     if (microtage->isEnabled()) {
-        microtage->checkFoldedHist(s0PHistory,
+        microtage->checkFoldedHist(s0PHistory, tid,
             squash_type == SQUASH_CTRL ? "control squash" :
             squash_type == SQUASH_OTHER ? "non control squash" : "trap squash");
     }
     if (mgsc->isEnabled()) {
-        mgsc->checkFoldedHist(s0History, s0PHistory, s0LHistory,
+        mgsc->checkFoldedHist(s0History, s0PHistory, s0LHistory, tid,
             squash_type == SQUASH_CTRL ? "control squash" :
             squash_type == SQUASH_OTHER ? "non control squash" : "trap squash");
     }

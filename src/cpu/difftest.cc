@@ -37,6 +37,27 @@ const char *reg_name[] = {
 
 std::vector<uint64_t> skipCSRs;
 
+namespace {
+
+void *
+openDiffTestHandle(const char *ref_so)
+{
+#if defined(__APPLE__)
+    int flags = RTLD_LAZY | RTLD_LOCAL;
+#if defined(RTLD_FIRST)
+    flags |= RTLD_FIRST;
+#endif
+    warn("macOS does not support dlmopen/RTLD_DEEPBIND; difftest falls back "
+         "to dlopen without Linux-equivalent symbol isolation and may behave "
+         "differently from Linux.\n");
+    return dlopen(ref_so, flags);
+#else
+    return dlmopen(LM_ID_NEWLM, ref_so, RTLD_LAZY | RTLD_DEEPBIND);
+#endif
+}
+
+} // anonymous namespace
+
 // CSR op Encoding:
 //     #12
 // | csrName | 0000 | 0000 | 0000 | 0111 | 0011 |
@@ -68,7 +89,7 @@ skipPerfCntCsr()
 
 NemuProxy::NemuProxy(int coreid, const char *ref_so, bool enable_sdcard_diff, bool enable_mem_dedup, bool multi_core)
 {
-    handle = dlmopen(LM_ID_NEWLM, ref_so, RTLD_LAZY | RTLD_DEEPBIND);
+    handle = openDiffTestHandle(ref_so);
     printf("Using %s for difftest\n", ref_so);
     if (!handle) {
         printf("%s\n", dlerror());
@@ -128,6 +149,12 @@ NemuProxy::NemuProxy(int coreid, const char *ref_so, bool enable_sdcard_diff, bo
 #endif
 
     multiCore = multi_core;
+    if (multiCore) {
+        nemuSetHartId = (void (*)(int))dlsym(handle, "difftest_set_mhartid");
+        assert(nemuSetHartId);
+        nemuPutGmaddr = (void (*)(uint8_t *))dlsym(handle, "difftest_put_gmaddr");
+        assert(nemuPutGmaddr);
+    }
 
     if (enable_sdcard_diff) {
         sdcard_init = (void (*)(const char *, const char *))dlsym(
@@ -147,22 +174,25 @@ void
 NemuProxy::initState(int coreid, uint8_t *golden_mem)
 {
     if (multiCore) {
-        auto nemu_difftest_set_mhartid = (void (*)(int))dlsym(handle, "difftest_set_mhartid");
         warn("Setting mhartid to %d\n", coreid);
-        assert(nemu_difftest_set_mhartid);
-        nemu_difftest_set_mhartid(coreid);
-
-        auto nemu_difftest_put_gmaddr = (void (*)(uint8_t *ptr))dlsym(handle, "difftest_put_gmaddr");
+        setHartId(coreid);
         warn("Setting gmaddr to %#lx\n", (uint64_t) golden_mem);
-        assert(nemu_difftest_put_gmaddr);
-        nemu_difftest_put_gmaddr(golden_mem);
+        nemuPutGmaddr(golden_mem);
+    }
+}
+
+void
+NemuProxy::setHartId(int coreid)
+{
+    if (multiCore) {
+        nemuSetHartId(coreid);
     }
 }
 
 
 SpikeProxy::SpikeProxy(int coreid, const char *ref_so, bool enable_sdcard_diff)
 {
-    handle = dlmopen(LM_ID_NEWLM, ref_so, RTLD_LAZY | RTLD_DEEPBIND);
+    handle = openDiffTestHandle(ref_so);
     printf("Using %s for difftest\n", ref_so);
     if (!handle) {
         printf("%s\n", dlerror());
@@ -215,4 +245,3 @@ SpikeProxy::SpikeProxy(int coreid, const char *ref_so, bool enable_sdcard_diff)
 
     nemu_init();
 }
-

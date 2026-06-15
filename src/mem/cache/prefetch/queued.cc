@@ -37,11 +37,14 @@
 
 #include "mem/cache/prefetch/queued.hh"
 
+#include <linux/limits.h>
+
 #include <cassert>
 
 #include "arch/generic/tlb.hh"
 #include "base/logging.hh"
 #include "base/trace.hh"
+#include "cmc.hh"
 #include "debug/HWPrefetch.hh"
 #include "debug/HWPrefetchOther.hh"
 #include "debug/HWPrefetchQueue.hh"
@@ -65,11 +68,21 @@ Queued::DeferredPacket::createPkt(Addr paddr, unsigned blk_size, RequestorID req
     /* Create a prefetch memory request */
     RequestPtr req;
     if (owner->useVirtualAddresses && pfInfo.hasPC()) {
-        req = std::make_shared<Request>(pfInfo.getAddr(), blk_size, 0,
-                                        requestor_id, pfInfo.getPC(), 0);
+        if (pfInfo.hasContextId()) {
+            req = std::make_shared<Request>(pfInfo.getAddr(), blk_size, 0,
+                                            requestor_id, pfInfo.getPC(),
+                                            pfInfo.contextId());
+        } else {
+            req = std::make_shared<Request>();
+            req->setVirt(pfInfo.getAddr(), blk_size, 0, requestor_id,
+                         pfInfo.getPC());
+        }
         req->setPaddr(paddr);
     } else {
         req = std::make_shared<Request>(paddr, blk_size, 0, requestor_id);
+        if (pfInfo.hasContextId()) {
+            req->setContext(pfInfo.contextId());
+        }
     }
 
     req->setFlags(Request::PREFETCH);
@@ -129,7 +142,14 @@ Queued::Queued(const QueuedPrefetcherParams &p)
       tlbReqEvent(
           [this]{ processMissingTranslations(queueSize); },
           name()),
-      statsQueued(this)
+      statsQueued(this),
+      usePFBuffer(p.use_pf_buffer),
+      PFRequestBuffer(),
+      max_pf_buffer_size(p.max_pf_buffer_size),
+      PFReqSendEvent(
+          [this]{ PFSendEventWrapper(); },
+          name())
+
 {
 }
 
@@ -204,7 +224,6 @@ void
 Queued::notify(const PacketPtr &pkt, const PrefetchInfo &pfi)
 {
     Addr blk_addr = blockAddress(pfi.getAddr());
-    bool is_secure = pfi.isSecure();
 
     bool late_in_mshr = pkt->missOnLatePf;  // hit in pf mshr
 
@@ -213,10 +232,10 @@ Queued::notify(const PacketPtr &pkt, const PrefetchInfo &pfi)
 
     // Squash queued prefetches if demand miss to same line
     if (queueSquash) {
+        PrefetchInfo blk_pfi(pfi, blk_addr);
         auto itr = pfq.begin();
         while (itr != pfq.end()) {
-            if (itr->pfInfo.getAddr() == blk_addr &&
-                itr->pfInfo.isSecure() == is_secure) {
+            if (itr->pfInfo.sameAddr(blk_pfi)) {
                 DPRINTF(HWPrefetch, "Removing pf candidate addr: %#x "
                         "(cl: %#x), demand request going to the same addr\n",
                         itr->pfInfo.getAddr(),
@@ -243,10 +262,18 @@ Queued::notify(const PacketPtr &pkt, const PrefetchInfo &pfi)
     // Calculate prefetches given this access
     std::vector<AddrPriority> addresses;
     // if (!pkt->coalescingMSHR) {  // hit to Other cpu access
+    pfi.setTriggerInfo(pkt);
     calculatePrefetch(pfi, addresses, pfi.isCacheMiss() && (late_in_mshr || late_in_pfq), pf_source,
                       pkt->coalescingMSHR);
     // }
-
+    if (usePFBuffer) {
+        //PFs supposed to be stored in buffer,just trigger PF send event
+        if (!PFReqSendEvent.scheduled()) {
+            //even if this cycle has trained,we assume it take 1 cycle to generate PFs
+            schedule(PFReqSendEvent, nextCycle());
+        }
+        return;
+    }
     // Get the maximu number of prefetches that we are allowed to generate
     size_t max_pfs = getMaxPermittedPrefetches(addresses.size());
 
@@ -283,7 +310,56 @@ Queued::notify(const PacketPtr &pkt, const PrefetchInfo &pfi)
         }
     }
 }
+void
+Queued::PFSendEventWrapper()
+{
+    std::vector<AddrPriority> addresses;
+    GetPFRequestsFromBuffer(addresses);
 
+    // there may be more than 1 req in addresses because we are trying to allow max 1 PF to every cache level
+    // assert(addresses.size()==1);
+    // Get the maximu number of prefetches that we are allowed to generate
+    size_t max_pfs = getMaxPermittedPrefetches(addresses.size());
+
+    // Queue up generated prefetches
+    size_t num_pfs = 0;
+    for (AddrPriority& addr_prio : addresses) {
+
+        PacketPtr pkt = addr_prio.pf_trigger_info.pkt;
+        PrefetchInfo pfi = PrefetchInfo(*addr_prio.pf_trigger_info.pfi_old);
+        //override address's prio to 1
+        addr_prio.priority = 1;
+        // Block align prefetch address
+        addr_prio.addr = blockAddress(addr_prio.addr);
+
+        if (!samePage(addr_prio.addr, pfi.getAddr())) {
+            statsQueued.pfSpanPage += 1;
+
+            if (hasBeenPrefetched(pkt->getAddr(), pkt->isSecure())) {
+                statsQueued.pfUsefulSpanPage += 1;
+            }
+        }
+
+        bool can_cross_page = (tlb != nullptr);
+        if (can_cross_page || samePage(addr_prio.addr, pfi.getAddr())) {
+            PrefetchInfo new_pfi(pfi, addr_prio.addr);
+            new_pfi.setXsMetadata(Request::XsMetadata(addr_prio.pfSource,addr_prio.depth));
+            statsQueued.pfIdentified++;
+            DPRINTF(HWPrefetch, "Found a pf candidate addr: %#x, "
+                    "inserting into prefetch queue.\n", new_pfi.getAddr());
+            insert(pkt, new_pfi, addr_prio);
+            num_pfs += 1;
+            if (num_pfs == max_pfs) {
+                break;
+            }
+        } else {
+            DPRINTF(HWPrefetch, "Ignoring page crossing prefetch.\n");
+        }
+    }
+    if (hasPFRequestsInBuffer() && !PFReqSendEvent.scheduled()) {
+        schedule(PFReqSendEvent, nextCycle()); // schedule next PF send event
+    }
+}
 bool
 Queued::hasPendingPacket()
 {
@@ -332,8 +408,13 @@ Queued::QueuedStats::QueuedStats(statistics::Group *parent)
     ADD_STAT(pfSpanPage, statistics::units::Count::get(),
              "number of prefetches that crossed the page"),
     ADD_STAT(pfUsefulSpanPage, statistics::units::Count::get(),
-             "number of prefetches that is useful and crossed the page")
-{
+             "number of prefetches that is useful and crossed the page"),
+    ADD_STAT(pfRemovedFull_srcs, statistics::units::Count::get(),
+        "src distribute of Removedfull prefetch")
+{   using namespace statistics;
+    pfRemovedFull_srcs
+        .init(NUM_PF_SOURCES)
+        .flags(total);
 }
 
 
@@ -384,7 +465,7 @@ Queued::translationComplete(DeferredPacket *dp, bool failed)
                     it->translationRequest->getPaddr());
             Addr target_paddr = it->translationRequest->getPaddr();
             // check if this prefetch is already redundant
-            if (cacheSnoop && (inCache(target_paddr, it->pfInfo.isSecure()) ||
+            if (cacheSnoop && queueFilter && (inCache(target_paddr, it->pfInfo.isSecure()) ||
                         inMissQueue(target_paddr, it->pfInfo.isSecure()))) {
                 statsQueued.pfInCache++;
                 DPRINTF(HWPrefetch, "Dropping redundant in "
@@ -474,9 +555,10 @@ Queued::alreadyInQueue(std::list<DeferredPacket> &queue,
 RequestPtr
 Queued::createPrefetchRequest(Addr addr, PrefetchInfo const &pfi, PacketPtr pkt, PrefetchSourceType pf_src, int pf_depth)
 {
+    assert(pfi.hasContextId());
     RequestPtr translation_req = std::make_shared<Request>(
             addr, blkSize, pkt->req->getFlags(), requestorId, pfi.getPC(),
-            pkt->req->contextId());
+            pfi.contextId());
     translation_req->setFlags(Request::PF_EXCLUSIVE);
     translation_req->setPFSource(pf_src);
     translation_req->setPFDepth(pf_depth);
@@ -554,7 +636,7 @@ Queued::insert(const PacketPtr &pkt, PrefetchInfo &new_pfi, const AddrPriority &
             return;
         }
     }
-    if (has_target_pa && cacheSnoop &&
+    if (has_target_pa && cacheSnoop && queueFilter &&
             (inCache(target_paddr, new_pfi.isSecure()) ||
             inMissQueue(target_paddr, new_pfi.isSecure()))) {
         statsQueued.pfInCache++;
@@ -650,6 +732,8 @@ Queued::addToQueue(std::list<DeferredPacket> &queue,
         }
         DPRINTF(HWPrefetch, "%s full (sz=%lu), removing lowest priority oldest packet, addr: %#x\n", queue_name,
                 queue.size(), it->pfInfo.getAddr());
+        statsQueued.pfRemovedFull_srcs[it->pfInfo.getXsMetadata().prefetchSource]++;
+
         if (&queue == &pfq || !it->ongoingTranslation){
             delete it->pkt;
             queue.erase(it);

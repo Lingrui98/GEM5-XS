@@ -78,6 +78,7 @@
 # Global Python imports
 import atexit
 import os
+import shlex
 import sys
 
 from os import mkdir, remove, environ
@@ -337,11 +338,21 @@ def config_embedded_python(env):
         # Since this function does not use the `unique` param, one should not
         # pass any value to this param.
         assert(unique==True)
-        flags = cmd_output.split()
+        flags = shlex.split(cmd_output)
         prefixes = ('-l', '-L', '-I')
         is_useful = lambda x: any(x.startswith(prefix) for prefix in prefixes)
         useful_flags = list(filter(is_useful, flags))
         env.MergeFlags(' '.join(useful_flags))
+
+        lib_paths = [
+            flag[2:] for flag in flags
+            if flag.startswith('-L') and len(flag) > 2
+        ]
+        for path in lib_paths:
+            if os.path.isabs(path):
+                # The configure test runs the embedded interpreter, so a
+                # non-system libpython path must be visible at run time too.
+                env.AppendUnique(RPATH=[path])
 
     env.ParseConfig(cmd, flag_filter)
 
@@ -532,6 +543,25 @@ for variant_path in variant_paths:
         if sys.platform == "darwin":
             env.Append(CXXFLAGS=['-stdlib=libc++'])
             env.Append(LIBS=['c++'])
+            env['RPATHPREFIX'] = '-Wl,-rpath,'
+            env['RPATHSUFFIX'] = ''
+            env['_RPATH'] = \
+                '${_concat(RPATHPREFIX, RPATH, RPATHSUFFIX, __env__)}'
+
+            # Homebrew installs headers and libraries under a non-system
+            # prefix on macOS (e.g., /opt/homebrew on Apple Silicon). Add the
+            # common prefixes here so Configure checks can find dependencies
+            # such as zstd without requiring per-shell environment setup.
+            for brew_prefix in ('/opt/homebrew', '/usr/local'):
+                if os.path.isdir(brew_prefix):
+                    env.Prepend(CPPPATH=[os.path.join(brew_prefix, 'include')])
+                    env.Prepend(LIBPATH=[os.path.join(brew_prefix, 'lib')])
+                    env['ENV']['PKG_CONFIG_PATH'] = \
+                        os.path.join(brew_prefix, 'lib', 'pkgconfig') + \
+                        (':' + env['ENV']['PKG_CONFIG_PATH']
+                         if 'PKG_CONFIG_PATH' in env['ENV'] and
+                         env['ENV']['PKG_CONFIG_PATH'] else '')
+                    break
 
     # Add sanitizers flags
     sanitizers=[]
@@ -599,15 +629,18 @@ for variant_path in variant_paths:
     with gem5_scons.Configure(env) as conf:
         # On Solaris you need to use libsocket for socket ops
         if not conf.CheckLibWithHeader(
-                [None, 'socket'], 'sys/socket.h', 'C++', 'accept(0,0,0);'):
+                [None, 'socket'], 'sys/socket.h', 'C++',
+                call='accept(0,0,0);'):
            error("Can't find library with socket calls (e.g. accept()).")
 
-        if not conf.CheckLibWithHeader('z', 'zlib.h', 'C++','zlibVersion();'):
+        if not conf.CheckLibWithHeader('z', 'zlib.h', 'C++',
+                                       call='zlibVersion();'):
             error('Did not find needed zlib compression library '
                   'and/or zlib.h header file.\n'
                   'Please install zlib and try again.')
 
-        if not conf.CheckLibWithHeader('zstd', 'zstd.h', 'C++','ZSTD_isError(0);'):
+        if not conf.CheckLibWithHeader('zstd', 'zstd.h', 'C++',
+                                       call='ZSTD_isError(0);'):
             error('Did not find needed zstd compression library '
                   'and/or zstd.h header file.\n'
                   'Please install zstd and try again.')

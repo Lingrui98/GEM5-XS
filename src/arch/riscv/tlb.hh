@@ -34,6 +34,7 @@
 
 #include <cstdint>
 #include <list>
+#include <vector>
 
 #include "arch/generic/tlb.hh"
 #include "arch/riscv/isa.hh"
@@ -42,6 +43,7 @@
 #include "arch/riscv/regs/misc.hh"
 #include "arch/riscv/utility.hh"
 #include "base/statistics.hh"
+#include "base/types.hh"
 #include "mem/request.hh"
 #include "params/RiscvTLB.hh"
 #include "sim/sim_object.hh"
@@ -107,9 +109,13 @@ class TLB : public BaseTLB
     uint64_t lastPc;
     uint64_t traceFlag;
 
-    bool use_old_priv;
-    PrivilegeMode old_priv_ldst;
-    PrivilegeMode old_priv_ex;
+    struct OldPrivState
+    {
+        bool valid = false;
+        PrivilegeMode ldst = PrivilegeMode::PRV_M;
+    };
+
+    std::vector<OldPrivState> oldPrivByThread;
 
     Walker *walker;
 
@@ -123,6 +129,7 @@ class TLB : public BaseTLB
         statistics::Scalar writeHits;
         statistics::Scalar writeMisses;
         statistics::Scalar writeAccesses;
+        /** Prefetch translations are tracked separately from demand accesses. */
         statistics::Scalar readprefetchHits;
         statistics::Scalar writeprefetchHits;
         statistics::Scalar readprefetchAccesses;
@@ -180,7 +187,6 @@ class TLB : public BaseTLB
     Walker *getWalker();
 
     void takeOverFrom(BaseTLB *old) override {}
-    void setPTWmode(bool _enable_sv48) override;
 
     TlbEntry *insert(Addr vpn, const TlbEntry &entry, bool suqashed_update, uint8_t translateMode);
     TlbEntry *insertForwardPre(Addr vpn, const TlbEntry &entry);
@@ -253,21 +259,18 @@ class TLB : public BaseTLB
                               BaseMMU::Translation *translation, BaseMMU::Mode mode) override;
     Fault finalizePhysical(const RequestPtr &req, ThreadContext *tc,
                            BaseMMU::Mode mode) const override;
-    TlbEntry *lookup(Addr vpn, uint16_t asid, BaseMMU::Mode mode, bool hidden, bool sign_used, uint8_t translateMode);
+    PrivilegeMode currentMemPriv(ThreadContext *tc, BaseMMU::Mode mode);
+    TlbEntry *lookup(Addr vpn, uint16_t asid, BaseMMU::Mode mode, bool hidden,
+                     bool sign_used, uint8_t translateMode,
+                     bool is_prefetch = false);
     TlbEntry *lookupForwardPre(Addr vpn, uint64_t asid, bool hidden);
     TlbEntry *lookupBackPre(Addr vpn, uint64_t asid, bool hidden);
     bool autoOpenNextline();
     TlbEntry *lookupL2TLB(Addr vpn, uint16_t asid, BaseMMU::Mode mode, bool hidden, int f_level, bool sign_used,
                           uint8_t translateMode);
 
-    void setOldPriv(ThreadContext *tc) {
-      use_old_priv = true;
-      old_priv_ex = getMemPriv(tc, BaseMMU::Execute);
-      old_priv_ldst = getMemPriv(tc, BaseMMU::Read);
-    }
-    void useNewPriv(ThreadContext *tc) {
-      use_old_priv = false;
-    }
+    void setOldPriv(ThreadContext *tc);
+    void useNewPriv(ThreadContext *tc);
 
 
     std::vector<TlbEntry> tlbL2L3;  // our TLB

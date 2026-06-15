@@ -45,6 +45,7 @@
 #include <list>
 #include <map>
 #include <queue>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -63,6 +64,7 @@
 #include "cpu/pred/general_arch_db.hh"
 #include "cpu/pred/stream/decoupled_bpred.hh"
 #include "cpu/timebuf.hh"
+#include "cpu/valuepred/valuepred_unit.hh"
 #include "enums/CommitPolicy.hh"
 #include "sim/arch_db.hh"
 #include "sim/probe/probe.hh"
@@ -99,6 +101,50 @@ class ThreadState;
  * supports multiple cycle squashing, to model a ROB that can only
  * remove a certain number of instructions per cycle.
  */
+struct LoadKey
+{
+    Addr pc;
+    Addr addr;
+    uint64_t value;
+    bool operator==(const LoadKey& o) const {
+        return pc == o.pc && addr == o.addr && value == o.value;
+    }
+};
+
+struct LoadKeyHash
+{
+    std::size_t operator()(const LoadKey& k) const {
+        std::size_t h1 = std::hash<Addr>{}(k.pc);
+        std::size_t h2 = std::hash<Addr>{}(k.addr);
+        std::size_t h3 = std::hash<uint64_t>{}(k.value);
+        return h1 ^ (h2 << 1) ^ (h3 << 2);
+    }
+};
+
+class LoadTripleCounter
+{
+public:
+    bool update(Addr pc, Addr addr, uint64_t value) {
+        LoadKey key{pc, addr, value};
+        auto it = table.find(key);
+        if (it != table.end()) {
+            it->second++;
+            totalCount++;
+            return true;
+        } else {
+            table.emplace(key, 1);
+            totalCount++;
+            return false;
+        }
+    }
+    uint64_t size() const { return table.size(); }
+    uint64_t total() const { return totalCount; }
+
+private:
+    std::unordered_map<LoadKey, uint64_t, LoadKeyHash> table;
+    uint64_t totalCount = 0;
+};
+
 class Commit
 {
   public:
@@ -131,6 +177,10 @@ class Commit
     /** Per-thread status. */
     ThreadStatus commitStatus[MaxThreads];
 
+    boost::circular_buffer<DynInstPtr> fixedbuffer[MaxThreads];
+
+    StallSignals* stallSig;
+
     bool robSquashHolding{false};
     /** Commit policy used in SMT mode. */
     CommitPolicy commitPolicy;
@@ -146,12 +196,17 @@ class Commit
     };
     std::list<BranchInfo> branchLog;
 
-    uint64_t lastCommitCycle = 0;
+    uint64_t lastCommitCycle[MaxThreads] = {0};
 
     EventFunctionWrapper stuckCheckEvent;
 
     /** Mark the thread as processing a trap. */
     void processTrapEvent(ThreadID tid);
+    LoadTripleCounter loadTripleCounter;
+
+    // --- Maps for "last time" tracking, keyed by static load PC ---
+    std::unordered_map<Addr, Addr> lastLoadEA;
+    std::unordered_map<Addr, Addr> lastLoadProducerStorePC;
 
   public:
     /** Construct a Commit with the given parameters. */
@@ -159,8 +214,6 @@ class Commit
 
     /** Returns the name of the Commit. */
     std::string name() const;
-
-    uint64_t getLastCommitCycle() const { return lastCommitCycle; }
 
     /** Registers probes. */
     void regProbePoints();
@@ -183,6 +236,8 @@ class Commit
     void setIEWStage(IEW *iew_stage);
 
     void setDecodeStage(Decode *decode_stage);
+
+    void setStallSignals(StallSignals* stall_signals) { stallSig = stall_signals; }
 
     /** The pointer to the IEW stage. Used solely to ensure that
      * various events (traps, interrupts, syscalls) do not occur until
@@ -315,6 +370,7 @@ class Commit
 
     /** Commits as many instructions as possible. */
     void commitInsts();
+    bool hasExecutedYoungerInst(ThreadID tid, InstSeqNum seq_num) const;
     void updateMstatusSd(ThreadID tid);
 
     /** Tries to commit the head ROB instruction passed in.
@@ -323,7 +379,7 @@ class Commit
     bool commitHead(const DynInstPtr &head_inst, unsigned inst_num);
 
     /** Gets instructions from rename and inserts them into the ROB. */
-    void getInsts();
+    void moveInstsToBuffer();
 
     /** Squash instructions in the rename to ROB TimeBuffer. */
     void squashInflightAndUpdateVersion(ThreadID tid);
@@ -373,7 +429,7 @@ class Commit
     /** Wire to read information from rename queue. */
     TimeBuffer<RenameStruct>::wire fromRename;
 
-    SquashVersion localSquashVer;
+    SquashVersion localSquashVer[MaxThreads];
 
   public:
     /** ROB interface. */
@@ -384,6 +440,9 @@ class Commit
     CPU *cpu;
 
     branch_prediction::BPredUnit *bp;
+
+    /** Value predictor */
+    valuepred::VPUnit *valuePred;
 
     /** Vector of all of the threads. */
     std::vector<ThreadState *> thread;
@@ -397,6 +456,9 @@ class Commit
      * then the number of free entries must be re-broadcast.
      */
     bool changedROBNumEntries[MaxThreads];
+
+    /** Donor hysteresis for dynamic ROB borrowing. */
+    unsigned borrowingDonorCycles[MaxThreads];
 
     /** Records if a thread has to squash this cycle due to a trap. */
     bool trapSquash[MaxThreads];
@@ -437,6 +499,9 @@ class Commit
 
     /** Number of Active Threads */
     const ThreadID numThreads;
+
+    /** Cycles to keep a stalled thread marked as a ROB borrowing donor. */
+    const unsigned smtBorrowDonorHoldCycles;
 
     /** Is a drain pending? Commit is looking for an instruction boundary while
      * there are no pending interrupts
@@ -508,9 +573,8 @@ class Commit
 
     // committed Stream and Target
 
-    uint64_t committedStreamId{1};
-    uint64_t committedTargetId{0};
-    uint64_t committedLoopIter{};
+    uint64_t committedTargetId[MaxThreads];
+    uint64_t committedLoopIter[MaxThreads];
 
     struct CommitStats : public statistics::Group
     {
@@ -542,6 +606,8 @@ class Commit
         statistics::Vector memRefs;
         /** Stat for the total number of committed loads. */
         statistics::Vector loads;
+        /** Stat for the total number of committed stores. */
+        statistics::Vector stores;
         /** Stat for the total number of committed atomics. */
         statistics::Vector amos;
         /** Total number of committed memory barriers. */
@@ -561,6 +627,11 @@ class Commit
 
         /** Number of cycles where the commit bandwidth limit is reached. */
         statistics::Scalar commitEligibleSamples;
+        /** Number of load get the same pc && addr && value*/
+        statistics::Scalar loadTriple;
+        statistics::Scalar loadEAReused;
+        statistics::Scalar loadsWithProducer;
+        statistics::Scalar producerStable;
 
         statistics::Distribution segUnitStrideNF;
         statistics::Distribution segStrideNF;
@@ -573,6 +644,7 @@ class Commit
 
         statistics::Scalar squashDueToBranch;
         statistics::Scalar squashDueToOrderViolation;
+        statistics::Scalar squashDueToValuePrediction;
         statistics::Scalar squashDueToTrap;
         statistics::Scalar squashDueToTC;
         statistics::Scalar squashDueToSquashAfter;

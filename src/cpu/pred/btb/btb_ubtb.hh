@@ -51,7 +51,7 @@
 #include "base/logging.hh"
 #include "base/types.hh"
 #include "config/the_isa.hh"
-#include "cpu/pred/btb/stream_struct.hh"
+#include "cpu/pred/btb/common.hh"
 #include "cpu/pred/btb/timed_base_pred.hh"
 #include "debug/UBTB.hh"
 #include "params/UBTB.hh"
@@ -130,26 +130,22 @@ class UBTB : public TimedBaseBTBPredictor
     /** for statistics only
      * @param stream The fetch stream containing execution results and prediction metadata
      */
-    void update(const FetchStream &stream) override;
+    void update(const FetchTarget &stream) override;
 
     /** for statistics only
      * @param stream The fetch stream containing execution results
      * @param inst The dynamic instruction being committed
      */
-    void commitBranch(const FetchStream &stream, const DynInstPtr &inst) override;
+    void commitBranch(const FetchTarget &stream, const DynInstPtr &inst) override;
 
     /** Get prediction BTBMeta
      *  @return Returns the prediction meta
      */
-    std::shared_ptr<void> getPredictionMeta() override
+    std::shared_ptr<void> getPredictionMeta(ThreadID tid = 0) override
     {
         return meta;
     }
 
-    // the following methods are not used
-    void specUpdateHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred) override {}
-    void recoverHist(const boost::dynamic_bitset<> &history,
-        const FetchStream &entry, int shamt, bool cond_taken) override{};
     void reset();
     void setTrace() override;
     TraceManager *ubtbTrace;
@@ -218,8 +214,9 @@ class UBTB : public TimedBaseBTBPredictor
      *  @param startPC The start address of the fetch block
      *  @return Returns the tag bits.
      */
-    inline Addr getTag(Addr startPC) {
-        return (startPC >> 1) & tagMask;
+    inline Addr getTag(Addr startPC, uint8_t asidHash) {
+        Addr baseTag = (startPC >> 1) & tagMask;
+        return injectAsidHashIntoTag(baseTag, tagBits, asidHash);
     }
 
     void updateUCtr(unsigned &ctr, bool inc) {
@@ -231,7 +228,7 @@ class UBTB : public TimedBaseBTBPredictor
      * @param startAddr The FB start address to look up
      * @return Iterator to the matching entry if found, or ubtb.end() if not found
      */
-    UBTBIter lookup(Addr startAddr);
+    UBTBIter lookup(Addr startAddr, uint8_t asidHash);
 
     /** helper method called by putPCHistory: Check uBTB entry pc range and update statistics
      * @param entry The uBTB entry to check
@@ -251,10 +248,12 @@ class UBTB : public TimedBaseBTBPredictor
      * @param oldEntry Iterator to the entry to replace
      * @param newPrediction The new prediction to store
      */
-    void replaceOldEntry(UBTBIter oldEntryIter, const BTBEntry &newTakenEntry, Addr startAddr);
+    void replaceOldEntry(UBTBIter oldEntryIter, const BTBEntry &newTakenEntry,
+                         Addr startAddr, uint8_t asidHash);
 
     //using the FB final taken branch to update uBTB
-    void updateNewEntry(UBTBIter oldEntryIter, const BTBEntry &takenEntry, const Addr startAddr);
+    void updateNewEntry(UBTBIter oldEntryIter, const BTBEntry &takenEntry,
+                        const Addr startAddr, uint8_t asidHash);
 
 
     /** The uBTB structure:

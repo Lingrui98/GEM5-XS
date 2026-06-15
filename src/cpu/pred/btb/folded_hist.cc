@@ -1,4 +1,7 @@
 #include "cpu/pred/btb/folded_hist.hh"
+// #include "debug/MGSC.hh"
+
+#include "base/logging.hh"
 
 namespace gem5
 {
@@ -10,7 +13,7 @@ namespace btb_pred
 {
 
 uint64_t
-FoldedHistBase::fold(const boost::dynamic_bitset<> &ghr)
+FoldedHistBase::fold(const boost::dynamic_bitset<> &ghr) const
 {
     // Create ideal folded history from GHR
     uint64_t folded = 0;
@@ -42,7 +45,7 @@ FoldedHistBase::fold(const boost::dynamic_bitset<> &ghr)
  * Used during branch misprediction recovery.
  */
 void
-FoldedHistBase::recover(FoldedHistBase &other)
+FoldedHistBase::recover(const FoldedHistBase &other)
 {
     // Verify both histories have same configuration
     assert(foldedLen == other.foldedLen);
@@ -60,7 +63,7 @@ FoldedHistBase::recover(FoldedHistBase &other)
  * This method can be commonly used for checking both GHR and PHR.
  */
 void
-FoldedHistBase::check(const boost::dynamic_bitset<> &historyBitVec)
+FoldedHistBase::check(const boost::dynamic_bitset<> &historyBitVec) const
 {
     // Verify our folded history matches ideal
     auto expected = fold(historyBitVec);
@@ -152,15 +155,20 @@ ImliFoldedHist::update(const boost::dynamic_bitset<> &ghr, int shamt, bool taken
     const uint64_t foldedMask = ((1ULL << foldedLen) - 1);
     uint64_t temp = _folded;
 
-    // Simple shift and set case
-    if (taken && temp < ((1ULL << histLen) - 1) && shamt == 1) {  // backward taken, inner most loop
-        temp = temp + 1;                                          // counter++ (index++)
-    } else if (taken && shamt > 1) {                              // backward taken, not inner most loop
-        temp = 1;
-    } else if (!taken) {  // backward not taken, hist = 0
+    // For IMLI, we treat "taken" as a backward-taken event (i.e., loop continues).
+    // Update rule (CBP-like):
+    // - backward taken: counter++
+    // - otherwise: counter = 0 (loop exits or no backward-taken event)
+    if (taken) {
+        const uint64_t max = ((1ULL << histLen) - 1);
+        if (temp < max) {
+            temp++;
+        }
+    } else {
         temp = 0;
     }
     _folded = temp & foldedMask;
+    // DPRINTF(MGSC, "IMLI FoldedHist update: shamt %d, taken %d, folded %ld\n", shamt, taken, _folded);
 }
 
 /**
@@ -219,6 +227,72 @@ PathFoldedHist::update(const boost::dynamic_bitset<> &ghr, int shamt, bool taken
             temp &= foldedMask;
         }
         _folded = temp;
+    }
+}
+
+TageFoldedHist::TageFoldedHist()
+    : historyType(HistoryType::PATH),
+      directionHist(1, 1, 1),
+      pathHist(1, 1, 1)
+{
+}
+
+TageFoldedHist::TageFoldedHist(int histLen, int foldedLen,
+                               int maxShamt,
+                               HistoryType historyType)
+    : historyType(historyType),
+      directionHist(histLen, foldedLen, maxShamt),
+      pathHist(histLen, foldedLen, maxShamt)
+{
+    if (historyType != HistoryType::GLOBAL &&
+        historyType != HistoryType::PATH) {
+        panic("TageFoldedHist only supports GLOBAL and PATH, got %d",
+            static_cast<int>(historyType));
+    }
+}
+
+uint64_t
+TageFoldedHist::get() const
+{
+    return isPathBased() ? pathHist.get() : directionHist.get();
+}
+
+boost::dynamic_bitset<>
+TageFoldedHist::getAsBitset() const
+{
+    return isPathBased() ? pathHist.getAsBitset() :
+        directionHist.getAsBitset();
+}
+
+void
+TageFoldedHist::update(const boost::dynamic_bitset<> &history, int shamt,
+                       bool taken, Addr pc, Addr target)
+{
+    if (isPathBased()) {
+        pathHist.update(history, shamt, taken, pc, target);
+    } else {
+        directionHist.update(history, shamt, taken, pc, target);
+    }
+}
+
+void
+TageFoldedHist::recover(const TageFoldedHist &other)
+{
+    assert(historyType == other.historyType);
+    if (isPathBased()) {
+        pathHist.recover(other.pathHist);
+    } else {
+        directionHist.recover(other.directionHist);
+    }
+}
+
+void
+TageFoldedHist::check(const boost::dynamic_bitset<> &history) const
+{
+    if (isPathBased()) {
+        pathHist.check(history);
+    } else {
+        directionHist.check(history);
     }
 }
 
