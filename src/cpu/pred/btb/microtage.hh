@@ -232,6 +232,30 @@ class MicroTAGE : public TimedBaseBTBPredictor
     // The actual TAGE prediction tables (table x index x way)
     std::vector<std::vector<std::vector<TageEntry>>> tageTable;
 
+  public:
+    /** SWAY per-way visit counters for stranded-capacity profiling.
+     *
+     *  Indexed as [table][index][way], same shape as tageTable. Bumped
+     *  on every prediction-time tag-match hit in generateSinglePrediction.
+     *  The top-level BPU calls collectAndResetWayVisitCounts() at every
+     *  phase boundary to derive per-table stranded ratio. Upstream split
+     *  MicroTAGE out of BTBTAGE, so the SWAY counters (previously
+     *  inherited from BTBTAGE) live here now. See SWAY plan PENDING-9.
+     */
+    std::vector<std::vector<std::vector<uint32_t>>> wayVisitCnt;
+
+    struct WayPhaseSnapshot
+    {
+        std::string scope;      // e.g. "microtage_t3"
+        unsigned table;         // table id (0..numPredictors-1)
+        uint64_t totalWays;     // tableSizes[i] * numWays
+        uint64_t validWays;     // entries with valid set
+        uint64_t activeWays;    // entries with visit count > 0 this phase
+    };
+    std::vector<WayPhaseSnapshot> collectAndResetWayVisitCounts();
+
+  private:
+
     const unsigned maxBranchPositions;  // Maximum branch positions per 64-byte block
 
     // useful bit reset counter, when cnt >= 256, reset useful bit of all entries
