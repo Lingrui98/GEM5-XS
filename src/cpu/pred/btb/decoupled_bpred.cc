@@ -295,6 +295,10 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
              "SMT FTQ threshold (%u) exceeds total FTQ entries (%u)",
              smtFTQThreshold, ftqEntries);
 
+    // SWAY: profiling phase length is now a SimObject param so a single
+    // build can sweep W via -P system.cpu[0].branchPred.phaseSizeByInst=N.
+    phaseSizeByInst = p.phaseSizeByInst;
+    subPhaseRatio = p.subPhaseRatio;
     if (bpDBSwitches.size() > 0) {
         initDB();
     }
