@@ -68,6 +68,7 @@
 #include "cpu/reg_class.hh"
 #include "cpu/static_inst.hh"
 #include "cpu/translation.hh"
+#include "cpu/valuepred/valuepred_metadata.hh"
 #include "debug/CommitTrace.hh"
 #include "debug/DecoupleBP.hh"
 #include "debug/HtmCpu.hh"
@@ -242,6 +243,14 @@ class DynInst : public ExecContext, public RefCounted
         MaxFlags
     };
 
+  public:
+    enum class LoadPipeSource
+    {
+        IssueQueue,
+        ReplayQueue,
+        FastReplay
+    };
+
   private:
     /* An amalgamation of a lot of boolean values into one */
     std::bitset<MaxFlags> instFlags;
@@ -251,6 +260,12 @@ class DynInst : public ExecContext, public RefCounted
 
     /* replay type of this instruction */
     std::optional<LdStReplayType> replayType;
+    std::bitset<LdStReplayTypeCount> replayFlags;
+
+    LoadPipeSource loadPipeSource = LoadPipeSource::IssueQueue;
+
+    bool _hasProducerStorePC = false;
+    Addr _producerStorePC = 0;
 
   protected:
     /** The result of the instruction; assumes an instruction can have many
@@ -383,6 +398,22 @@ class DynInst : public ExecContext, public RefCounted
         replaceBits(byte, idx % 8, ready ? 1 : 0);
     }
 
+    void
+    setProducerStorePC(Addr pc)
+    {
+        _hasProducerStorePC = true;
+        _producerStorePC = pc;
+    }
+
+    bool hasProducerStorePC() const { return _hasProducerStorePC; }
+    Addr producerStorePC() const { return _producerStorePC; }
+
+    void clearProducerStorePC()
+    {
+        _hasProducerStorePC = false;
+        _producerStorePC = 0;
+    }
+
     /** The thread this instruction is from. */
     ThreadID threadNumber = 0;
 
@@ -395,10 +426,8 @@ class DynInst : public ExecContext, public RefCounted
 
     Addr fallThruPC;
 
-    /** fsqId and ftqId are used for squashing and committing */
+    /** ftqId is used for squashing and committing */
     /** The fetch stream queue ID of the instruction. */
-    unsigned fsqId;
-    /** The fetch target queue ID of the instruction. */
     unsigned ftqId;
     /** The number of loop iteration within an fsq entry of the instruction. */
     unsigned loopIteration;
@@ -433,6 +462,12 @@ class DynInst : public ExecContext, public RefCounted
     /** Store queue index. */
     ssize_t sqIdx = -1;
     typename LSQUnit::SQIterator sqIt;
+
+    /** Store-set predicted producing stores (for replay-based MDP). */
+    std::vector<InstSeqNum> mdpProducingStores;
+
+    /** Whether this load is predicted to strictly wait for prior store addrs. */
+    bool mdpPredStrictWait = false;
 
     /** If load data is from cache then it must be golden */
     uint8_t goldenData[8] = {0};
@@ -721,6 +756,7 @@ class DynInst : public ExecContext, public RefCounted
     bool isHInst()        const { return staticInst->isHInst(); }
     bool isStore()        const { return staticInst->isStore(); }
     bool isAtomic()       const { return staticInst->isAtomic(); }
+    bool isLoadReserved() const { return staticInst->isLoadReserved(); }
     bool isStoreConditional() const
     { return staticInst->isStoreConditional(); }
     bool isInstPrefetch() const { return staticInst->isInstPrefetch(); }
@@ -838,9 +874,6 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Clears the serializeAfter part of this instruction.*/
     void clearSerializeAfter() { status.reset(SerializeAfter); }
-
-    /** Checks if this serializeAfter is only temporarily set. */
-    bool isTempSerializeAfter() { return status[SerializeAfter]; }
 
     /** Sets the serialization part of this instruction as handled. */
     void setSerializeHandled() { status.set(SerializeHandled); }
@@ -1017,6 +1050,7 @@ class DynInst : public ExecContext, public RefCounted
                     (1 << SkipFollowingPipe));
         status.set(InPipe);
         clearReplayType();
+        clearReplayFlags();
     }
 
     void endPipelining() {
@@ -1029,6 +1063,7 @@ class DynInst : public ExecContext, public RefCounted
     bool cacheHit() const { return status[CacheHit]; }
 
     void setReplay(LdStReplayType type) {
+        markReplayFlag(type);
         setNeedReplay();
         replayType = type;
     }
@@ -1036,6 +1071,77 @@ class DynInst : public ExecContext, public RefCounted
         return replayType;
     }
     void clearReplayType() { replayType.reset(); }
+    void clearReplayFlags() { replayFlags.reset(); }
+    void markReplayFlag(LdStReplayType type) {
+        replayFlags.set(static_cast<size_t>(type));
+    }
+    bool hasReplayFlag(LdStReplayType type) const {
+        return replayFlags.test(static_cast<size_t>(type));
+    }
+    std::optional<LdStReplayType> selectReplayTypeFromFlags() const {
+        auto rtlReplayPriority = [](LdStReplayType type) -> int {
+            switch (type) {
+              case LdStReplayType::MdpAddrReplay:
+                return 2;  // C_MA
+              case LdStReplayType::TLBMissReplay:
+                return 3;  // C_TM
+              case LdStReplayType::STLFReplay:
+                return 4;  // C_FF
+              case LdStReplayType::CacheBlockedReplay:
+              case LdStReplayType::MshrAliasFailReplay:
+              case LdStReplayType::HitInWriteBufferReplay:
+              case LdStReplayType::MshrArbFailReplay:
+                return 5;  // C_DR
+              case LdStReplayType::CacheMissReplay:
+                return 6;  // C_DM
+              case LdStReplayType::BankConflictReplay:
+                return 8;  // C_BC
+              case LdStReplayType::RARReplay:
+                return 9;  // C_RAR
+              case LdStReplayType::RAWReplay:
+                return 10; // C_RAW
+              case LdStReplayType::NukeReplay:
+                return 11; // C_NK
+              default:
+                return 100 + static_cast<int>(type);
+            }
+        };
+
+        std::optional<LdStReplayType> selected;
+        int bestPriority = 1000;
+        for (int i = 0; i < LdStReplayTypeCount; ++i) {
+            auto type = static_cast<LdStReplayType>(i);
+            if (!replayFlags.test(i)) {
+                continue;
+            }
+
+            const int priority = rtlReplayPriority(type);
+            if (!selected || priority < bestPriority) {
+                selected = type;
+                bestPriority = priority;
+            }
+        }
+
+        if (selected) {
+            return selected;
+        }
+
+        return {};
+    }
+
+    bool finalizeReplayTypeFromFlags() {
+        auto selected = selectReplayTypeFromFlags();
+        if (!selected) {
+            return false;
+        }
+
+        replayType = *selected;
+        status.set(NeedReplay);
+        return true;
+    }
+
+    void setLoadPipeSource(LoadPipeSource source) { loadPipeSource = source; }
+    LoadPipeSource getLoadPipeSource() const { return loadPipeSource; }
 
     // only can be set once!!!
     void setNeedReplay() {
@@ -1055,6 +1161,9 @@ class DynInst : public ExecContext, public RefCounted
 
     void setSTLFReplay() { setReplay(LdStReplayType::STLFReplay); }
     bool needSTLFReplay() const { return getReplayType() == LdStReplayType::STLFReplay; }
+
+    void setMdpAddrReplay() { setReplay(LdStReplayType::MdpAddrReplay); }
+    bool needMdpAddrReplay() const { return getReplayType() == LdStReplayType::MdpAddrReplay; }
 
     void setNukeReplay() { setReplay(LdStReplayType::NukeReplay); }
     bool needNukeReplay() const { return getReplayType() == LdStReplayType::NukeReplay; }
@@ -1346,6 +1455,9 @@ class DynInst : public ExecContext, public RefCounted
     Tick lastWakeDependents = -1;
     Tick translatedTick = -1;
 
+    /** Dispatch age = dispatch cycle * 8 + dispatch position. */
+    uint64_t ageCtr = static_cast<uint64_t>(-1);
+
     Tick readyTick = -1;
     Tick completionTick = -1;
 
@@ -1559,18 +1671,6 @@ class DynInst : public ExecContext, public RefCounted
 
 
     void
-    setFsqId(unsigned id)
-    {
-        fsqId = id;
-    }
-
-    unsigned
-    getFsqId()
-    {
-        return fsqId;
-    }
-
-    void
     setFtqId(unsigned id)
     {
         ftqId = id;
@@ -1638,6 +1738,17 @@ class DynInst : public ExecContext, public RefCounted
 
     /** get golden */
     uint8_t *getGolden() { return goldenData; }
+
+    /** value prediction */
+    valuepred::VPResult vpResult = {false, 0xdeadbeefULL};
+
+    RegVal actualValue = 0xdeadbeefULL;
+    bool vpMisprediction = false;
+    bool vpSupported = false;
+
+    bool canLVP(){
+        return isLoad() && !isVector() && !isLoadReserved();
+    }
 };
 
 } // namespace o3

@@ -21,6 +21,8 @@ from common.xiangshan import *
 if __name__ == '__m5_main__':
 
     args = xiangshan_system_init()
+    # Keep kmhv2 runnable, but align with repo policy (BTB-only).
+    args.bp_type = 'DecoupledBPUWithBTB'
 
     # l1cache prefetcher use stream, stride
     # l2cache prefetcher use pht, bop, cmc
@@ -28,7 +30,6 @@ if __name__ == '__m5_main__':
     # disable l1 berti, l2 cdp
     args.l2_wrapper_hwp_type = "L2CompositeWithWorkerPrefetcher"
     args.kmh_align = True
-
     assert not args.external_memory_system
 
     test_mem_mode = 'timing'

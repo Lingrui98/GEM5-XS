@@ -16,6 +16,7 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/smt_sched.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/timebuf.hh"
 #include "params/BaseSelector.hh"
@@ -24,6 +25,7 @@
 #include "params/PAgeSelector.hh"
 #include "params/Scheduler.hh"
 #include "params/SpecWakeupChannel.hh"
+#include "sim/eventq.hh"
 #include "sim/sim_object.hh"
 
 namespace gem5
@@ -119,6 +121,7 @@ class IssueQue : public SimObject
 
     int numLoadPipe = 0;
     int numStorePipe = 0;
+    int loadPipeId = -1;
 
     struct select_policy
     {
@@ -166,10 +169,20 @@ class IssueQue : public SimObject
     std::vector<std::vector<std::pair<uint8_t, DynInstPtr>>> subDepGraph;
 
     std::queue<DynInstPtr> replayQ;  // only for mem
+    std::queue<DynInstPtr> vectorReadyQ;
+    std::queue<Tick> vectorReadyQReleaseTicks;
+    std::queue<bool> vectorReadyQReplay;
+    std::queue<DynInstPtr> vectorDelayedReadyQ;
+    std::queue<bool> vectorDelayedReadyQReplay;
+    std::unordered_set<InstSeqNum> vectorReadyQSeqs;
+    EventFunctionWrapper vectorReadyQEvent;
 
     CPU* cpu = nullptr;
     Scheduler* scheduler = nullptr;
     BaseSelector* selector = nullptr;
+
+    // iq per-thread occupancy counter, used for fetch-side feedback stats
+    InstsCounter* instsCounter = nullptr;
 
     struct IssueQueStats : public statistics::Group
     {
@@ -185,17 +198,22 @@ class IssueQue : public SimObject
         statistics::Vector portissued;
         statistics::Vector portBusy;
         statistics::Average avgInsts;
+        statistics::Vector instsNum;
     }* iqstats = nullptr;
 
     void replay(const DynInstPtr& inst);
     void addToFu(const DynInstPtr& inst);
     bool checkScoreboard(const DynInstPtr& inst);
+    bool isVectorMemInst(const DynInstPtr& inst) const;
+    void enqueueVectorMemDelay(const DynInstPtr& inst, bool replay);
+    void releaseVectorDelayedReadyQ();
     void issueToFu();
     void wakeUpDependents(const DynInstPtr& inst, bool speculative);
     void selectInst();
     void scheduleInst();
     void addIfReady(const DynInstPtr& inst);
     void cancel(const DynInstPtr& inst);
+    void processVectorReadyQ();
 
   public:
     inline void clearBusy(uint32_t pi) { portBusy.at(pi) = 0; }
@@ -205,6 +223,12 @@ class IssueQue : public SimObject
     void setCPU(CPU* cpu);
     void setMainRdpOpt(bool enable) { enableMainRdpOpt = enable; }
     void resetDepGraph(int numPhysRegs);
+
+    InstsCounter* getInstsCounter() const {return instsCounter; }
+
+    void incInIQInstsCounter(ThreadID tid);
+    void decInIQInstsCounter(ThreadID tid);
+    bool hasInstsCounter() const { return instsCounter != nullptr; }
 
     void tick();
     bool ready();
@@ -217,11 +241,15 @@ class IssueQue : public SimObject
     void retryMem(const DynInstPtr& inst);
     bool idle();
 
-    void doCommit(const InstSeqNum inst);
-    void doSquash(const InstSeqNum seqNum);
+    void doCommit(const InstSeqNum inst, ThreadID tid);
+    void doSquash(SquashInfo squashInfo);
+
+    bool hasReadyVectorInst() const { return !vectorDelayedReadyQ.empty(); }
+    DynInstPtr popReadyVectorInst();
 
     int getIssueStages() { return scheduleToExecDelay; }
     int getId() { return IQID; }
+    int getLoadPipeId() const { return loadPipeId; }
     // return IQ's name
     std::string getName() { return iqname; }
     // return gem5 simobject's name
@@ -260,7 +288,7 @@ class Scheduler : public SimObject
     CPU* cpu;
     MemDepUnit* memDepUnit;
     LSQ* lsq;
-    const int intel_fewops = 4;
+    const int intel_fewops = 8;
     bool old_disp = false;
     const int intRegfileBanks;
 
@@ -326,6 +354,7 @@ class Scheduler : public SimObject
     Scheduler(const SchedulerParams& params);
     void setCPU(CPU* cpu, LSQ* lsq);
     void resetDepGraph(uint64_t numPhysRegs);
+    void setAllScoreBoard(PhysRegIdPtr reg);
     void setMemDepUnit(MemDepUnit* memDepUnit) { this->memDepUnit = memDepUnit; }
     void setMainRdpOpt(bool enable);
 
@@ -333,7 +362,8 @@ class Scheduler : public SimObject
     void issueAndSelect();
     void lookahead(std::deque<DynInstPtr>& insts);
     bool ready(const DynInstPtr& inst, int disp_seq);
-    DynInstPtr getInstByDstReg(RegIndex flatIdx);
+    DynInstPtr getInstByDstReg(RegIndex flatIdx, ThreadID tid,
+                               InstSeqNum consumerSeqNum);
 
     void addProducer(const DynInstPtr& inst);
     // return true if insert successful
@@ -345,8 +375,9 @@ class Scheduler : public SimObject
     void useRfRdPort(const DynInstPtr& inst, const PhysRegIdPtr& regid, int typePortId, int pri);
     void useRfWrPort(const DynInstPtr& inst, const PhysRegIdPtr& regid, int typePortId, int pri);
 
+    void specWakeUpFromVP(const DynInstPtr& inst);
     void specWakeUpFromLoadPipe(const DynInstPtr& inst);
-    void loadCancel(const DynInstPtr& inst);
+    bool loadCancel(const DynInstPtr& inst);
 
     void writebackWakeup(const DynInstPtr& inst);
     void bypassWriteback(const DynInstPtr& inst);
@@ -355,9 +386,10 @@ class Scheduler : public SimObject
     uint32_t getCorrectedOpLat(const DynInstPtr& inst);
     bool hasReadyInsts();
     bool isDrained();
-    void doCommit(const InstSeqNum seqNum);
-    void doSquash(const InstSeqNum seqNum);
+    void doCommit(const InstSeqNum seqNum, ThreadID tid);
+    void doSquash(SquashInfo squashInfo);
     uint32_t getIQInsts();
+    uint32_t getIQInsts(ThreadID tid);
 
     SchedulerStats& getStats() { return stats; }
 };

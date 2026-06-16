@@ -7,13 +7,13 @@
 // Conditional includes based on build mode
 #ifdef UNIT_TEST
     #include "base/types.hh"
-    #include "cpu/pred/btb/stream_struct.hh"
+    #include "cpu/pred/btb/common.hh"
 #else
     #include "base/statistics.hh"
     #include "base/types.hh"
     #include "cpu/inst_seq.hh"
     #include "cpu/o3/dyn_inst_ptr.hh"
-    #include "cpu/pred/btb/stream_struct.hh"
+    #include "cpu/pred/btb/common.hh"
     #include "sim/sim_object.hh"
     #include "params/TimedBaseBTBPredictor.hh"
 #endif
@@ -61,32 +61,36 @@ class TimedBaseBTBPredictor: public SimObject
                               const boost::dynamic_bitset<> &history,
                               std::vector<FullBTBPrediction> &stagePreds) {}
 
-    virtual std::shared_ptr<void> getPredictionMeta() { return nullptr; }
+    virtual std::shared_ptr<void> getPredictionMeta(ThreadID tid = 0)
+    {
+        return nullptr;
+    }
 
-    virtual void specUpdateHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred) {}
-    virtual void specUpdatePHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred) {}
-    virtual void specUpdateBwHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred) {}
-    virtual void specUpdateIHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred) {}
-    virtual void specUpdateLHist(const std::vector<boost::dynamic_bitset<>> &history, FullBTBPrediction &pred) {}
-    virtual void recoverHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt, bool cond_taken) {}
-    virtual void recoverPHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt, bool cond_taken) {}
-    virtual void recoverBwHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt, bool cond_taken) {}
-    virtual void recoverIHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt, bool cond_taken) {}
-    virtual void recoverLHist(const std::vector<boost::dynamic_bitset<>> &history, const FetchStream &entry, int shamt, bool cond_taken) {}
-    virtual void update(const FetchStream &entry) {}
+    virtual void specUpdateGHist(const boost::dynamic_bitset<> &history,
+                                FullBTBPrediction &pred,
+                                const DirectionHistoryUpdate &update) {}
+    virtual void specUpdatePHist(const boost::dynamic_bitset<> &history,
+                                 FullBTBPrediction &pred,
+                                 const PathHistoryUpdate &update) {}
+    virtual void recoverHist(const boost::dynamic_bitset<> &history,
+                             const FetchTarget &entry, int shamt,
+                             bool cond_taken) {}
+    virtual void recoverPHist(const boost::dynamic_bitset<> &history,
+                              const FetchTarget &entry,
+                              const PathHistoryUpdate &update) {}
+    virtual void update(const FetchTarget &entry) {}
     virtual unsigned getDelay() {return numDelay;}
     virtual bool getResolvedUpdate() {return resolvedUpdate;}
     // Two-phase resolved update: probe first, then apply
-    virtual bool canResolveUpdate(const FetchStream &entry) { return true; }
-    virtual void doResolveUpdate(const FetchStream &entry) { update(entry); }
+    virtual bool canResolveUpdate(const FetchTarget &entry) { return true; }
+    virtual void doResolveUpdate(const FetchTarget &entry) { update(entry); }
 #ifndef UNIT_TEST
     // do some statistics on a per-branch and per-predictor basis
-    virtual void commitBranch(const FetchStream &entry, const DynInstPtr &inst) {}
+    virtual void commitBranch(const FetchTarget &entry, const DynInstPtr &inst) {}
 #endif
 
     int componentIdx{0};
     unsigned aheadPipelinedStages{0};
-    bool needMoreHistories{false};
     int getComponentIdx() { return componentIdx; }
     void setComponentIdx(int idx) { componentIdx = idx; }
 

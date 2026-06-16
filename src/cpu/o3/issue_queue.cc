@@ -18,6 +18,7 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/inst_queue.hh"
 #include "cpu/reg_class.hh"
 #include "debug/Counters.hh"
 #include "debug/Dispatch.hh"
@@ -142,6 +143,9 @@ PAgeSelector::select(ReadyQue::iterator begin, int portid)
 bool
 IssueQue::select_policy::operator()(const DynInstPtr& a, const DynInstPtr& b) const
 {
+    if (a->ageCtr != b->ageCtr) {
+        return a->ageCtr < b->ageCtr;
+    }
     return a->seqNum < b->seqNum;
 }
 
@@ -171,7 +175,8 @@ IssueQue::IssueQueStats::IssueQueStats(statistics::Group* parent, IssueQue* que,
       ADD_STAT(issueDist, statistics::units::Count::get(), "distruibution of issue"),
       ADD_STAT(portissued, statistics::units::Count::get(), "count each port issues"),
       ADD_STAT(portBusy, statistics::units::Count::get(), "count each port busy cycles"),
-      ADD_STAT(avgInsts, statistics::units::Count::get(), "average insts")
+      ADD_STAT(avgInsts, statistics::units::Count::get(), "average insts"),
+      ADD_STAT(instsNum, statistics::units::Count::get(), "insts per thread")
 {
     insertDist.init(que->inports + 1).flags(statistics::nozero);
     issueDist.init(que->outports + 1).flags(statistics::nozero);
@@ -182,6 +187,7 @@ IssueQue::IssueQueStats::IssueQueStats(statistics::Group* parent, IssueQue* que,
     loadmiss.flags(statistics::nozero);
     arbFailed.flags(statistics::nozero);
     issueOccupy.flags(statistics::nozero);
+    instsNum.flags(statistics::nozero);
 }
 
 IssueQue::IssueQue(const IssueQueParams& params)
@@ -192,8 +198,21 @@ IssueQue::IssueQue(const IssueQueParams& params)
       scheduleToExecDelay(params.scheduleToExecDelay),
       iqname(params.name),
       inflightIssues(scheduleToExecDelay, 0),
+      vectorReadyQEvent([this]() { processVectorReadyQ(); },
+                        csprintf("%s.vectorReadyQEvent", params.name)),
       selector(params.sel)
 {
+    // TODO: keep this in sync with the current load IQ naming convention.
+    // This should become an explicit IssueQue parameter when the config grows
+    // more load pipes or renames the queues.
+    if (iqname == "ld0" || iqname == "load0") {
+        loadPipeId = 0;
+    } else if (iqname == "ld1" || iqname == "load1") {
+        loadPipeId = 1;
+    } else if (iqname == "ld2" || iqname == "load2") {
+        loadPipeId = 2;
+    }
+
     toIssue = inflightIssues.getWire(0);
     toFu = inflightIssues.getWire(-scheduleToExecDelay);
     if (outports > 8) {
@@ -300,6 +319,9 @@ IssueQue::IssueQue(const IssueQueParams& params)
         if (storePipeAcc)
             numStorePipe++;
     }
+
+    //Init InstsCounter
+    instsCounter = new InstsCounter();
 }
 
 void
@@ -308,6 +330,7 @@ IssueQue::setCPU(CPU* cpu)
     this->cpu = cpu;
     _name = cpu->name() + ".scheduler." + getName();
     iqstats = new IssueQueStats(cpu, this, "scheduler." + this->getName());
+    iqstats->instsNum.init(cpu->numThreads);
 }
 
 void
@@ -326,9 +349,11 @@ IssueQue::checkScoreboard(const DynInstPtr& inst)
         }
         // check bypass data ready or not
         if (!scheduler->bypassScoreboard[src->flatIndex()]) [[unlikely]] {
-            auto dst_inst = scheduler->getInstByDstReg(src->flatIndex());
+            auto dst_inst = scheduler->getInstByDstReg(src->flatIndex(),
+                                                       inst->threadNumber,
+                                                       inst->seqNum);
             assert(dst_inst);
-            if (!dst_inst->isLoad()) panic("dst[sn:%llu] is not load", dst_inst->seqNum);
+            if (!dst_inst->isLoad()) panic("dst[sn:%llu] is not load, src[sn:%llu]", dst_inst->seqNum, inst->seqNum);
             warn_once(
                 "Tt's should not happen on classic cache, it may be wrong delay of load wake or missed loadcancel in "
                 "lsq\n");
@@ -349,7 +374,111 @@ IssueQue::addToFu(const DynInstPtr& inst)
     }
     inst->setIssued();
     POPINST(inst);
+    if (hasInstsCounter()) {
+        decInIQInstsCounter(inst->threadNumber);
+    }
     scheduler->addToFU(inst);
+}
+
+bool
+IssueQue::isVectorMemInst(const DynInstPtr& inst) const
+{
+    return inst && inst->isVector() && inst->isMemRef() && !inst->isSquashed();
+}
+
+void
+IssueQue::enqueueVectorMemDelay(const DynInstPtr& inst, bool replay)
+{
+    if (!isVectorMemInst(inst) || (!replay && inst->canceled())) {
+        return;
+    }
+
+    if (!vectorReadyQSeqs.insert(inst->seqNum).second) {
+        return;
+    }
+
+    assert(cpu);
+    const Tick releaseTick = cpu->clockEdge(Cycles(3));
+    const bool needSchedule = vectorReadyQ.empty();
+    vectorReadyQ.push(inst);
+    vectorReadyQReleaseTicks.push(releaseTick);
+    vectorReadyQReplay.push(replay);
+    DPRINTF(Schedule,
+            "[sn:%llu] add to vectorReadyQ, replay:%d, release at %llu\n",
+            inst->seqNum, replay, releaseTick);
+
+    if (needSchedule && !vectorReadyQEvent.scheduled()) {
+        cpu->schedule(vectorReadyQEvent, releaseTick);
+    }
+}
+
+void
+IssueQue::releaseVectorDelayedReadyQ()
+{
+    assert(vectorDelayedReadyQ.size() == vectorDelayedReadyQReplay.size());
+    while (!vectorDelayedReadyQ.empty() && !vectorDelayedReadyQReplay.empty()) {
+        auto inst = vectorDelayedReadyQ.front();
+        const bool replay = vectorDelayedReadyQReplay.front();
+        vectorDelayedReadyQ.pop();
+        vectorDelayedReadyQReplay.pop();
+
+        if (!inst || inst->isSquashed() || (!replay && inst->canceled())) {
+            if (inst) {
+                vectorReadyQSeqs.erase(inst->seqNum);
+            }
+            continue;
+        }
+
+        vectorReadyQSeqs.erase(inst->seqNum);
+        if (replay) {
+            replayQ.push(inst);
+            DPRINTF(Schedule, "[sn:%llu] released to replayQ after vector delay\n",
+                    inst->seqNum);
+        } else {
+            inst->clearCancel();
+            if (!inst->inReadyQ()) {
+                READYQ_PUSH(inst);
+                DPRINTF(Schedule,
+                        "[sn:%llu] released to readyQ after vector delay\n",
+                        inst->seqNum);
+            }
+        }
+    }
+}
+
+void
+IssueQue::processVectorReadyQ()
+{
+    assert(vectorReadyQ.size() == vectorReadyQReleaseTicks.size());
+    assert(vectorReadyQ.size() == vectorReadyQReplay.size());
+    while (!vectorReadyQ.empty() && !vectorReadyQReleaseTicks.empty() &&
+           !vectorReadyQReplay.empty() &&
+           vectorReadyQReleaseTicks.front() <= curTick()) {
+        auto inst = vectorReadyQ.front();
+        const bool replay = vectorReadyQReplay.front();
+        vectorReadyQ.pop();
+        vectorReadyQReleaseTicks.pop();
+        vectorReadyQReplay.pop();
+
+        if (!inst || inst->isSquashed() || (!replay && inst->canceled())) {
+            if (inst) {
+                vectorReadyQSeqs.erase(inst->seqNum);
+            }
+            continue;
+        }
+
+        vectorDelayedReadyQ.push(inst);
+        vectorDelayedReadyQReplay.push(replay);
+        DPRINTF(Schedule, "[sn:%llu] moved to vectorDelayedReadyQ, replay:%d\n",
+                inst->seqNum, replay);
+    }
+
+    if (!vectorReadyQ.empty() && !vectorReadyQReleaseTicks.empty() &&
+        !vectorReadyQEvent.scheduled()) {
+        cpu->schedule(vectorReadyQEvent, vectorReadyQReleaseTicks.front());
+    }
+
+    releaseVectorDelayedReadyQ();
 }
 
 void
@@ -405,7 +534,7 @@ IssueQue::issueToFu()
             incTagRefillBlockStats = true;
         }
 
-        if ((i + replayed >= outports) || (inst->isLoad() && (issuedLoad >= numLoadPipe)) ||
+        if ((issued >= outports) || (inst->isLoad() && (issuedLoad >= numLoadPipe)) ||
             (inst->isStore() && (issuedStore >= numStorePipe)) || blockLoad) {
             inst->clearScheduled();
             // only for load/store
@@ -444,7 +573,24 @@ IssueQue::retryMem(const DynInstPtr& inst)
 {
     assert(!inst->isNonSpeculative());
     iqstats->retryMem++;
+    if (inst->isLoad()) {
+        const auto replay_type = inst->getReplayType();
+        const bool is_fast_replay = replay_type &&
+            (*replay_type == LdStReplayType::BankConflictReplay ||
+             *replay_type == LdStReplayType::MshrArbFailReplay ||
+             *replay_type == LdStReplayType::MshrAliasFailReplay ||
+             *replay_type == LdStReplayType::HitInWriteBufferReplay ||
+             *replay_type == LdStReplayType::NukeReplay);
+
+        inst->setLoadPipeSource(is_fast_replay ?
+            DynInst::LoadPipeSource::FastReplay :
+            DynInst::LoadPipeSource::ReplayQueue);
+    }
     DPRINTF(Schedule, "retry %s [sn:%llu]\n", enums::OpClassStrings[inst->opClass()], inst->seqNum);
+    if (isVectorMemInst(inst)) {
+        enqueueVectorMemDelay(inst, true);
+        return;
+    }
     replayQ.push(inst);
 }
 
@@ -458,6 +604,8 @@ IssueQue::idle()
         }
     }
     idle |= replayQ.size() > 0;
+    idle |= vectorReadyQ.size() > 0;
+    idle |= vectorDelayedReadyQ.size() > 0;
     return idle;
 }
 
@@ -488,14 +636,16 @@ IssueQue::wakeUpDependents(const DynInstPtr& inst, bool speculative)
         for (auto& it : depgraph) {
             int srcIdx = it.first;
             auto& consumer = it.second;
-            if (consumer->readySrcIdx(srcIdx)) {
-                continue;
+            if (consumer->threadNumber == inst->threadNumber){
+                if (consumer->readySrcIdx(srcIdx)) {
+                    continue;
+                }
+                consumer->markSrcRegReady(srcIdx);
+
+
+                DPRINTF(Schedule, "[sn:%llu] src%d was woken\n", consumer->seqNum, srcIdx);
+                addIfReady(consumer);
             }
-            consumer->markSrcRegReady(srcIdx);
-
-
-            DPRINTF(Schedule, "[sn:%llu] src%d was woken\n", consumer->seqNum, srcIdx);
-            addIfReady(consumer);
         }
 
         if (!speculative) {
@@ -507,6 +657,10 @@ IssueQue::wakeUpDependents(const DynInstPtr& inst, bool speculative)
 void
 IssueQue::addIfReady(const DynInstPtr& inst)
 {
+    if (inst->isIssued()) {
+        return;
+    }
+
     if (inst->readyToIssue()) {
         if (inst->readyTick == -1) {
             inst->readyTick = curTick();
@@ -523,10 +677,16 @@ IssueQue::addIfReady(const DynInstPtr& inst)
             }
         }
 
+
+
         DPRINTF(Schedule, "[sn:%llu] add to readyInstsQue\n", inst->seqNum);
         inst->clearCancel();
         if (!inst->inReadyQ()) {
-            READYQ_PUSH(inst);
+            if (isVectorMemInst(inst)) {
+                enqueueVectorMemDelay(inst, false);
+            } else {
+                READYQ_PUSH(inst);
+            }
         }
     }
 }
@@ -552,6 +712,11 @@ IssueQue::selectInst()
     selectQ.clear();
     for (int pi = 0; pi < outports; pi++) {
         auto readyQ = readyQs[pi];
+        for (auto it = readyQ->begin(); it != readyQ->end(); ++it) {
+            DPRINTF(Schedule, "readyQ for port %d has [sn:%llu] %s [tid:%u]\n", pi, (*it)->seqNum,
+                    (*it)->genDisassembly(), (*it)->threadNumber);
+        }
+
         selector->begin(readyQ);
         for (auto it = selector->select(readyQ->begin(), pi); it != readyQ->end(); it = selector->select(it, pi)) {
             auto& inst = *it;
@@ -565,7 +730,6 @@ IssueQue::selectInst()
             uint64_t busy_bit = (lat > 63 ? -1 : (1llu << lat));
             if (!(portBusy[pi] & busy_bit)) {
                 DPRINTF(Schedule, "[sn %ld] was selected\n", inst->seqNum);
-
                 // get regfile write port
                 for (int i = 0; i < inst->numDestRegs(); i++) {
                     auto pdst = inst->renamedDestIdx(i);
@@ -661,6 +825,7 @@ IssueQue::tick()
     instNumInsert = 0;
 
     scheduleInst();
+    processVectorReadyQ();
     inflightIssues.advance();
 
     for (auto& t : portBusy) {
@@ -692,10 +857,15 @@ IssueQue::insert(const DynInstPtr& inst)
 
     cpu->perfCCT->updateInstPos(inst->seqNum, PerfRecord::AtIssueQue);
 
-    DPRINTF(Schedule, "[sn:%llu] %s insert into %s\n", inst->seqNum, enums::OpClassStrings[inst->opClass()], iqname);
+    DPRINTF(Schedule, "[tid:%u] [sn:%llu] %s insert into %s\n",
+            inst->threadNumber, inst->seqNum,
+            enums::OpClassStrings[inst->opClass()], iqname);
     selector->allocate(inst);
     inst->issueQue = this;
     instList.emplace_back(inst);
+    if (hasInstsCounter()) {
+        incInIQInstsCounter(inst->threadNumber);
+    }
     bool addToDepGraph = false;
     for (int i = 0; i < inst->numSrcRegs(); i++) {
         auto src = inst->renamedSrcIdx(i);
@@ -741,21 +911,60 @@ IssueQue::insertNonSpec(const DynInstPtr& inst)
     }
 }
 
-void
-IssueQue::doCommit(const InstSeqNum seqNum)
+DynInstPtr
+IssueQue::popReadyVectorInst()
 {
-    while (!instList.empty() && instList.front()->seqNum <= seqNum) {
-        assert(instList.front()->isIssued());
-        instList.pop_front();
+    assert(vectorDelayedReadyQ.size() == vectorDelayedReadyQReplay.size());
+    while (!vectorDelayedReadyQ.empty() && !vectorDelayedReadyQReplay.empty()) {
+        auto inst = vectorDelayedReadyQ.front();
+        vectorDelayedReadyQ.pop();
+        vectorDelayedReadyQReplay.pop();
+
+        if (!inst) {
+            continue;
+        }
+
+        vectorReadyQSeqs.erase(inst->seqNum);
+
+        if (inst->isSquashed()) {
+            continue;
+        }
+
+        return inst;
     }
+
+    return nullptr;
 }
 
 void
-IssueQue::doSquash(const InstSeqNum seqNum)
+IssueQue::doCommit(const InstSeqNum seqNum, ThreadID tid)
 {
     for (auto it = instList.begin(); it != instList.end();) {
-        if ((*it)->seqNum > seqNum) {
+        const auto &inst = *it;
+        if (inst->threadNumber == tid && inst->seqNum <= seqNum) {
+            assert(inst->isIssued());
+            vectorReadyQSeqs.erase(inst->seqNum);
+            it = instList.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // while (!instList.empty() && instList.front()->seqNum <= seqNum) {
+    //     assert(instList.front()->isIssued());
+    //     vectorReadyQSeqs.erase(instList.front()->seqNum);
+    //     instList.pop_front();
+    // }
+}
+
+void
+IssueQue::doSquash(SquashInfo squashInfo)
+{
+    for (auto it = instList.begin(); it != instList.end();) {
+        if (((*it)->seqNum > squashInfo.squashSn) && ((*it)->threadNumber == squashInfo.squashTid)) {
             if (!(*it)->isIssued()) {
+                if (hasInstsCounter()) {
+                    decInIQInstsCounter((*it)->threadNumber);
+                }
                 POPINST((*it));
                 (*it)->setIssued();
             }
@@ -767,6 +976,7 @@ IssueQue::doSquash(const InstSeqNum seqNum)
             (*it)->setCanCommit();
             (*it)->clearScheduled();
             (*it)->setCancel();
+            vectorReadyQSeqs.erase((*it)->seqNum);
             it = instList.erase(it);
             assert(instList.size() >= instNum);
         } else {
@@ -778,7 +988,7 @@ IssueQue::doSquash(const InstSeqNum seqNum)
         int size = inflightIssues[-i].size;
         for (int j = 0; j < size; j++) {
             auto& inst = inflightIssues[-i].insts[j];
-            if (inst && inst->isSquashed()) {
+            if (inst && inst->isSquashed() && (inst->threadNumber == squashInfo.squashTid)) {
                 inst = nullptr;
             }
         }
@@ -787,12 +997,33 @@ IssueQue::doSquash(const InstSeqNum seqNum)
     // clear in depGraph
     for (auto& entrys : subDepGraph) {
         for (auto it = entrys.begin(); it != entrys.end();) {
-            if ((*it).second->isSquashed()) {
+            if ((*it).second->isSquashed() && ((*it).second->threadNumber == squashInfo.squashTid)) {
                 it = entrys.erase(it);
             } else {
                 it++;
             }
         }
+    }
+}
+
+void
+IssueQue::incInIQInstsCounter(ThreadID tid)
+{
+    if (instsCounter) {
+        instsCounter->incCounter(tid);
+        DPRINTF(Schedule, "Thread %d: incInIQInstsCounter to %d\n", tid, instsCounter->getCounter(tid));
+    }
+    if (iqstats) {
+        iqstats->instsNum[tid]++;
+    }
+}
+
+void
+IssueQue::decInIQInstsCounter(ThreadID tid)
+{
+    if (instsCounter) {
+        instsCounter->decCounter(tid);
+        DPRINTF(Schedule, "Thread %d: decInIQInstsCounter to %d\n", tid, instsCounter->getCounter(tid));
     }
 }
 
@@ -994,6 +1225,7 @@ Scheduler::setCPU(CPU* cpu, LSQ* lsq)
     this->lsq = lsq;
     for (auto it : issueQues) {
         it->setCPU(cpu);
+        it->selector->setparent(this, it);
     }
 }
 
@@ -1006,6 +1238,13 @@ Scheduler::resetDepGraph(uint64_t numPhysRegs)
     for (auto it : issueQues) {
         it->resetDepGraph(numPhysRegs);
     }
+}
+
+void
+Scheduler::setAllScoreBoard(PhysRegIdPtr reg) {
+    scoreboard[reg->flatIndex()] = true;
+    bypassScoreboard[reg->flatIndex()] = true;
+    earlyScoreboard[reg->flatIndex()] = true;
 }
 
 void
@@ -1047,8 +1286,6 @@ Scheduler::issueAndSelect()
     }
     if (instsToFu.size() < intel_fewops) {
         stats.exec_stall_cycle++;
-        if (lsq->anyStoreNotExecute())
-            stats.memstall_any_store++;
     }
     if (instsToFu.size() == 0) {
         int misslevel = lsq->anyInflightLoadsNotComplete();
@@ -1060,6 +1297,9 @@ Scheduler::issueAndSelect()
             stats.memstall_l2miss++;
         if ((misslevel & ((1 << 3) - 1)) == ((1 << 3) - 1))
             stats.memstall_l3miss++;
+    } else if (instsToFu.size() < intel_fewops) {
+        if (lsq->anyStoreNotExecute())
+            stats.memstall_any_store++;
     }
 }
 
@@ -1135,18 +1375,28 @@ Scheduler::ready(OpClass op, int disp_seq)
 }
 
 DynInstPtr
-Scheduler::getInstByDstReg(RegIndex flatIdx)
+Scheduler::getInstByDstReg(RegIndex flatIdx, ThreadID tid,
+                           InstSeqNum consumerSeqNum)
 {
+    DynInstPtr candidate = nullptr;
+
     for (auto iq : issueQues) {
-        for (auto& inst : iq->instList) {
-            for (auto i = 0; i < inst->numDestRegs(); i++) {
-                if (inst->renamedDestIdx(i)->flatIndex() == flatIdx) {
-                    return inst;
+        for (auto &inst : iq->instList) {
+            if (inst->threadNumber != tid || inst->seqNum >= consumerSeqNum) {
+                continue;
+            }
+            for (int i = 0; i < inst->numDestRegs(); i++) {
+                if (inst->renamedDestIdx(i)->flatIndex() != flatIdx) {
+                    continue;
+                }
+                if (!candidate || inst->seqNum > candidate->seqNum) {
+                    candidate = inst;
                 }
             }
         }
     }
-    return nullptr;
+
+    return candidate;
 }
 
 void
@@ -1193,7 +1443,7 @@ Scheduler::insert(const DynInstPtr& inst, int disp_seq)
         iqs[dispSeqVec.at(disp_seq)]->insert(inst);
     }
 
-    DPRINTF(Schedule, "[sn:%llu] dispatch: %s\n", inst->seqNum, inst->staticInst->disassemble(0));
+    DPRINTF(Schedule, "[sn:%llu] scheduler insert: %s\n", inst->seqNum, inst->staticInst->disassemble(0));
 }
 
 void
@@ -1246,6 +1496,32 @@ Scheduler::specWakeUpDependents(const DynInstPtr& inst, IssueQue* from_issue_que
             specWakeEvents[inst->seqNum].insert(wakeEvent);
             cpu->schedule(wakeEvent, cpu->clockEdge(Cycles(wakeDelay)) - 1);
         }
+    }
+}
+
+void
+Scheduler::specWakeUpFromVP(const DynInstPtr& inst)
+{
+    DPRINTF(Schedule, "[sn:%llu] VP speculative wakeup dependents\n", inst->seqNum);
+    // Wake consumers already in IQ via speculative wakeup (preserves subDepGraph)
+    for (auto to : issueQues) {
+        to->wakeUpDependents(inst, true);  // speculative=true -> depgraph preserved
+    }
+    // Set earlyScoreboard + bypassScoreboard (but NOT scoreboard) so that
+    // future consumers entering IQ via insert() will:
+    //   - see scoreboard[src]=false -> enter the else branch
+    //   - see earlyScoreboard[src]=true -> markSrcRegReady AND added to subDepGraph
+    // This ensures loadCancel DFS can find them.
+    for (int i = 0; i < inst->numDestRegs(); i++) {
+        PhysRegIdPtr dst = inst->renamedDestIdx(i);
+        if (dst->isFixedMapping()) [[unlikely]] {
+            continue;
+        }
+        earlyScoreboard[dst->flatIndex()] = true;
+        bypassScoreboard[dst->flatIndex()] = true;
+        // NOTE: intentionally NOT setting scoreboard[dst] = true
+        // so consumers go through the earlyScoreboard path in insert()
+        // which adds them to subDepGraph
     }
 }
 
@@ -1351,13 +1627,21 @@ Scheduler::useRfWrPort(const DynInstPtr& inst, const PhysRegIdPtr& regid, int ty
     t_lat = lat;
 }
 
-void
+bool
 Scheduler::loadCancel(const DynInstPtr& inst)
 {
     DPRINTF(Schedule, "[sn:%llu] %s cache miss, cancel consumers\n", inst->seqNum,
             enums::OpClassStrings[inst->opClass()]);
     if (inst->issueQue) {
         inst->issueQue->iqstats->loadmiss++;
+    }
+
+    bool needSquashFallback = false;
+
+    // For VP load: if prediction is correct (no misprediction), skip cancel.
+    // If VP misprediction detected, allow DFS to cancel dependent consumers.
+    if (inst->vpResult.speculative && !inst->vpMisprediction) {
+        return false;
     }
 
     dfs.push(inst);
@@ -1380,12 +1664,26 @@ Scheduler::loadCancel(const DynInstPtr& inst)
                 for (auto& it : iq->subDepGraph[dst->flatIndex()]) {
                     int srcIdx = it.first;
                     auto& depInst = it.second;
-                    if (depInst->readySrcIdx(srcIdx)) {
-                        DPRINTF(Schedule, "cancel [sn:%llu], clear src p%d ready\n", depInst->seqNum,
-                                depInst->renamedSrcIdx(srcIdx)->flatIndex());
-                        depInst->issueQue->cancel(depInst);
-                        depInst->clearSrcRegReady(srcIdx);
-                        dfs.push(depInst);
+                    if (depInst->threadNumber == inst->threadNumber) {
+                        if (depInst->readySrcIdx(srcIdx)) {
+                            DPRINTF(Schedule, "cancel [sn:%llu], clear src p%d ready\n", depInst->seqNum,
+                                    depInst->renamedSrcIdx(srcIdx)->flatIndex());
+                            if (depInst->isIssued()) {
+                                if (inst->vpMisprediction) {
+                                    // VP misprediction: consumer may already be in-flight.
+                                    // Mark canceled and propagate to its dependents.
+                                    depInst->setCancel();
+                                    depInst->clearSrcRegReady(srcIdx);
+                                    dfs.push(depInst);
+                                    needSquashFallback = true;
+                                }
+                                continue;
+                            }
+
+                            depInst->issueQue->cancel(depInst);
+                            depInst->clearSrcRegReady(srcIdx);
+                            dfs.push(depInst);
+                        }
                     }
                 }
             }
@@ -1403,6 +1701,8 @@ Scheduler::loadCancel(const DynInstPtr& inst)
             }
         }
     }
+
+    return needSquashFallback;
 }
 
 void
@@ -1438,6 +1738,18 @@ Scheduler::bypassWriteback(const DynInstPtr& inst)
         }
         bypassScoreboard[dst->flatIndex()] = true;
         DPRINTF(Schedule, "p%lu in bypassNetwork ready\n", dst->flatIndex());
+    }
+    if (inst->canLVP()) {
+        RegVal actualValue = cpu->getReg(inst->extRenamedDestIdx(0));
+        inst->actualValue = actualValue;
+        inst->vpMisprediction = false;
+        if (inst->vpResult.speculative && inst->fault == NoFault &&
+            actualValue != inst->vpResult.value) {
+            DPRINTF(Schedule, "actual value: 0x%lx, predicted value: 0x%lx pc %lx\n", actualValue,
+                    inst->vpResult.value, inst->pcState().instAddr());
+            inst->vpMisprediction = true;
+            inst->vpResult.speculative = false;
+        }
     }
 }
 
@@ -1486,19 +1798,19 @@ Scheduler::isDrained()
 }
 
 void
-Scheduler::doCommit(const InstSeqNum seqNum)
+Scheduler::doCommit(const InstSeqNum seqNum, ThreadID tid)
 {
     for (auto it : issueQues) {
-        it->doCommit(seqNum);
+        it->doCommit(seqNum, tid);
     }
 }
 
 void
-Scheduler::doSquash(const InstSeqNum seqNum)
+Scheduler::doSquash(SquashInfo squashInfo)
 {
-    DPRINTF(Schedule, "doSquash until seqNum %lu\n", seqNum);
+    DPRINTF(Schedule, "doSquash until seqNum %lu\n", squashInfo.squashSn);
     for (auto it : issueQues) {
-        it->doSquash(seqNum);
+        it->doSquash(squashInfo);
     }
 }
 
@@ -1511,6 +1823,17 @@ Scheduler::getIQInsts()
     }
     return total;
 }
+
+uint32_t
+Scheduler::getIQInsts(ThreadID tid)
+{
+    uint32_t total = 0;
+    for (auto iq : issueQues) {
+        total += iq->getInstsCounter()->getCounter(tid);;
+    }
+    return total;
+}
+
 
 void
 Scheduler::setMainRdpOpt(bool enable)

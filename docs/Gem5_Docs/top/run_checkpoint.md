@@ -46,9 +46,9 @@ export PATH=/nfs/home/yanyue/tools/parallel/parallel-20240722/src:$PATH
 
 ```c
 cd gem5/util/xs_scripts/example
-bash ../kmh_6wide.sh /nfs/share/zyy/spec06_rv64gcb_O3_20m_gcc12.2.0-intFpcOff-jeMalloc/zstd-checkpoint-0-0-0/astar_biglakes/31/_31_0.016784_.zstd
+bash ../kmh_v3_btb.sh /nfs/share/zyy/spec06_rv64gcb_O3_20m_gcc12.2.0-intFpcOff-jeMalloc/zstd-checkpoint-0-0-0/astar_biglakes/31/_31_0.016784_.zstd
 等价于
-command line: /nfs/home/yanyue/workspace/GEM5-internal/build/RISCV/gem5.opt /nfs/home/yanyue/workspace/GEM5-internal/configs/example/xiangshan.py --generic-rv-cpt=/nfs/share/zyy/spec06_rv64gcb_O3_20m_gcc12.2.0-intFpcOff-jeMalloc/zstd-checkpoint-0-0-0/astar_biglakes/31/_31_0.016784_.zstd
+command line: /nfs/home/yanyue/workspace/GEM5-internal/build/RISCV/gem5.opt /nfs/home/yanyue/workspace/GEM5-internal/configs/example/kmhv3.py --generic-rv-cpt=/nfs/share/zyy/spec06_rv64gcb_O3_20m_gcc12.2.0-intFpcOff-jeMalloc/zstd-checkpoint-0-0-0/astar_biglakes/31/_31_0.016784_.zstd
 ```
 
 f. 之后会具体怎么跑，如何和nemu来进行对比的？需要详细看看
@@ -60,7 +60,7 @@ cd gem5/util/xs_scripts/example1
 
 /nfs/share/zyy/spec06_rv64gcb_O3_20m_gcc12.2.0-intFpcOff-jeMalloc
 
-bash ../parallel_sim.sh `realpath ../kmh_6wide.sh` /nfs/share/zyy/spec06_rv64gcb_O3_20m_gcc12.2.0-intFpcOff-jeMalloc/zstd-checkpoint-0-0-0/checkpoint-0-0-0.lst /nfs/share/zyy/spec06_rv64gcb_O3_20m_gcc12.2.0-intFpcOff-jeMalloc yanyue
+bash ../parallel_sim.sh `realpath ../kmh_v3_btb.sh` /nfs/share/zyy/spec06_rv64gcb_O3_20m_gcc12.2.0-intFpcOff-jeMalloc/zstd-checkpoint-0-0-0/checkpoint-0-0-0.lst /nfs/share/zyy/spec06_rv64gcb_O3_20m_gcc12.2.0-intFpcOff-jeMalloc yanyue
 # 修改了parallel_sim 中线程数为127， 可以改到192的，先跑一下试试吧
 
 ```
@@ -74,11 +74,11 @@ bash ../parallel_sim.sh `realpath ../kmh_6wide.sh` /nfs/share/zyy/spec06_rv64gcb
 cd workspace/GEM5-internal/util/xs_scripts/example1/
 
 export FP_PATH=/nfs/home/hebo/test/kunminghu-fp/8ff1bd8e38aaee3a26048c594c815a6c
-# bash ../parallel_sim.sh `realpath ../kmh_6wide.sh` /nfs/home/hebo/test/kunminghu-fp/8ff1bd8e38aaee3a26048c594c815a6c/checkpoint-0-0-0/checkpoint-0-0-0.lst /nfs/home/hebo/test/kunminghu-fp/8ff1bd8e38aaee3a26048c594c815a6c/checkpoint-0-0-0 test0
+# bash ../parallel_sim.sh `realpath ../kmh_v3_btb.sh` /nfs/home/hebo/test/kunminghu-fp/8ff1bd8e38aaee3a26048c594c815a6c/checkpoint-0-0-0/checkpoint-0-0-0.lst /nfs/home/hebo/test/kunminghu-fp/8ff1bd8e38aaee3a26048c594c815a6c/checkpoint-0-0-0 test0
 
-bash ../parallel_sim.sh `realpath ../kmh_6wide.sh` $FP_PATH/checkpoint-0-0-0/checkpoint-0-0-0.lst $FP_PATH/checkpoint-0-0-0 test0
-bash ../parallel_sim.sh `realpath ../kmh_6wide.sh` $FP_PATH/checkpoint-0-1-0/checkpoint-0-1-0.lst $FP_PATH/checkpoint-0-1-0 test1
-bash ../parallel_sim.sh `realpath ../kmh_6wide.sh` $FP_PATH/checkpoint-0-2-0/checkpoint-0-2-0.lst $FP_PATH/checkpoint-0-2-0 test2
+bash ../parallel_sim.sh `realpath ../kmh_v3_btb.sh` $FP_PATH/checkpoint-0-0-0/checkpoint-0-0-0.lst $FP_PATH/checkpoint-0-0-0 test0
+bash ../parallel_sim.sh `realpath ../kmh_v3_btb.sh` $FP_PATH/checkpoint-0-1-0/checkpoint-0-1-0.lst $FP_PATH/checkpoint-0-1-0 test1
+bash ../parallel_sim.sh `realpath ../kmh_v3_btb.sh` $FP_PATH/checkpoint-0-2-0/checkpoint-0-2-0.lst $FP_PATH/checkpoint-0-2-0 test2
 ```
 
 10. 这3轮只包含浮点程序，总共438个程序，似乎半小时就能跑完了，现在需要分析数据
@@ -103,7 +103,7 @@ mv results results1
 
 
 ```bash
-git log -p xxx  
+git log -p xxx
 可以查看xxx 这个分支对应的细节和时间
 ```
 
@@ -138,9 +138,9 @@ gem5 data stats:
 ```bash
 cd workspace/GEM5-internal/util/xs_scripts/lbm_check
 
-bash ../parallel_sim.sh `realpath ../kmh_6wide.sh` /nfs/home/hebo/BOSC/Simpoint_Checkpoint/auto_checkpoint/archive/fdc64512e812aaa9f6150087ffdd3054/checkpoint-0-0-0/checkpoint-0-0-0.lst /nfs/home/hebo/BOSC/Simpoint_Checkpoint/auto_checkpoint/archive/fdc64512e812aaa9f6150087ffdd3054/checkpoint-0-0-0 ref0 
+bash ../parallel_sim.sh `realpath ../kmh_v3_btb.sh` /nfs/home/hebo/BOSC/Simpoint_Checkpoint/auto_checkpoint/archive/fdc64512e812aaa9f6150087ffdd3054/checkpoint-0-0-0/checkpoint-0-0-0.lst /nfs/home/hebo/BOSC/Simpoint_Checkpoint/auto_checkpoint/archive/fdc64512e812aaa9f6150087ffdd3054/checkpoint-0-0-0 ref0
 
-bash ../parallel_sim.sh `realpath ../kmh_6wide.sh` /nfs/home/hebo/BOSC/Simpoint_Checkpoint/auto_checkpoint/archive/a48e1767f39f7fd48b940baabfde21d5/checkpoint-0-0-0/checkpoint-0-0-0.lst /nfs/home/hebo/BOSC/Simpoint_Checkpoint/auto_checkpoint/archive/a48e1767f39f7fd48b940baabfde21d5/checkpoint-0-0-0 test0
+bash ../parallel_sim.sh `realpath ../kmh_v3_btb.sh` /nfs/home/hebo/BOSC/Simpoint_Checkpoint/auto_checkpoint/archive/a48e1767f39f7fd48b940baabfde21d5/checkpoint-0-0-0/checkpoint-0-0-0.lst /nfs/home/hebo/BOSC/Simpoint_Checkpoint/auto_checkpoint/archive/a48e1767f39f7fd48b940baabfde21d5/checkpoint-0-0-0 test0
 
 
 ```
@@ -161,9 +161,9 @@ function prepare_env() {
     all_args=("$@")
     task=${all_args[0]}			# mcf_9578
     task_path=${all_args[1]}	# mcf/9578
-    suffix="zstd"	
+    suffix="zstd"
     checkpoint=$(find -L $cpt_dir -wholename "*${task_path}*${suffix}" | head -n 1)
-    # 在目录下找模式匹配为mcf/9578 * zstd 的文件 
+    # 在目录下找模式匹配为mcf/9578 * zstd 的文件
     echo $checkpoint
 
     export work_dir=$full_work_dir/$task	# 当前运行输出目录 yanyue/mcf_9578

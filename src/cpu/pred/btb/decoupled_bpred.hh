@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <queue>
 #include <stack>
 #include <utility>
@@ -10,38 +11,28 @@
 
 #include "arch/generic/pcstate.hh"
 #include "base/types.hh"
-#include "config/the_isa.hh"
 #include "cpu/o3/cpu_def.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/pred/bpred_unit.hh"
 #include "cpu/pred/btb/abtb.hh"
-#include "cpu/pred/btb/mbtb.hh"
 #include "cpu/pred/btb/btb_ittage.hh"
+#include "cpu/pred/btb/btb_mgsc.hh"
 #include "cpu/pred/btb/btb_tage.hh"
 #include "cpu/pred/btb/btb_ubtb.hh"
-#include "cpu/pred/btb/btb_mgsc.hh"
-#include "cpu/pred/btb/fetch_target_queue.hh"
-#include "cpu/pred/btb/jump_ahead_predictor.hh"
-#include "cpu/pred/btb/loop_buffer.hh"
-#include "cpu/pred/btb/loop_predictor.hh"
-#include "cpu/pred/btb/ras.hh"
-#include "cpu/pred/general_arch_db.hh"
-
-// #include "cpu/pred/btb/uras.hh"
+#include "cpu/pred/btb/common.hh"
+#include "cpu/pred/btb/ftq.hh"
 #include "cpu/pred/btb/history_manager.hh"
-#include "cpu/pred/btb/stream_struct.hh"
+#include "cpu/pred/btb/mbtb.hh"
+#include "cpu/pred/btb/microtage.hh"
+#include "cpu/pred/btb/ras.hh"
 #include "cpu/pred/btb/timed_base_pred.hh"
+#include "cpu/pred/general_arch_db.hh"
+#include "cpu/timebuf.hh"
 #include "debug/DBPBTBStats.hh"
 #include "debug/DecoupleBP.hh"
-#include "debug/DecoupleBPHist.hh"
 #include "debug/DecoupleBPProbe.hh"
-#include "debug/DecoupleBPRAS.hh"
-#include "debug/DecoupleBPVerbose.hh"
-#include "debug/DecoupleBPuRAS.hh"
-#include "debug/JumpAheadPredictor.hh"
-#include "debug/LoopBuffer.hh"
-#include "debug/LoopPredictor.hh"
-#include "debug/LoopPredictorVerbose.hh"
+#include "enums/SMTFTQMode.hh"
+#include "enums/SMTFTQPolicy.hh"
 #include "params/DecoupledBPUWithBTB.hh"
 
 namespace gem5
@@ -63,36 +54,28 @@ using CPU = o3::CPU;
  * This predictor implements a decoupled front-end with:
  * - Multiple prediction stages (UBTB -> BTB/TAGE/ITTAGE)
  * - Fetch Target Queue (FTQ) for managing predicted targets
- * - Fetch Stream Queue (FSQ) for managing instruction streams
  * - Support for loop prediction and jump-ahead prediction
  */
 class DecoupledBPUWithBTB : public BPredUnit
 {
-    using defer = std::shared_ptr<void>;
+    static constexpr int MaxThreads = o3::MaxThreads;
+
   public:
     typedef DecoupledBPUWithBTBParams Params;
 
     DecoupledBPUWithBTB(const Params &params);
-    // TODO: remove loop predictor and loop buffer, jap, now fetch.cc need them
-    LoopPredictor lp;
-    LoopBuffer lb;
-    bool enableLoopBuffer{false};
-    bool enableLoopPredictor{false};
-
-    JumpAheadPredictor jap;
-    bool enableJumpAheadPredictor{false};
 
   private:
-    std::string _name;
-
-    FetchTargetQueue fetchTargetQueue;
-
-    std::map<FetchStreamId, FetchStream> fetchStreamQueue;
-    unsigned fetchStreamQueueSize;
-    FetchStreamId fsqId{1};
+    // FSQ storage: a simple FIFO queue with implicit IDs (baseId + index),
+    // which is closer to RTL than std::map and makes "head" explicit.
+    // unsigned fetchTargetQueueSize;
+    // std::deque<FetchTarget> fetchTargetQueue;
+    // FetchTargetId fetchTargetBaseId{1}; // ID of fetchTargetQueue.front()
+    // FetchTargetId ftqId{1}; // next FSQ id to allocate (monotonic)
+    // FetchTargetId fetchHeadFtqId{1}; // next FSQ id to be consumed by fetch
 
     CPU *cpu;
-
+    ThreadID nextPredictTid = 0;
     unsigned predictWidth;  // max predict width, default 64
     unsigned maxInstsNum;
 
@@ -103,11 +86,10 @@ class DecoupledBPUWithBTB : public BPredUnit
     UBTB *ubtb{};
     AheadBTB *abtb{};
     MBTB *mbtb{};
-    BTBTAGE *microtage{};
+    MicroTAGE *microtage{};
     BTBTAGE *tage{};
     BTBITTAGE *ittage{};
     BTBMGSC *mgsc{};
-
     btb_pred::BTBRAS *ras{};
     // btb_pred::BTBuRAS *uras{};
 
@@ -116,8 +98,7 @@ class DecoupledBPUWithBTB : public BPredUnit
     bool someDBenabled{false};
     bool enableBranchTrace{false};
     bool enablePredFSQTrace{false};
-    bool enablePredFTQTrace{false};
-    bool enableLoopDB{false};
+
     bool checkGivenSwitch(std::vector<std::string> switches, std::string switchName) {
         for (auto &sw : switches) {
             if (sw == switchName) {
@@ -133,121 +114,78 @@ class DecoupledBPUWithBTB : public BPredUnit
     DataBase bpdb;
     TraceManager *bptrace;
     TraceManager *predTraceManager;  // Trace manager for prediction-time events
-    TraceManager *ftqTraceManager;   // Trace manager for fetch target queue entries
-    TraceManager *lptrace;
 
     void initDB();
 
     std::vector<TimedBaseBTBPredictor*> components{};
-    std::vector<FullBTBPrediction> predsOfEachStage{};
+    // std::vector<FullBTBPrediction> predsOfEachStage{};
     unsigned numComponents{};
     unsigned numStages{};
+    unsigned ftqEntries;
+    SMTFTQMode ftqMode;
+    SMTFTQPolicy ftqPolicy;
+    unsigned smtFTQThreshold;
 
-    enum class BpuState
+    FetchTargetQueue ftq;
+
+    struct
     {
-        IDLE,               // Waiting to start a prediction.
-        PREDICTOR_DONE,         // Prediction in progress (conceptually replaces `predictorFinished`).
-        PREDICTION_OUTSTANDING,         // Prediction is ready to be enqueued (replaces `receivedPred`).
-    };
-    BpuState bpuState;
+        Addr s0PC;
+        std::vector<FullBTBPrediction> predsOfEachStage{};
+        boost::dynamic_bitset<> s0History;  ///< global History bits
+        boost::dynamic_bitset<> s0PHistory;  ///< path History bits
+        boost::dynamic_bitset<> s0BwHistory;  ///< global backward History bits
+        std::vector<boost::dynamic_bitset<>> s0LHistory;  ///< local History bits
+        boost::dynamic_bitset<> commitHistory;
+        FullBTBPrediction finalPred;      ///< Final prediction
+        unsigned numOverrideBubbles{0};
+        bool validprediction{false};
+        bool squashing{false};
+        bool blockPredictionPending{false};
+    } threads[MaxThreads];
 
-    Addr s0PC;                  ///< Current PC
-    // Addr s0StreamStartPC;
-    boost::dynamic_bitset<> s0History;  ///< global History bits
-    boost::dynamic_bitset<> s0PHistory;  ///< path History bits
-    boost::dynamic_bitset<> s0BwHistory;  ///< global backward History bits
-    boost::dynamic_bitset<> s0IHistory;  ///< IMLI History bits
-    std::vector<boost::dynamic_bitset<>> s0LHistory;  ///< local History bits
-    FullBTBPrediction finalPred;      ///< Final prediction
-
-    boost::dynamic_bitset<> commitHistory;
-
-    bool squashing{false};
-
-    HistoryManager historyManager;
-    bool blockPredictionPending{false};
-    unsigned resolveDequeueFailCounter{0};
+    std::vector<HistoryManager> historyManagers;
+    std::vector<unsigned> resolveDequeueFailCounters;
     const unsigned resolveBlockThreshold;
 
-    unsigned numOverrideBubbles{0};
+    bool sharedFTQMode() const;
+    unsigned activeFTQThreads() const;
+    unsigned totalFTQEntries() const;
+    unsigned sharedFTQAllocation(unsigned entries) const;
+    unsigned logicalMaxFTQEntries(ThreadID tid) const;
+    unsigned logicalFreeFTQEntries(ThreadID tid) const;
+    bool ftqFull(ThreadID tid) const;
 
+    ThreadID scheduleThread();
 
-    using JAInfo = JumpAheadPredictor::JAInfo;
-    JAInfo jaInfo;
+    void processNewPrediction(ThreadID tid);
 
-    bool validateFSQEnqueue();
+    FetchTarget createFetchTargetEntry(ThreadID tid);
 
-    void tryEnqFetchTarget();
+    void updateHistoryForPrediction(FetchTarget &entry);
 
-    // Helper function to validate FTQ and FSQ state before enqueueing
-    bool validateFTQEnqueue();
-    void recoverFromStaleEnqueue(FetchStreamId stream_id, Addr demand_pc);
-    void rebuildGlobalHistoryFromManager();
-
-    void processNewPrediction(bool create_new_stream);
-
-    FtqEntry createFtqEntryFromStream(const FetchStream &stream, const FetchTargetEnqState &ftq_enq_state);
-
-    FetchStream createFetchStreamEntry();
-
-    void updateHistoryForPrediction(FetchStream &entry);
-
-    void fillAheadPipeline(FetchStream &entry);
+    void fillAheadPipeline(FetchTarget &entry);
 
     // Tick helper functions
-    void requestNewPrediction();
-
-    Addr computePathHash(Addr br, Addr target);
+    void requestNewPrediction(ThreadID tid);
 
     // TODO: compare phr and ghr
     void histShiftIn(int shamt, bool taken, boost::dynamic_bitset<> &history);
 
     void pHistShiftIn(int shamt, bool taken, boost::dynamic_bitset<> &history, Addr pc, Addr target);
 
-    void printStream(const FetchStream &e)
+    void printTarget(const FetchTarget &e)
     {
         if (!e.resolved) {
-            DPRINTFR(DecoupleBPProbe, "FSQ Predicted stream: ");
+            DPRINTFR(DecoupleBPProbe, "FSQ Predicted target: ");
         } else {
-            DPRINTFR(DecoupleBPProbe, "FSQ Resolved stream: ");
+            DPRINTFR(DecoupleBPProbe, "FSQ Resolved target: ");
         }
         // TODO:fix this
         DPRINTFR(DecoupleBPProbe,
                  "%#lx-[%#lx, %#lx) --> %#lx, taken: %lu\n",
                  e.startPC, e.getBranchInfo().pc, e.getEndPC(),
                  e.getTakenTarget(), e.getTaken());
-    }
-
-    void printStreamFull(const FetchStream &e)
-    {
-        // TODO: fix this
-        // DPRINTFR(
-        //     DecoupleBP,
-        //     "FSQ prediction:: %#lx-[%#lx, %#lx) --> %#lx\n",
-        //     e.startPC, e.predBranchPC, e.predEndPC, e.predTarget);
-        // DPRINTFR(
-        //     DecoupleBP,
-        //     "Resolved: %i, resolved stream:: %#lx-[%#lx, %#lx) --> %#lx\n",
-        //     e.exeEnded, e.startPC, e.exeBranchPC, e.exeEndPC,
-        //     e.exeTarget);
-    }
-
-    void printFetchTarget(const FtqEntry &e, const char *when)
-    {
-        DPRINTFR(DecoupleBP,
-                 "%s:: %#lx - [%#lx, %#lx) --> %#lx, taken: %d, fsqID: %lu\n",
-                 when, e.startPC, e.takenPC, e.endPC, e.target, e.taken, e.fsqID);
-    }
-
-    void printFetchTargetFull(const FtqEntry &e)
-    {
-        DPRINTFR(DecoupleBP, "Fetch Target:: %#lx-[%#lx, %#lx) --> %#lx\n",
-                 e.startPC, e.takenPC, e.endPC, e.target);
-    }
-
-    bool streamQueueFull() const
-    {
-        return fetchStreamQueue.size() >= fetchStreamQueueSize;
     }
 
     /**
@@ -258,13 +196,12 @@ class DecoupledBPUWithBTB : public BPredUnit
      * - Generates necessary bubbles
      * - Updates prediction state
      */
-    unsigned generateFinalPredAndCreateBubbles();
+    void generateFinalPredAndCreateBubbles(ThreadID tid);
 
-    void clearPreds() {
-        for (auto &stagePred : predsOfEachStage) {
-            stagePred.condTakens.clear();
-            stagePred.indirectTargets.clear();
-            stagePred.btbEntries.clear();
+    void clearPreds(ThreadID tid) {
+        for (int i = 0; i < threads[tid].predsOfEachStage.size(); ++i) {
+            threads[tid].predsOfEachStage[i] = FullBTBPrediction();
+            threads[tid].predsOfEachStage[i].predSource = i;
         }
     }
 
@@ -318,6 +255,7 @@ class DecoupledBPUWithBTB : public BPredUnit
         // Fine-grained branch classification statistics
         statistics::Vector branchClassCounts; ///< Classified branch occurrences
         statistics::Vector branchClassMisses; ///< Mispredictions per class
+        statistics::Scalar branchClassCountsTotal; ///< Total classified branches
         statistics::Vector controlSquashByClass; ///< Commit/Resolve-path squashes per class
 
         // Branch coverage statistics
@@ -370,6 +308,14 @@ class DecoupledBPUWithBTB : public BPredUnit
         // Window blocking statistics
         statistics::Scalar predictionBlockedForUpdate;  // Times prediction was blocked for update priority
 
+        statistics::Scalar s1PredWrongFallthrough;
+        statistics::Scalar s1PredWrongUbtb;
+        statistics::Scalar s1PredWrongAbtb;
+        statistics::Scalar s3PredWrongMbtb;
+        statistics::Scalar s3PredWrongTage;
+        statistics::Scalar s3PredWrongIttage;
+        statistics::Scalar s3PredWrongRas;
+
         DBPBTBStats(statistics::Group* parent, unsigned numStages, unsigned fsqSize, unsigned maxInstsNum);
     } dbpBtbStats;
 
@@ -385,8 +331,6 @@ class DecoupledBPUWithBTB : public BPredUnit
      */
     void tick();
 
-    bool trySupplyFetchWithTarget(Addr fetch_demand_pc, bool &fetchTargetInLoop);
-
     void squash(const InstSeqNum &squashed_sn, ThreadID tid)
     {
         panic("Squashing decoupled BP with tightly coupled API\n");
@@ -398,8 +342,14 @@ class DecoupledBPUWithBTB : public BPredUnit
     }
 
     void setCpu(CPU *_cpu) { cpu = _cpu; }
+    uint8_t getThreadAsidHash(ThreadID tid) const;
 
-    struct BpTrace : public Record {
+    void consumeFetchTarget(unsigned fetched_inst_num, ThreadID tid);
+
+    int getTargetTid() { return ftq.getTargetTid(); }
+
+    struct BpTrace : public Record
+    {
         void set(uint64_t fsqId, uint64_t startPC, uint64_t controlPC, uint64_t controlType,
             uint64_t taken, uint64_t mispred, uint64_t fallThruPC,
             uint64_t source, uint64_t target) {
@@ -413,7 +363,7 @@ class DecoupledBPUWithBTB : public BPredUnit
             _uint64_data["source"] = source;
             _uint64_data["target"] = target;
         }
-        BpTrace(uint64_t fsqId, FetchStream &stream, const DynInstPtr &inst, bool mispred);
+        BpTrace(uint64_t fsqId, FetchTarget &target, const DynInstPtr &inst, bool mispred);
     };
 
     // Prediction trace record for tracking prediction-time information
@@ -432,7 +382,7 @@ class DecoupledBPUWithBTB : public BPredUnit
             _uint64_data["btbHit"] = btbHit;
         }
 
-        PredictionTrace(uint64_t id, const FetchStream &entry) {
+        PredictionTrace(uint64_t id, const FetchTarget &entry) {
             _tick = curTick();
             set(id, entry.startPC, entry.predTaken, entry.predEndPC,
                 entry.getControlPC(), entry.getTakenTarget(),
@@ -440,83 +390,32 @@ class DecoupledBPUWithBTB : public BPredUnit
         }
     };
 
-    // FTQ trace record for tracking fetch target queue entries
-    struct FtqTrace : public Record
-    {
-        void set(uint64_t ftqId, uint64_t fsqId, uint64_t startPC, uint64_t endPC,
-                 uint64_t takenPC, uint64_t taken, uint64_t target) {
-            _uint64_data["ftqId"] = ftqId;
-            _uint64_data["fsqId"] = fsqId;
-            _uint64_data["startPC"] = startPC;
-            _uint64_data["endPC"] = endPC;
-            _uint64_data["takenPC"] = takenPC;
-            _uint64_data["taken"] = taken;
-            _uint64_data["target"] = target;
-        }
-
-        FtqTrace(uint64_t ftqId, uint64_t fsqId, const FtqEntry &entry) {
-            _tick = curTick();
-            set(ftqId, fsqId, entry.startPC, entry.endPC,
-                entry.takenPC, entry.taken ? 1 : 0, entry.target);
-        }
-    };
-
-    std::pair<bool, bool> decoupledPredict(const StaticInstPtr &inst,
-                                           const InstSeqNum &seqNum,
-                                           PCStateBase &pc, ThreadID tid,
-                                           unsigned &currentLoopIter);
-
-    // redirect the stream
-    void controlSquash(unsigned ftq_id, unsigned fsq_id,
+    // redirect the target
+    void controlSquash(unsigned fsq_id,
                        const PCStateBase &control_pc,
                        const PCStateBase &target_pc,
                        const StaticInstPtr &static_inst, unsigned inst_bytes,
                        bool actually_taken, const InstSeqNum &squashed_sn,
                        ThreadID tid, const unsigned &currentLoopIter,
-                       const bool fromCommit);
+                       const bool fromCommit,
+                       const bool trustTargetPc = false);
 
-    // keep the stream: original prediction might be right
-    // For memory violation, stream continues after squashing
-    void nonControlSquash(unsigned ftq_id, unsigned fsq_id,
+    // keep the target: original prediction might be right
+    // For memory violation, target continues after squashing
+    void nonControlSquash(unsigned fsq_id,
                           const PCStateBase &inst_pc, const InstSeqNum seq,
                           ThreadID tid, const unsigned &currentLoopIter);
 
-    // Not a control. But stream is actually disturbed
-    void trapSquash(unsigned ftq_id, unsigned fsq_id, Addr last_committed_pc,
+    // Not a control. But target is actually disturbed
+    void trapSquash(unsigned fsq_id, Addr last_committed_pc,
                     const PCStateBase &inst_pc, ThreadID tid, const unsigned &currentLoopIter);
 
-    void update(unsigned fsqID, ThreadID tid);
+    void commit(unsigned fsqID, ThreadID tid);
 
-    void squashStreamAfter(unsigned squash_stream_id);
-
-    bool fetchTargetAvailable()
-    {
-        return fetchTargetQueue.fetchTargetAvailable();
-    }
-
-    FtqEntry& getSupplyingFetchTarget()
-    {
-        return fetchTargetQueue.getTarget();
-    }
-
-    unsigned getSupplyingTargetId()
-    {
-        return fetchTargetQueue.getSupplyingTargetId();
-    }
-    unsigned getSupplyingStreamId()
-    {
-        return fetchTargetQueue.getSupplyingStreamId();
-    }
-
-    Addr getEnqueuePC() const
-    {
-        return fetchTargetQueue.getEnqPC();
-    }
-
-    Addr getCurrentPC() const
-    {
-        return s0PC;
-    }
+    // Fetch-facing interface: consume FSQ head directly (RTL-like single queue).
+    bool ftqHasFetching(ThreadID tid) const { return ftq.hasTarget(ftq.fetchId(tid), tid); }
+    FetchTargetId ftqHeadId(ThreadID tid) const { assert(ftqHasFetching(tid)); return ftq.fetchId(tid); }
+    const FetchTarget &ftqFetchingTarget(ThreadID tid) { assert(ftqHasFetching(tid)); return ftq.fetching(tid); }
 
     void dumpFsq(const char *when);
 
@@ -538,17 +437,11 @@ class DecoupledBPUWithBTB : public BPredUnit
 
     void overrideStats(OverrideReason overrideReason);
 
-    void checkHistory(const boost::dynamic_bitset<> &history);
-
-    bool useStreamRAS(FetchStreamId sid);
+    void checkHistories(const boost::dynamic_bitset<> &history,
+                        const boost::dynamic_bitset<> &phistory,
+                        ThreadID tid);
 
     Addr getPreservedReturnAddr(const DynInstPtr &dynInst);
-
-    std::string buf1, buf2;
-
-    std::stack<Addr> streamRAS;
-
-    bool debugFlagOn{false};
 
     std::unordered_map<Addr, int> takenBranches;      // branch address -> taken count
     std::unordered_map<Addr, int> currentPhaseTakenBranches;
@@ -831,14 +724,9 @@ class DecoupledBPUWithBTB : public BPredUnit
     // std::vector<BranchStatsMap> topMispredictsByBranchBySubPhase;
     // std::vector<std::map<Addr, int>> takenBranchesBySubPhase;
 
-
-    void setTakenEntryWithStream(FtqEntry &ftq_entry, const FetchStream &stream_entry);
-
-    void setNTEntryWithStream(FtqEntry &ftq_entry, Addr endPC);
-
     void recoverHistoryForSquash(
-        FetchStream &stream,
-        unsigned stream_id,
+        FetchTarget &target,
+        unsigned target_id,
         const PCStateBase &squash_pc,
         bool is_conditional,
         bool actually_taken,
@@ -846,8 +734,7 @@ class DecoupledBPUWithBTB : public BPredUnit
         Addr redirect_pc);
 
     // Common logic for squash handling
-    void handleSquash(unsigned target_id,
-                      unsigned stream_id,
+    void handleSquash(ThreadID tid, unsigned target_id,
                       SquashType squash_type,
                       const PCStateBase &squash_pc,
                       Addr redirect_pc,
@@ -857,19 +744,17 @@ class DecoupledBPUWithBTB : public BPredUnit
                       unsigned control_inst_size = 0);
 
     void resetPC(Addr new_pc);
+    void resetPC(ThreadID tid, Addr new_pc);
 
     // Helper functions for update
-    bool resolveUpdate(unsigned &stream_id);
-    void prepareResolveUpdateEntries(unsigned &stream_id);
-    void markCFIResolved(unsigned &stream_id, uint64_t resolvedInstPC);
-    void updatePredictorComponents(FetchStream &stream);
-    void updateStatistics(const FetchStream &stream);
-    void notifyResolveSuccess();
-    void notifyResolveFailure();
-    void blockPredictionOnce();
-
-    // Helper function to process FTQ entry completion
-    void processFetchTargetCompletion(const FtqEntry &target_to_fetch);
+    bool resolveUpdate(unsigned &target_id, ThreadID tid);
+    void prepareResolveUpdateEntries(unsigned &target_id, ThreadID tid);
+    void markCFIResolved(unsigned &target, uint64_t resolvedInstPC, ThreadID tid);
+    void updatePredictorComponents(FetchTarget &target);
+    void updateStatistics(const FetchTarget &target);
+    void notifyResolveSuccess(ThreadID tid);
+    void notifyResolveFailure(ThreadID tid);
+    void blockPredictionOnce(ThreadID tid);
 
     /**
      * @brief Types of control flow instructions for misprediction tracking
@@ -946,17 +831,20 @@ class DecoupledBPUWithBTB : public BPredUnit
      */
     void commitBranch(const DynInstPtr &inst, bool miss);
 
+
+    void commitPredWrongSource(const FetchTarget &entry);
+
     /**
      * @brief Process branch misprediction, determine type and update statistics
      *
-     * @param entry The fetch stream entry
+     * @param entry The fetch target entry
      * @param branchAddr Branch instruction address
      * @param info Branch information
      * @param taken Whether the branch was taken
      * @param mispred Whether the branch was mispredicted
      */
     void processMisprediction(
-        const FetchStream &entry,
+        const FetchTarget &entry,
         Addr branchAddr,
         const BranchInfo &info,
         bool taken,
@@ -1019,11 +907,6 @@ class DecoupledBPUWithBTB : public BPredUnit
      * Maps indirect branch addresses to misprediction counts.
      */
     std::map<Addr, unsigned> topMispredIndirect;
-
-    /**
-     * @brief Current FTQ entry instruction count
-     */
-    int currentFtqEntryInstNum{0};
 
     /**
      * @brief Dump statistics on program exit

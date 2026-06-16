@@ -1,7 +1,20 @@
 #include "cpu/pred/btb/btb_mgsc.hh"
 
-#ifndef UNIT_TEST
+#include "base/intmath.hh"
+#include "base/logging.hh"
+
+#ifdef UNIT_TEST
+#include "cpu/pred/btb/test/test_dprintf.hh"
+
+// Define debug flags for unit testing
+namespace gem5 {
+namespace debug {
+    bool MGSC = true;
+}
+}
+#else
 #include "cpu/o3/dyn_inst.hh"
+#include "debug/MGSC.hh"
 
 #endif
 
@@ -13,8 +26,6 @@
 #include <type_traits>
 #include <vector>
 
-#include "debug/MGSC.hh"
-
 namespace gem5
 {
 
@@ -24,6 +35,161 @@ namespace branch_prediction
 namespace btb_pred
 {
 
+#ifdef UNIT_TEST
+namespace test
+{
+#endif
+
+void
+BTBMGSC::initStorage()
+{
+    auto pow2 = [](unsigned width) -> uint64_t {
+        assert(width < 63);
+        return 1ULL << width;
+    };
+    auto allocPredTable = [&](std::vector<std::vector<std::vector<int16_t>>> &table, unsigned numTables,
+                              unsigned idxWidth) -> uint64_t {
+        table.resize(numTables);
+        auto tableSize = pow2(idxWidth);
+        assert(tableSize > numCtrsPerLine);
+        for (unsigned int i = 0; i < numTables; ++i) {
+            table[i].resize(tableSize / numCtrsPerLine, std::vector<int16_t>(numCtrsPerLine, 0));
+        }
+        return tableSize;
+    };
+
+    assert(isPowerOf2(numCtrsPerLine));
+    numCtrsPerLineBits = log2i(numCtrsPerLine);
+
+    threadHistory.resize(MaxThreads);
+    threadMeta.resize(MaxThreads);
+
+    auto bwTableSize = allocPredTable(bwTable, bwTableNum, bwTableIdxWidth);
+    for (ThreadID tid = 0; tid < MaxThreads; ++tid) {
+        auto &state = threadHistory[tid];
+        for (unsigned int i = 0; i < bwTableNum; ++i) {
+            state.indexBwFoldedHist.emplace_back(
+                bwHistLen[i], bwTableIdxWidth - numCtrsPerLineBits, 16);
+        }
+    }
+    bwIndex.resize(bwTableNum);
+
+    auto lTableSize = allocPredTable(lTable, lTableNum, lTableIdxWidth);
+    for (ThreadID tid = 0; tid < MaxThreads; ++tid) {
+        auto &state = threadHistory[tid];
+        state.indexLFoldedHist.resize(numEntriesFirstLocalHistories);
+        for (unsigned int i = 0; i < lTableNum; ++i) {
+            for (unsigned int k = 0; k < numEntriesFirstLocalHistories; ++k) {
+                state.indexLFoldedHist[k].push_back(LocalFoldedHist(
+                    lHistLen[i], lTableIdxWidth - numCtrsPerLineBits, 16));
+            }
+        }
+    }
+    lIndex.resize(lTableNum);
+
+    auto iTableSize = allocPredTable(iTable, iTableNum, iTableIdxWidth);
+    for (ThreadID tid = 0; tid < MaxThreads; ++tid) {
+        auto &state = threadHistory[tid];
+        for (unsigned int i = 0; i < iTableNum; ++i) {
+            assert(iHistLen[i] >= 0);
+            assert(static_cast<unsigned>(iHistLen[i]) < 63);
+            assert(pow2(static_cast<unsigned>(iHistLen[i])) <= iTableSize);
+            state.indexIFoldedHist.emplace_back(
+                iHistLen[i], iTableIdxWidth - numCtrsPerLineBits, 16);
+        }
+    }
+    iIndex.resize(iTableNum);
+
+    auto gTableSize = allocPredTable(gTable, gTableNum, gTableIdxWidth);
+    for (ThreadID tid = 0; tid < MaxThreads; ++tid) {
+        auto &state = threadHistory[tid];
+        for (unsigned int i = 0; i < gTableNum; ++i) {
+            assert(gTable.size() >= gTableNum);
+            state.indexGFoldedHist.emplace_back(
+                gHistLen[i], gTableIdxWidth - numCtrsPerLineBits, 16);
+        }
+    }
+    gIndex.resize(gTableNum);
+
+    auto pTableSize = allocPredTable(pTable, pTableNum, pTableIdxWidth);
+    for (ThreadID tid = 0; tid < MaxThreads; ++tid) {
+        auto &state = threadHistory[tid];
+        for (unsigned int i = 0; i < pTableNum; ++i) {
+            assert(pTable.size() >= pTableNum);
+            state.indexPFoldedHist.emplace_back(
+                pHistLen[i], pTableIdxWidth - numCtrsPerLineBits, 2);
+        }
+    }
+    pIndex.resize(pTableNum);
+
+    allocPredTable(biasTable, biasTableNum, biasTableIdxWidth);
+    biasIndex.resize(biasTableNum);
+
+    auto weightTableSize = pow2(weightTableIdxWidth);
+    bwWeightTable.resize(weightTableSize);
+    lWeightTable.resize(weightTableSize);
+    iWeightTable.resize(weightTableSize);
+    gWeightTable.resize(weightTableSize);
+    pWeightTable.resize(weightTableSize);
+    biasWeightTable.resize(weightTableSize);
+
+    pUpdateThreshold.resize(pow2(thresholdTablelogSize));
+}
+
+#ifdef UNIT_TEST
+BTBMGSC::BTBMGSC()
+    : TimedBaseBTBPredictor(),
+      bwTableNum(1),
+      // Use a slightly larger idx width so foldedLen is not too small (helps pattern-learning tests).
+      bwTableIdxWidth(6),
+      bwHistLen({4}),
+      numEntriesFirstLocalHistories(4),
+      lTableNum(1),
+      // Use a slightly larger idx width so foldedLen is not too small (helps pattern-learning tests).
+      lTableIdxWidth(6),
+      lHistLen({4}),
+      iTableNum(1),
+      iTableIdxWidth(5),
+      // `ImliFoldedHist` requires foldedLen >= histLen. With `numCtrsPerLine=8` and `iTableIdxWidth=5`,
+      // foldedLen is small (5 - log2(8) = 2), so keep histLen=1 for unit tests.
+      // Also keep it >= 2 so we can build loop-trip-count tests on IMLI.
+      iHistLen({2}),
+      gTableNum(1),
+      // Use a slightly larger idx width so foldedLen is not too small (helps pattern-learning tests).
+      gTableIdxWidth(6),
+      gHistLen({4}),
+      pTableNum(1),
+      // Use a slightly larger idx width so foldedLen is not too small (helps pattern-learning tests).
+      pTableIdxWidth(6),
+      pHistLen({4}),
+      biasTableNum(1),
+      biasTableIdxWidth(5),
+      scCountersWidth(6),
+      thresholdTablelogSize(4),
+      updateThresholdWidth(12),
+      pUpdateThresholdWidth(8),
+      extraWeightsWidth(6),
+      weightTableIdxWidth(4),
+      // Keep consistent with `src/cpu/pred/BranchPredictor.py` default (8 counters per SRAM line).
+      // This models "read a whole SRAM line, then pick a lane" behavior in `posHash()`.
+      numCtrsPerLine(8),
+      forceUseSC(false),
+      allowMissingTageInfo(false),
+      enableBwTable(true),
+      enableLTable(true),
+      enableITable(true),
+      enableGTable(true),
+      enablePTable(true),
+      enableBiasTable(true),
+      enablePCThreshold(false),
+      focusBranchPC(0),
+      mgscStats()
+{
+    // Test-only small config: keep tables tiny and deterministic for fast unit tests.
+    initStorage();
+    updateThreshold = 35 * 8;
+}
+#else
 // Constructor: Initialize MGSC predictor with given parameters
 BTBMGSC::BTBMGSC(const Params &p)
     : TimedBaseBTBPredictor(p),
@@ -52,90 +218,92 @@ BTBMGSC::BTBMGSC(const Params &p)
       extraWeightsWidth(p.extraWeightsWidth),
       weightTableIdxWidth(p.weightTableIdxWidth),
       numCtrsPerLine(p.numCtrsPerLine),
+      forceUseSC(p.forceUseSC),
+      allowMissingTageInfo(p.allowMissingTageInfo),
+      enableBwTable(p.enableBwTable),
+      enableLTable(p.enableLTable),
+      enableITable(p.enableITable),
+      enableGTable(p.enableGTable),
+      enablePTable(p.enablePTable),
+      enableBiasTable(p.enableBiasTable),
+      enablePCThreshold(p.enablePCThreshold),
+      focusBranchPC(p.focusBranchPC),
       mgscStats(this)
 {
     DPRINTF(MGSC, "BTBMGSC constructor\n");
-    this->needMoreHistories = p.needMoreHistories;
-
-    assert(isPowerOf2(numCtrsPerLine));
-    numCtrsPerLineBits = log2i(numCtrsPerLine);
-
-    bwTable.resize(bwTableNum);
-    auto bwTableSize = std::pow(2, bwTableIdxWidth);
-    assert(bwTableSize > numCtrsPerLine);
-    for (unsigned int i = 0; i < bwTableNum; ++i) {
-        bwTable[i].resize(bwTableSize / numCtrsPerLine, std::vector<int16_t>(numCtrsPerLine, 0));
-        indexBwFoldedHist.push_back(GlobalBwFoldedHist(bwHistLen[i], bwTableIdxWidth - numCtrsPerLineBits, 16));
-    }
-    bwIndex.resize(bwTableNum);
-
-    lTable.resize(lTableNum);
-    indexLFoldedHist.resize(numEntriesFirstLocalHistories);
-    auto lTableSize = std::pow(2, lTableIdxWidth);
-    assert(lTableSize > numCtrsPerLine);
-    for (unsigned int i = 0; i < lTableNum; ++i) {
-        lTable[i].resize(lTableSize / numCtrsPerLine, std::vector<int16_t>(numCtrsPerLine, 0));
-        for (unsigned int k = 0; k < numEntriesFirstLocalHistories; ++k) {
-            indexLFoldedHist[k].push_back(LocalFoldedHist(lHistLen[i], lTableIdxWidth - numCtrsPerLineBits, 16));
-        }
-    }
-    lIndex.resize(lTableNum);
-
-    iTable.resize(iTableNum);
-    auto iTableSize = std::pow(2, iTableIdxWidth);
-    assert(iTableSize > numCtrsPerLine);
-    for (unsigned int i = 0; i < iTableNum; ++i) {
-        assert(std::pow(2, iHistLen[i]) <= iTableSize);
-        iTable[i].resize(iTableSize / numCtrsPerLine, std::vector<int16_t>(numCtrsPerLine, 0));
-        indexIFoldedHist.push_back(ImliFoldedHist(iHistLen[i], iTableIdxWidth - numCtrsPerLineBits, 16));
-    }
-    iIndex.resize(iTableNum);
-
-    gTable.resize(gTableNum);
-    auto gTableSize = std::pow(2, gTableIdxWidth);
-    assert(gTableSize > numCtrsPerLine);
-    for (unsigned int i = 0; i < gTableNum; ++i) {
-        assert(gTable.size() >= gTableNum);
-        gTable[i].resize(gTableSize / numCtrsPerLine, std::vector<int16_t>(numCtrsPerLine, 0));
-        indexGFoldedHist.push_back(GlobalFoldedHist(gHistLen[i], gTableIdxWidth - numCtrsPerLineBits, 16));
-    }
-    gIndex.resize(gTableNum);
-
-    pTable.resize(pTableNum);
-    auto pTableSize = std::pow(2, pTableIdxWidth);
-    assert(pTableSize > numCtrsPerLine);
-    for (unsigned int i = 0; i < pTableNum; ++i) {
-        assert(pTable.size() >= pTableNum);
-        pTable[i].resize(pTableSize / numCtrsPerLine, std::vector<int16_t>(numCtrsPerLine, 0));
-        indexPFoldedHist.push_back(PathFoldedHist(pHistLen[i], pTableIdxWidth - numCtrsPerLineBits, 2));
-    }
-    pIndex.resize(pTableNum);
-
-    biasTable.resize(biasTableNum);
-    auto biasTableSize = std::pow(2, biasTableIdxWidth);
-    assert(biasTableSize > numCtrsPerLine);
-    for (unsigned int i = 0; i < biasTableNum; ++i) {
-        biasTable[i].resize(biasTableSize / numCtrsPerLine, std::vector<int16_t>(numCtrsPerLine, 0));
-    }
-    biasIndex.resize(biasTableNum);
-
-    bwWeightTable.resize(std::pow(2, weightTableIdxWidth));
-    lWeightTable.resize(std::pow(2, weightTableIdxWidth));
-    iWeightTable.resize(std::pow(2, weightTableIdxWidth));
-    gWeightTable.resize(std::pow(2, weightTableIdxWidth));
-    pWeightTable.resize(std::pow(2, weightTableIdxWidth));
-    biasWeightTable.resize(std::pow(2, weightTableIdxWidth));
-    pUpdateThreshold.resize(std::pow(2, thresholdTablelogSize));
-
+    initStorage();
     updateThreshold = 35 * 8;
+
+    hasDB = true;
+    dbName = std::string("mgsc");
+}
+#endif
+BTBMGSC::~BTBMGSC() {}
+
+ThreadID
+BTBMGSC::predictorTid(const std::vector<FullBTBPrediction> &stagePreds) const
+{
+    assert(!stagePreds.empty());
+    return stagePreds.front().tid;
 }
 
-BTBMGSC::~BTBMGSC() {}
+BTBMGSC::ThreadHistoryState &
+BTBMGSC::historyState(ThreadID tid)
+{
+    assert(tid < threadHistory.size());
+    return threadHistory[tid];
+}
+
+const BTBMGSC::ThreadHistoryState &
+BTBMGSC::historyState(ThreadID tid) const
+{
+    assert(tid < threadHistory.size());
+    return threadHistory[tid];
+}
 
 // Set up tracing for debugging
 void
 BTBMGSC::setTrace()
 {
+#ifndef UNIT_TEST
+    if (enableDB) {
+        std::vector<std::pair<std::string, DataType>> fields_vec = {
+            std::make_pair("branchPC", UINT64),
+            std::make_pair("bbStart", UINT64),
+            std::make_pair("branchOffset", UINT64),
+            std::make_pair("tagePred", UINT64),
+            std::make_pair("tageConfHigh", UINT64),
+            std::make_pair("tageConfMid", UINT64),
+            std::make_pair("tageConfLow", UINT64),
+            std::make_pair("bwPercsum", UINT64),
+            std::make_pair("lPercsum", UINT64),
+            std::make_pair("iPercsum", UINT64),
+            std::make_pair("gPercsum", UINT64),
+            std::make_pair("pPercsum", UINT64),
+            std::make_pair("biasPercsum", UINT64),
+            std::make_pair("totalSum", UINT64),
+            std::make_pair("totalThres", UINT64),
+            std::make_pair("effectiveGate", UINT64),
+            std::make_pair("margin", UINT64),
+            std::make_pair("bwIndex0", UINT64),
+            std::make_pair("bwIndex1", UINT64),
+            std::make_pair("lIndex0", UINT64),
+            std::make_pair("lIndex1", UINT64),
+            std::make_pair("iIndex0", UINT64),
+            std::make_pair("gIndex0", UINT64),
+            std::make_pair("gIndex1", UINT64),
+            std::make_pair("pIndex0", UINT64),
+            std::make_pair("pIndex1", UINT64),
+            std::make_pair("biasIndex0", UINT64),
+            std::make_pair("useSc", UINT64),
+            std::make_pair("scPred", UINT64),
+            std::make_pair("scWrong", UINT64),
+            std::make_pair("actualTaken", UINT64),
+        };
+        mgscMissTrace = _db->addAndGetTrace("MGSCTRACE", fields_vec);
+        mgscMissTrace->init_table();
+    }
+#endif
 }
 
 void
@@ -151,12 +319,13 @@ BTBMGSC::tickStart()
 
 /**
  * Calculate perceptron sum from a table for a given PC
- * perceptron sum is the sum of the (2*counter + 1) of the matching entries
+ * Counter range: [-2^(w-1), 2^(w-1)-1], e.g., [-32, 31] for w=6
+ * Percsum = sum of (2*counter + 1), transforms to odd numbers, e.g., [-63, 63] per entry
  * @param table The table to search in
  * @param tableIndices Indices to use for each table component
  * @param numTables Number of tables to search
  * @param pc PC to match against
- * @return Calculated percsum value
+ * @return Calculated percsum value (positive=taken bias, negative=not-taken bias)
  */
 int
 BTBMGSC::calculatePercsum(const std::vector<std::vector<std::vector<int16_t>>> &table,
@@ -166,7 +335,7 @@ BTBMGSC::calculatePercsum(const std::vector<std::vector<std::vector<int16_t>>> &
     for (unsigned int i = 0; i < numTables; ++i) {
         auto [idx1, idx2] = posHash(pc, tableIndices[i]);
         auto &entry = table[i][idx1][idx2];
-        percsum += (2 * entry + 1);  // align to zero center
+        percsum += (2 * entry + 1);  // transform to odd numbers, avoid zero
     }
     return percsum;
 }
@@ -179,25 +348,21 @@ BTBMGSC::calculatePercsum(const std::vector<std::vector<std::vector<int16_t>>> &
  * @return Found weight or 0 if not found
  */
 int
-BTBMGSC::findWeight(const std::vector<int16_t> &weightTable, Addr pc)
+BTBMGSC::findWeight(const std::vector<int16_t> &weightTable, Addr pc,
+                    uint8_t asidHash)
 {
     auto mask = (1 << weightTableIdxWidth) - 1;
     auto pcHash = ((pc >> instShiftAmt) ^ ((pc >> instShiftAmt) >> 2)) & mask;
+    pcHash = xorAsidHashIntoIndex(pcHash, weightTableIdxWidth, asidHash);
     auto &entry = weightTable[pcHash];
     return entry;
 }
 
-/**
- * Calculate scaled percsum using weight
- * weight range is [-32, 31], return value range is percsum or 2x percsum
- * @param weight Weight value
- * @param percsum Original percsum value
- * @return Scaled percsum value
- */
+
 int
 BTBMGSC::calculateScaledPercsum(int weight, int percsum)
 {
-    return ((weight + 64) / 32) * percsum;
+    return percsum; // disable weight scaling for test
 }
 
 /**
@@ -209,10 +374,12 @@ BTBMGSC::calculateScaledPercsum(int weight, int percsum)
  * @return Found threshold or default value if not found
  */
 int
-BTBMGSC::findThreshold(const std::vector<int16_t> &thresholdTable, Addr pc)
+BTBMGSC::findThreshold(const std::vector<int16_t> &thresholdTable, Addr pc,
+                       uint8_t asidHash)
 {
     auto mask = (1 << thresholdTablelogSize) - 1;
     auto pcHash = ((pc >> instShiftAmt) ^ ((pc >> instShiftAmt) >> 2)) & mask;
+    pcHash = xorAsidHashIntoIndex(pcHash, thresholdTablelogSize, asidHash);
     auto &entry = thresholdTable[pcHash];
     return entry;
 }
@@ -241,60 +408,76 @@ BTBMGSC::calculateWeightScaleDiff(int total_sum, int scale_percsum, int percsum)
  * @return TagePrediction containing main and alternative predictions
  */
 BTBMGSC::MgscPrediction
-BTBMGSC::generateSinglePrediction(const BTBEntry &btb_entry, const Addr &startPC, const TageInfoForMGSC &tage_info)
+BTBMGSC::generateSinglePrediction(const BTBEntry &btb_entry, const Addr &startPC,
+                                  const TageInfoForMGSC &tage_info,
+                                  ThreadID tid, uint8_t asidHash)
 {
     DPRINTF(MGSC, "generateSinglePrediction for btbEntry: %#lx, always taken %d\n", btb_entry.pc,
             btb_entry.alwaysTaken);
+    const auto &state = historyState(tid);
 
     // Calculate indices for all tables
     for (unsigned int i = 0; i < bwTableNum; ++i) {
-        bwIndex[i] = getHistIndex(startPC, bwTableIdxWidth - numCtrsPerLineBits, indexBwFoldedHist[i].get());
+        bwIndex[i] = getHistIndex(startPC, bwTableIdxWidth - numCtrsPerLineBits,
+                                  state.indexBwFoldedHist[i].get(), asidHash);
     }
 
+    const Addr localHistoryIndex =
+        getPcIndex(startPC, log2(numEntriesFirstLocalHistories), asidHash);
     for (unsigned int i = 0; i < lTableNum; ++i) {
         lIndex[i] = getHistIndex(startPC, lTableIdxWidth - numCtrsPerLineBits,
-                                 indexLFoldedHist[getPcIndex(startPC, log2(numEntriesFirstLocalHistories))][i].get());
+                                 state.indexLFoldedHist[localHistoryIndex][i].get(),
+                                 asidHash);
     }
+    // std::string buf;
+    // boost::to_string(
+    //     indexLFoldedHist[getPcIndex(
+    //         startPC, log2(numEntriesFirstLocalHistories))][0].getAsBitset(),
+    //     buf);
+    // DPRINTF(MGSC, "startPC: %#lx, local index: %d, local_folded_hist: %s\n", startPC, lIndex[0], buf.c_str());
 
     for (unsigned int i = 0; i < iTableNum; ++i) {
-        iIndex[i] = getHistIndex(startPC, iTableIdxWidth - numCtrsPerLineBits, indexIFoldedHist[i].get());
+        iIndex[i] = getHistIndex(startPC, iTableIdxWidth - numCtrsPerLineBits,
+                                 state.indexIFoldedHist[i].get(), asidHash);
     }
 
     for (unsigned int i = 0; i < gTableNum; ++i) {
-        gIndex[i] = getHistIndex(startPC, gTableIdxWidth - numCtrsPerLineBits, indexGFoldedHist[i].get());
+        gIndex[i] = getHistIndex(startPC, gTableIdxWidth - numCtrsPerLineBits,
+                                 state.indexGFoldedHist[i].get(), asidHash);
     }
 
     for (unsigned int i = 0; i < pTableNum; ++i) {
-        pIndex[i] = getHistIndex(startPC, pTableIdxWidth - numCtrsPerLineBits, indexPFoldedHist[i].get());
+        pIndex[i] = getHistIndex(startPC, pTableIdxWidth - numCtrsPerLineBits,
+                                 state.indexPFoldedHist[i].get(), asidHash);
     }
 
     for (unsigned int i = 0; i < biasTableNum; ++i) {
         biasIndex[i] = getBiasIndex(startPC, biasTableIdxWidth - numCtrsPerLineBits, tage_info.tage_main_taken,
-                                    tage_info.tage_pred_conf_low);
+                                    tage_info.tage_pred_conf_low, asidHash);
     }
 
-    int bw_percsum = calculatePercsum(bwTable, bwIndex, bwTableNum, btb_entry.pc);
-    int bw_weight = findWeight(bwWeightTable, btb_entry.pc);
+    int bw_percsum = enableBwTable ? calculatePercsum(bwTable, bwIndex, bwTableNum, btb_entry.pc) : 0;
+    int bw_weight = findWeight(bwWeightTable, btb_entry.pc, asidHash);
     int bw_scaled_percsum = calculateScaledPercsum(bw_weight, bw_percsum);
 
-    int l_percsum = calculatePercsum(lTable, lIndex, lTableNum, btb_entry.pc);
-    int l_weight = findWeight(lWeightTable, btb_entry.pc);
+    int l_percsum = enableLTable ? calculatePercsum(lTable, lIndex, lTableNum, btb_entry.pc) : 0;
+    int l_weight = findWeight(lWeightTable, btb_entry.pc, asidHash);
     int l_scaled_percsum = calculateScaledPercsum(l_weight, l_percsum);
 
-    int i_percsum = calculatePercsum(iTable, iIndex, iTableNum, btb_entry.pc);
-    int i_weight = findWeight(iWeightTable, btb_entry.pc);
+    int i_percsum = enableITable ? calculatePercsum(iTable, iIndex, iTableNum, btb_entry.pc) : 0;
+    int i_weight = findWeight(iWeightTable, btb_entry.pc, asidHash);
     int i_scaled_percsum = calculateScaledPercsum(i_weight, i_percsum);
 
-    int g_percsum = calculatePercsum(gTable, gIndex, gTableNum, btb_entry.pc);
-    int g_weight = findWeight(gWeightTable, btb_entry.pc);
+    int g_percsum = enableGTable ? calculatePercsum(gTable, gIndex, gTableNum, btb_entry.pc) : 0;
+    int g_weight = findWeight(gWeightTable, btb_entry.pc, asidHash);
     int g_scaled_percsum = calculateScaledPercsum(g_weight, g_percsum);
 
-    int p_percsum = calculatePercsum(pTable, pIndex, pTableNum, btb_entry.pc);
-    int p_weight = findWeight(pWeightTable, btb_entry.pc);
+    int p_percsum = enablePTable ? calculatePercsum(pTable, pIndex, pTableNum, btb_entry.pc) : 0;
+    int p_weight = findWeight(pWeightTable, btb_entry.pc, asidHash);
     int p_scaled_percsum = calculateScaledPercsum(p_weight, p_percsum);
 
-    int bias_percsum = calculatePercsum(biasTable, biasIndex, biasTableNum, btb_entry.pc);
-    int bias_weight = findWeight(biasWeightTable, btb_entry.pc);
+    int bias_percsum = enableBiasTable ? calculatePercsum(biasTable, biasIndex, biasTableNum, btb_entry.pc) : 0;
+    int bias_weight = findWeight(biasWeightTable, btb_entry.pc, asidHash);
     int bias_scaled_percsum = calculateScaledPercsum(bias_weight, bias_percsum);
 
     // Calculate total sum of all weighted percsums
@@ -302,27 +485,37 @@ BTBMGSC::generateSinglePrediction(const BTBEntry &btb_entry, const Addr &startPC
                     bias_scaled_percsum;
 
     // Find thresholds
-    // pc-indexed threshold table
-    int p_update_thres = findThreshold(pUpdateThreshold, btb_entry.pc);
+    // pc-indexed threshold table (only if enabled)
+    int p_update_thres =
+        enablePCThreshold ? findThreshold(pUpdateThreshold, btb_entry.pc, asidHash) : 0;
 
     int total_thres = (updateThreshold / 8) + p_update_thres;
+    // Threshold is used as a confidence gate; avoid negative values which
+    // effectively disable the gate (abs(sum) > negative is almost always true).
+    total_thres = std::max(total_thres, 0);
 
-    bool use_sc_pred = false;
-    if (tage_info.tage_pred_conf_high) {
-        if (abs(total_sum) > total_thres / 2) {
-            use_sc_pred = true;
-        }
-    } else if (tage_info.tage_pred_conf_mid) {
-        if (abs(total_sum) > total_thres / 4) {
-            use_sc_pred = true;
-        }
-    } else if (tage_info.tage_pred_conf_low) {
-        if (abs(total_sum) > total_thres / 8) {
-            use_sc_pred = true;
+    bool use_sc_pred = forceUseSC;  // Force use SC if configured
+    if (!use_sc_pred) {
+        if (tage_info.tage_pred_conf_high) {
+            if (abs(total_sum) > total_thres / 2) {
+                use_sc_pred = true;
+            }
+        } else if (tage_info.tage_pred_conf_mid) {
+            if (abs(total_sum) > total_thres / 4) {
+                use_sc_pred = true;
+            }
+        } else if (tage_info.tage_pred_conf_low) {
+            if (abs(total_sum) > total_thres / 8) {
+                use_sc_pred = true;
+            }
         }
     }
     // Final prediction, total_sum >= 0 means taken if use_sc_pred
     bool taken = use_sc_pred ? (total_sum >= 0) : tage_info.tage_pred_taken;
+
+    // DPRINTF(MGSC, "global tag_index: %d, global_percsum: %d, total_sum: %d\n", gIndex[0], g_percsum, total_sum);
+    // DPRINTF(MGSC, "local tag_index: %d, local_percsum: %d, total_sum: %d\n", lIndex[0], l_percsum, total_sum);
+    // DPRINTF(MGSC, "path tag_index: %d, path_percsum: %d, total_sum: %d\n", pIndex[0], p_percsum, total_sum);
 
     // Calculate weight scale differences
     bool bw_weight_scale_diff = calculateWeightScaleDiff(total_sum, bw_scaled_percsum, bw_percsum);
@@ -334,10 +527,13 @@ BTBMGSC::generateSinglePrediction(const BTBEntry &btb_entry, const Addr &startPC
 
     DPRINTF(MGSC, "sc predict %#lx taken %d\n", btb_entry.pc, taken);
 
-    return MgscPrediction(btb_entry.pc, total_sum, use_sc_pred, taken, tage_info.tage_pred_taken, total_thres, bwIndex,
-                          lIndex, iIndex, gIndex, pIndex, biasIndex, bw_weight_scale_diff, l_weight_scale_diff,
-                          i_weight_scale_diff, g_weight_scale_diff, p_weight_scale_diff, bias_weight_scale_diff,
-                          bw_percsum, l_percsum, i_percsum, g_percsum, p_percsum, bias_percsum);
+    return MgscPrediction(btb_entry.pc, total_sum, use_sc_pred, taken, tage_info.tage_pred_taken,
+                          tage_info.tage_pred_conf_high, tage_info.tage_pred_conf_mid, tage_info.tage_pred_conf_low,
+                          total_thres, bwIndex, lIndex, iIndex, gIndex, pIndex, biasIndex, bw_weight_scale_diff,
+                          l_weight_scale_diff, i_weight_scale_diff, g_weight_scale_diff, p_weight_scale_diff,
+                          bias_weight_scale_diff, bw_percsum, l_percsum,
+                          i_percsum, g_percsum, p_percsum,
+                          bias_percsum);
 }
 
 /**
@@ -349,7 +545,8 @@ BTBMGSC::generateSinglePrediction(const BTBEntry &btb_entry, const Addr &startPC
  */
 void
 BTBMGSC::lookupHelper(const Addr &startPC, const std::vector<BTBEntry> &btbEntries,
-                      const std::unordered_map<Addr, TageInfoForMGSC> &tageInfoForMgscs, CondTakens &results)
+                      const std::unordered_map<Addr, TageInfoForMGSC> &tageInfoForMgscs,
+                      CondTakens &results, ThreadID tid, uint8_t asidHash)
 {
     DPRINTF(MGSC, "lookupHelper startAddr: %#lx\n", startPC);
 
@@ -358,13 +555,18 @@ BTBMGSC::lookupHelper(const Addr &startPC, const std::vector<BTBEntry> &btbEntri
         // Only predict for valid conditional branches
         if (btb_entry.isCond && btb_entry.valid) {
             auto tage_info = tageInfoForMgscs.find(btb_entry.pc);
-            if (tage_info != tageInfoForMgscs.end()) {
-                auto pred = generateSinglePrediction(btb_entry, startPC, tage_info->second);
-                meta->preds[btb_entry.pc] = pred;
-                results.push_back({btb_entry.pc, pred.taken || btb_entry.alwaysTaken});
-            } else {
-                assert(false);
-            }
+            panic_if(tage_info == tageInfoForMgscs.end() && !allowMissingTageInfo,
+                     "MGSC missing TAGE info for conditional branch pc %#lx "
+                     "startPC %#lx tid %u asidHash %#x",
+                     btb_entry.pc, startPC, static_cast<unsigned>(tid),
+                     static_cast<unsigned>(asidHash));
+
+            const TageInfoForMGSC missing_tage_info;
+            const auto &info =
+                tage_info != tageInfoForMgscs.end() ? tage_info->second : missing_tage_info;
+            auto pred = generateSinglePrediction(btb_entry, startPC, info, tid, asidHash);
+            threadMeta[tid]->preds[btb_entry.pc] = pred;
+            results.push_back({btb_entry.pc, pred.taken || btb_entry.alwaysTaken});
         }
     }
 }
@@ -385,6 +587,9 @@ void
 BTBMGSC::putPCHistory(Addr stream_start, const boost::dynamic_bitset<> &history,
                       std::vector<FullBTBPrediction> &stagePreds)
 {
+    const ThreadID tid = predictorTid(stagePreds);
+    const auto &state = historyState(tid);
+    const uint8_t asidHash = stagePreds.empty() ? 0 : stagePreds.front().asidHash;
     DPRINTF(MGSC, "putPCHistory startAddr: %#lx\n", stream_start);
 
     // IMPORTANT: when this function is called,
@@ -396,25 +601,30 @@ BTBMGSC::putPCHistory(Addr stream_start, const boost::dynamic_bitset<> &history,
     }
 
     // Clear old prediction metadata and save current history state
-    meta = std::make_shared<MgscMeta>();
-    meta->indexBwFoldedHist = indexBwFoldedHist;
-    meta->indexLFoldedHist = indexLFoldedHist;
-    meta->indexIFoldedHist = indexIFoldedHist;
-    meta->indexGFoldedHist = indexGFoldedHist;
-    meta->indexPFoldedHist = indexPFoldedHist;
+    threadMeta[tid] = std::make_shared<MgscMeta>();
+    threadMeta[tid]->indexBwFoldedHist = state.indexBwFoldedHist;
+    threadMeta[tid]->indexLFoldedHist = state.indexLFoldedHist;
+    threadMeta[tid]->indexIFoldedHist = state.indexIFoldedHist;
+    threadMeta[tid]->indexGFoldedHist = state.indexGFoldedHist;
+    threadMeta[tid]->indexPFoldedHist = state.indexPFoldedHist;
 
     for (int s = getDelay(); s < stagePreds.size(); s++) {
         // TODO: only lookup once for one btb entry in different stages
         auto &stage_pred = stagePreds[s];
         stage_pred.condTakens.clear();
-        lookupHelper(stream_start, stage_pred.btbEntries, stage_pred.tageInfoForMgscs, stage_pred.condTakens);
+        lookupHelper(stream_start, stage_pred.btbEntries,
+                     stage_pred.tageInfoForMgscs, stage_pred.condTakens, tid,
+                     asidHash);
     }
 }
 
 std::shared_ptr<void>
-BTBMGSC::getPredictionMeta()
+BTBMGSC::getPredictionMeta(ThreadID tid)
 {
-    return meta;
+    if (tid >= threadMeta.size()) {
+        return nullptr;
+    }
+    return threadMeta[tid];
 }
 
 /**
@@ -424,7 +634,7 @@ BTBMGSC::getPredictionMeta()
  * @return Vector of BTB entries that need to be updated
  */
 std::vector<BTBEntry>
-BTBMGSC::prepareUpdateEntries(const FetchStream &stream)
+BTBMGSC::prepareUpdateEntries(const FetchTarget &stream)
 {
     auto all_entries = stream.updateBTBEntries;
 
@@ -517,10 +727,11 @@ BTBMGSC::updateWeightTable(std::vector<int16_t> &weightTable, Addr tableIndex, A
  * @param update_direction Direction to update (true=increment, false=decrement)
  */
 void
-BTBMGSC::updatePCThresholdTable(Addr pc, bool update_direction)
+BTBMGSC::updatePCThresholdTable(Addr pc, uint8_t asidHash, bool update_direction)
 {
     auto mask = (1 << thresholdTablelogSize) - 1;
     auto pcHash = ((pc >> instShiftAmt) ^ ((pc >> instShiftAmt) >> 2)) & mask;
+    pcHash = xorAsidHashIntoIndex(pcHash, thresholdTablelogSize, asidHash);
     auto &entry = pUpdateThreshold[pcHash];
     updateCounter(update_direction, pUpdateThresholdWidth, entry);
 }
@@ -542,6 +753,98 @@ void
 BTBMGSC::updateGlobalThreshold(Addr pc, bool update_direction)
 {
     updateCounter(update_direction, updateThresholdWidth, updateThreshold);
+    // Keep global threshold non-negative; negative thresholds make SC gating
+    // degenerate and can cause overuse of SC.
+    if (updateThreshold < 0) {
+        updateThreshold = 0;
+    }
+}
+
+void
+BTBMGSC::recordPredictionStats(const MgscPrediction &pred, bool actual_taken, bool sc_pred_taken,
+                               bool tage_pred_taken)
+{
+    auto tage_conf_high = pred.tage_conf_high;
+    auto tage_conf_mid = pred.tage_conf_mid;
+    auto tage_conf_low = pred.tage_conf_low;
+
+    // SC vs TAGE outcomes
+    if (pred.use_mgsc) {
+        mgscStats.scUsed++;
+        if (sc_pred_taken == actual_taken && tage_pred_taken != actual_taken) {
+            mgscStats.scCorrectTageWrong++;
+        } else if (sc_pred_taken != actual_taken && tage_pred_taken == actual_taken) {
+            mgscStats.scWrongTageCorrect++;
+        } else if (sc_pred_taken == actual_taken && tage_pred_taken == actual_taken) {
+            mgscStats.scCorrectTageCorrect++;
+        } else if (sc_pred_taken != actual_taken && tage_pred_taken != actual_taken) {
+            mgscStats.scWrongTageWrong++;
+        }
+    } else {
+        mgscStats.scNotUsed++;  // sc confidence is low
+    }
+
+    // Record raw percsum correctness and weight criticality for each table
+    auto recordPercsum = [&](int percsum, auto &correct, auto &wrong) {
+        if ((percsum >= 0) == actual_taken) {
+            correct++;
+        } else {
+            wrong++;
+        }
+    };
+    if (pred.bw_weight_scale_diff) {
+        mgscStats.bwWeightScaleDiff++;
+    }
+    recordPercsum(pred.bw_percsum, mgscStats.bwPercsumCorrect, mgscStats.bwPercsumWrong);
+
+    if (pred.l_weight_scale_diff) {
+        mgscStats.lWeightScaleDiff++;
+    }
+    recordPercsum(pred.l_percsum, mgscStats.lPercsumCorrect, mgscStats.lPercsumWrong);
+
+    if (pred.i_weight_scale_diff) {
+        mgscStats.iWeightScaleDiff++;
+    }
+    recordPercsum(pred.i_percsum, mgscStats.iPercsumCorrect, mgscStats.iPercsumWrong);
+
+    if (pred.g_weight_scale_diff) {
+        mgscStats.gWeightScaleDiff++;
+    }
+    recordPercsum(pred.g_percsum, mgscStats.gPercsumCorrect, mgscStats.gPercsumWrong);
+
+    if (pred.p_weight_scale_diff) {
+        mgscStats.pWeightScaleDiff++;
+    }
+    recordPercsum(pred.p_percsum, mgscStats.pPercsumCorrect, mgscStats.pPercsumWrong);
+
+    if (pred.bias_weight_scale_diff) {
+        mgscStats.biasWeightScaleDiff++;
+    }
+    recordPercsum(pred.bias_percsum, mgscStats.biasPercsumCorrect, mgscStats.biasPercsumWrong);
+
+    // SC usage under TAGE confidence buckets
+    auto recordConfOutcome = [&](bool conf_high, bool conf_mid, bool conf_low, bool use, bool correct) {
+        if (conf_high) {
+            if (use) {
+                correct ? mgscStats.scHighUseCorrect++ : mgscStats.scHighUseWrong++;
+            } else {
+                mgscStats.scHighBypass++;
+            }
+        } else if (conf_mid) {
+            if (use) {
+                correct ? mgscStats.scMidUseCorrect++ : mgscStats.scMidUseWrong++;
+            } else {
+                mgscStats.scMidBypass++;
+            }
+        } else if (conf_low) {
+            if (use) {
+                correct ? mgscStats.scLowUseCorrect++ : mgscStats.scLowUseWrong++;
+            } else {
+                mgscStats.scLowBypass++;
+            }
+        }
+    };
+    recordConfOutcome(tage_conf_high, tage_conf_mid, tage_conf_low, pred.use_mgsc, sc_pred_taken == actual_taken);
 }
 
 /**
@@ -557,7 +860,7 @@ BTBMGSC::updateGlobalThreshold(Addr pc, bool update_direction)
  */
 void
 BTBMGSC::updateSinglePredictor(const BTBEntry &entry, bool actual_taken, const MgscPrediction &pred,
-                               const FetchStream &stream)
+                               const FetchTarget &stream)
 {
     // Extract prediction information
     auto total_sum = pred.total_sum;
@@ -566,26 +869,49 @@ BTBMGSC::updateSinglePredictor(const BTBEntry &entry, bool actual_taken, const M
     auto sc_pred_taken = total_sum >= 0;
     auto tage_pred_taken = pred.taken_before_sc;  // tage predictions
 
-    // Update statistics
-    if (use_mgsc) {
-        mgscStats.scUsed++;
-        if (sc_pred_taken == actual_taken && tage_pred_taken != actual_taken) {
-            mgscStats.scCorrectTageWrong++;
-        } else if (sc_pred_taken != actual_taken && tage_pred_taken == actual_taken) {
-            mgscStats.scWrongTageCorrect++;
-        } else if (sc_pred_taken == actual_taken && tage_pred_taken == actual_taken) {
-            mgscStats.scCorrectTageCorrect++;
-        } else if (sc_pred_taken != actual_taken && tage_pred_taken != actual_taken) {
-            mgscStats.scWrongTageWrong++;
-        }
-    } else {
-        mgscStats.scNotUsed++;  // sc confidence is low
-    }
+    recordPredictionStats(pred, actual_taken, sc_pred_taken, tage_pred_taken);
 
-    // Only update tables if prediction was wrong or confidence was low
-    if (sc_pred_taken != actual_taken || abs(total_sum) < total_thres) {
+#ifndef UNIT_TEST
+    // Write trace record
+    if (enableDB && (focusBranchPC == 0 || entry.pc == focusBranchPC)) {
+        auto effective_gate = pred.tage_conf_high ? (total_thres / 2)
+            : (pred.tage_conf_mid ? (total_thres / 4) : (total_thres / 8));
+        auto margin = std::abs(total_sum) - effective_gate;
+        auto indexAt = [](const std::vector<unsigned> &indices, size_t idx) -> uint64_t {
+            return idx < indices.size() ? indices[idx] : 0;
+        };
+        MgscTrace t;
+        t.set(entry.pc,
+            stream.startPC, getOffset(entry.pc),
+            tage_pred_taken, pred.tage_conf_high, pred.tage_conf_mid, pred.tage_conf_low,
+            pred.bw_percsum, pred.l_percsum, pred.i_percsum,
+            pred.g_percsum, pred.p_percsum, pred.bias_percsum,
+            total_sum, total_thres, effective_gate, margin,
+            indexAt(pred.bwIndex, 0), indexAt(pred.bwIndex, 1),
+            indexAt(pred.lIndex, 0), indexAt(pred.lIndex, 1),
+            indexAt(pred.iIndex, 0),
+            indexAt(pred.gIndex, 0), indexAt(pred.gIndex, 1),
+            indexAt(pred.pIndex, 0), indexAt(pred.pIndex, 1),
+            indexAt(pred.biasIndex, 0),
+            use_mgsc, sc_pred_taken, sc_pred_taken != actual_taken,
+            actual_taken);
+        mgscMissTrace->write_record(t);
+    }
+#endif
+
+        // Only update tables if prediction was wrong or confidence was low
+    if (sc_pred_taken != actual_taken || abs(total_sum) < (total_thres / 2)) {
         // get weight table index from startPC
-        Addr weightTableIdx = getPcIndex(stream.startPC, weightTableIdxWidth);
+        Addr weightTableIdx = getPcIndex(stream.startPC, weightTableIdxWidth,
+                                         stream.asidHash);
+        bool threshold_inc = (sc_pred_taken != actual_taken);
+        if (threshold_inc) {
+            mgscStats.pcThresholdInc++;
+            mgscStats.globalThresholdInc++;
+        } else {
+            mgscStats.pcThresholdDec++;
+            mgscStats.globalThresholdDec++;
+        }
 
         // Update BW tables
         updatePredTable(bwTable, pred.bwIndex, bwTableNum, entry.pc, actual_taken);
@@ -617,8 +943,11 @@ BTBMGSC::updateSinglePredictor(const BTBEntry &entry, bool actual_taken, const M
         updateWeightTable(biasWeightTable, weightTableIdx, entry.pc, pred.bias_weight_scale_diff,
                           (pred.bias_percsum >= 0) == actual_taken);
 
-        // Update PC-indexed threshold table
-        updatePCThresholdTable(entry.pc, sc_pred_taken != actual_taken);
+        // Update PC-indexed threshold table (only if enabled)
+        if (enablePCThreshold) {
+            updatePCThresholdTable(entry.pc, stream.asidHash,
+                                   sc_pred_taken != actual_taken);
+        }
 
         // Update global threshold table
         updateGlobalThreshold(entry.pc, sc_pred_taken != actual_taken);
@@ -626,7 +955,7 @@ BTBMGSC::updateSinglePredictor(const BTBEntry &entry, bool actual_taken, const M
 }
 
 void
-BTBMGSC::update(const FetchStream &stream)
+BTBMGSC::update(const FetchTarget &stream)
 {
     if (!isEnabled()) {
         return;  // No update if disabled
@@ -703,7 +1032,8 @@ BTBMGSC::updateCounter<uint64_t>(bool taken, unsigned width, uint64_t &counter);
 
 
 Addr
-BTBMGSC::getHistIndex(Addr pc, unsigned tableIndexBits, uint64_t foldedHist)
+BTBMGSC::getHistIndex(Addr pc, unsigned tableIndexBits, uint64_t foldedHist,
+                      uint8_t asidHash)
 {
     // Create mask to limit result size to tableIndexBits
     Addr mask = (1ULL << tableIndexBits) - 1;
@@ -712,11 +1042,12 @@ BTBMGSC::getHistIndex(Addr pc, unsigned tableIndexBits, uint64_t foldedHist)
     Addr pcBits = (pc >> floorLog2(blockSize)) & mask;
     Addr foldedBits = foldedHist & mask;
 
-    return pcBits ^ foldedBits;
+    return xorAsidHashIntoIndex(pcBits ^ foldedBits, tableIndexBits, asidHash);
 }
 
 Addr
-BTBMGSC::getBiasIndex(Addr pc, unsigned tableIndexBits, bool lowbit0, bool lowbit1)
+BTBMGSC::getBiasIndex(Addr pc, unsigned tableIndexBits, bool lowbit0,
+                      bool lowbit1, uint8_t asidHash)
 {
     // Create mask for tableIndexBits-2 to extract PC bits
     Addr mask = (1ULL << (tableIndexBits - 2)) - 1;
@@ -724,17 +1055,18 @@ BTBMGSC::getBiasIndex(Addr pc, unsigned tableIndexBits, bool lowbit0, bool lowbi
     // Extract lower bits of PC directly and combine with low bits
     Addr pcBits = (pc >> floorLog2(blockSize)) & mask;
     unsigned index = (pcBits << 2) + (lowbit1 << 1) + lowbit0;
-    return index;
+    return xorAsidHashIntoIndex(index, tableIndexBits, asidHash);
 }
 
 Addr
-BTBMGSC::getPcIndex(Addr pc, unsigned tableIndexBits)
+BTBMGSC::getPcIndex(Addr pc, unsigned tableIndexBits, uint8_t asidHash)
 {
     // Create mask to extract tableIndexBits from PC
     Addr mask = (1ULL << tableIndexBits) - 1;
 
     // Extract lower bits of PC directly without bitset
-    return (pc >> floorLog2(blockSize)) & mask;
+    Addr baseIndex = (pc >> floorLog2(blockSize)) & mask;
+    return xorAsidHashIntoIndex(baseIndex, tableIndexBits, asidHash);
 }
 
 template<typename T>
@@ -833,108 +1165,70 @@ BTBMGSC::doUpdateHist(const boost::dynamic_bitset<> &history, int shamt, bool ta
 
 
 /**
- * @brief Updates branch history for speculative execution
- *
- * This function updates the branch history for speculative execution
- * based on the provided history and prediction information.
- *
- * It first retrieves the history information from the prediction metadata
- * and then calls the doUpdateHist function to update the folded histories.
- *
- * @param history The current branch history
- * @param pred The prediction metadata containing history information
+ * @brief Speculatively updates global folded histories.
  */
 void
-BTBMGSC::specUpdateHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred)
+BTBMGSC::specUpdateGHist(const boost::dynamic_bitset<> &history,
+                        FullBTBPrediction &pred,
+                        const DirectionHistoryUpdate &update)
 {
-    int shamt;
-    bool cond_taken;
-    std::tie(shamt, cond_taken) = pred.getHistInfo();
-    doUpdateHist(history, shamt, cond_taken, indexGFoldedHist);  // use global history to update G folded history
+    auto &state = historyState(pred.tid);
+    doUpdateHist(history, update.shamt, update.taken,
+                 state.indexGFoldedHist);  // use global history to update G folded history
 }
 
 /**
- * @brief Updates branch history for speculative execution
- *
- * This function updates the branch history for speculative execution
- * based on the provided history and prediction information.
- *
- * It first retrieves the history information from the prediction metadata
- * and then calls the doUpdateHist function to update the folded histories.
- *
- * @param history The current branch history
- * @param pred The prediction metadata containing history information
+ * @brief Speculatively updates path folded histories.
  */
 void
-BTBMGSC::specUpdatePHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred)
+BTBMGSC::specUpdatePHist(const boost::dynamic_bitset<> &history,
+                         FullBTBPrediction &pred,
+                         const PathHistoryUpdate &update)
 {
-    auto [pc, target, taken] = pred.getPHistInfo();
-    doUpdateHist(history, 2, taken, indexPFoldedHist, pc, target);  // only path history needs pc!
+    auto &state = historyState(pred.tid);
+    doUpdateHist(history, update.shamt, update.taken, state.indexPFoldedHist,
+                 update.pc, update.target);  // only path history needs pc!
 }
 
 
 /**
- * @brief Updates global backward branch history for speculative execution
- *
- * This function updates the branch history for speculative execution
- * based on the provided history and prediction information.
- *
- * It first retrieves the history information from the prediction metadata
- * and then calls the doUpdateHist function to update the folded histories.
- *
- * @param history The current global backward branch history
- * @param pred The prediction metadata containing history information
+ * @brief Speculatively updates global backward folded histories.
  */
 void
-BTBMGSC::specUpdateBwHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred)
+BTBMGSC::specUpdateBwHist(const boost::dynamic_bitset<> &history,
+                          FullBTBPrediction &pred,
+                          const DirectionHistoryUpdate &update)
 {
-    int shamt;
-    bool cond_taken;
-    std::tie(shamt, cond_taken) = pred.getBwHistInfo();
-    doUpdateHist(history, shamt, cond_taken, indexBwFoldedHist);
+    auto &state = historyState(pred.tid);
+    doUpdateHist(history, update.shamt, update.taken, state.indexBwFoldedHist);
 }
 
 /**
- * @brief Updates IMLI branch history for speculative execution
- *
- * This function updates the branch history for speculative execution
- * based on the provided history and prediction information.
- *
- * It first retrieves the history information from the prediction metadata
- * and then calls the doUpdateHist function to update the folded histories.
- *
- * @param history The current imli branch history
- * @param pred The prediction metadata containing history information
+ * @brief Speculatively updates IMLI folded histories.
  */
 void
-BTBMGSC::specUpdateIHist(const boost::dynamic_bitset<> &history, FullBTBPrediction &pred)
+BTBMGSC::specUpdateIHist(FullBTBPrediction &pred,
+                         const DirectionHistoryUpdate &update)
 {
-    int shamt;
-    bool cond_taken;
-    std::tie(shamt, cond_taken) = pred.getBwHistInfo();
-    doUpdateHist(history, shamt, cond_taken, indexIFoldedHist);
+    auto &state = historyState(pred.tid);
+    // IMLI uses counter only, pass empty bitset (not used by ImliFoldedHist::update)
+    boost::dynamic_bitset<> dummy;
+    doUpdateHist(dummy, update.shamt, update.taken, state.indexIFoldedHist);
 }
 
 /**
- * @brief Updates local branch history for speculative execution
- *
- * This function updates the branch history for speculative execution
- * based on the provided history and prediction information.
- *
- * It first retrieves the history information from the prediction metadata
- * and then calls the doUpdateHist function to update the folded histories.
- *
- * @param history The current local branch history
- * @param pred The prediction metadata containing history information
+ * @brief Speculatively updates local folded histories.
  */
 void
-BTBMGSC::specUpdateLHist(const std::vector<boost::dynamic_bitset<>> &history, FullBTBPrediction &pred)
+BTBMGSC::specUpdateLHist(const std::vector<boost::dynamic_bitset<>> &history,
+                         FullBTBPrediction &pred,
+                         const DirectionHistoryUpdate &update)
 {
-    int shamt;
-    bool cond_taken;
-    std::tie(shamt, cond_taken) = pred.getHistInfo();
-    doUpdateHist(history[getPcIndex(pred.bbStart, log2(numEntriesFirstLocalHistories))], shamt, cond_taken,
-                 indexLFoldedHist[getPcIndex(pred.bbStart, log2(numEntriesFirstLocalHistories))]);
+    auto &state = historyState(pred.tid);
+    const Addr localHistoryIndex =
+        getPcIndex(pred.bbStart, log2(numEntriesFirstLocalHistories), pred.asidHash);
+    doUpdateHist(history[localHistoryIndex], update.shamt, update.taken,
+                 state.indexLFoldedHist[localHistoryIndex]);
 }
 
 /**
@@ -951,16 +1245,17 @@ BTBMGSC::specUpdateLHist(const std::vector<boost::dynamic_bitset<>> &history, Fu
  * @param cond_taken The actual branch outcome
  */
 void
-BTBMGSC::recoverHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt, bool cond_taken)
+BTBMGSC::recoverHist(const boost::dynamic_bitset<> &history, const FetchTarget &entry, int shamt, bool cond_taken)
 {
     if (!isEnabled()) {
         return;  // No recover when disabled
     }
+    auto &state = historyState(entry.tid);
     std::shared_ptr<MgscMeta> predMeta = std::static_pointer_cast<MgscMeta>(entry.predMetas[getComponentIdx()]);
     for (int i = 0; i < gTableNum; i++) {
-        indexGFoldedHist[i].recover(predMeta->indexGFoldedHist[i]);
+        state.indexGFoldedHist[i].recover(predMeta->indexGFoldedHist[i]);
     }
-    doUpdateHist(history, shamt, cond_taken, indexGFoldedHist);
+    doUpdateHist(history, shamt, cond_taken, state.indexGFoldedHist);
 }
 
 /**
@@ -977,16 +1272,20 @@ BTBMGSC::recoverHist(const boost::dynamic_bitset<> &history, const FetchStream &
  * @param cond_taken The actual branch outcome
  */
 void
-BTBMGSC::recoverPHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt, bool cond_taken)
+BTBMGSC::recoverPHist(const boost::dynamic_bitset<> &history,
+                      const FetchTarget &entry,
+                      const PathHistoryUpdate &update)
 {
     if (!isEnabled()) {
         return;  // No recover when disabled
     }
+    auto &state = historyState(entry.tid);
     std::shared_ptr<MgscMeta> predMeta = std::static_pointer_cast<MgscMeta>(entry.predMetas[getComponentIdx()]);
     for (int i = 0; i < pTableNum; i++) {
-        indexPFoldedHist[i].recover(predMeta->indexPFoldedHist[i]);
+        state.indexPFoldedHist[i].recover(predMeta->indexPFoldedHist[i]);
     }
-    doUpdateHist(history, 2, cond_taken, indexPFoldedHist, entry.getControlPC(), entry.getTakenTarget());
+    doUpdateHist(history, update.shamt, update.taken, state.indexPFoldedHist,
+                 update.pc, update.target);
 }
 
 /**
@@ -1003,16 +1302,17 @@ BTBMGSC::recoverPHist(const boost::dynamic_bitset<> &history, const FetchStream 
  * @param cond_taken The actual branch outcome
  */
 void
-BTBMGSC::recoverBwHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt, bool cond_taken)
+BTBMGSC::recoverBwHist(const boost::dynamic_bitset<> &history, const FetchTarget &entry, int shamt, bool cond_taken)
 {
     if (!isEnabled()) {
         return;  // No recover when disabled
     }
+    auto &state = historyState(entry.tid);
     std::shared_ptr<MgscMeta> predMeta = std::static_pointer_cast<MgscMeta>(entry.predMetas[getComponentIdx()]);
     for (int i = 0; i < bwTableNum; i++) {
-        indexBwFoldedHist[i].recover(predMeta->indexBwFoldedHist[i]);
+        state.indexBwFoldedHist[i].recover(predMeta->indexBwFoldedHist[i]);
     }
-    doUpdateHist(history, shamt, cond_taken, indexBwFoldedHist);
+    doUpdateHist(history, shamt, cond_taken, state.indexBwFoldedHist);
 }
 
 /**
@@ -1022,23 +1322,26 @@ BTBMGSC::recoverBwHist(const boost::dynamic_bitset<> &history, const FetchStream
  * 1. Restores the folded histories from the saved metadata
  * 2. Updates the histories with the correct branch outcome
  * 3. Ensures predictor state is consistent after recovery
+ * Note: IMLI only uses counter, not history bits.
  *
- * @param history The branch history to recover to
  * @param entry The fetch stream entry containing recovery information
  * @param shamt Number of bits to shift in history update
  * @param cond_taken The actual branch outcome
  */
 void
-BTBMGSC::recoverIHist(const boost::dynamic_bitset<> &history, const FetchStream &entry, int shamt, bool cond_taken)
+BTBMGSC::recoverIHist(const FetchTarget &entry, int shamt, bool cond_taken)
 {
     if (!isEnabled()) {
         return;  // No recover when disabled
     }
+    auto &state = historyState(entry.tid);
     std::shared_ptr<MgscMeta> predMeta = std::static_pointer_cast<MgscMeta>(entry.predMetas[getComponentIdx()]);
     for (int i = 0; i < iTableNum; i++) {
-        indexIFoldedHist[i].recover(predMeta->indexIFoldedHist[i]);
+        state.indexIFoldedHist[i].recover(predMeta->indexIFoldedHist[i]);
     }
-    doUpdateHist(history, shamt, cond_taken, indexIFoldedHist);
+    // IMLI uses counter only, pass empty bitset (not used by ImliFoldedHist::update)
+    boost::dynamic_bitset<> dummy;
+    doUpdateHist(dummy, shamt, cond_taken, state.indexIFoldedHist);
 }
 
 /**
@@ -1055,22 +1358,26 @@ BTBMGSC::recoverIHist(const boost::dynamic_bitset<> &history, const FetchStream 
  * @param cond_taken The actual branch outcome
  */
 void
-BTBMGSC::recoverLHist(const std::vector<boost::dynamic_bitset<>> &history, const FetchStream &entry, int shamt,
+BTBMGSC::recoverLHist(const std::vector<boost::dynamic_bitset<>> &history, const FetchTarget &entry, int shamt,
                       bool cond_taken)
 {
     if (!isEnabled()) {
         return;  // No recover when disabled
     }
+    auto &state = historyState(entry.tid);
     std::shared_ptr<MgscMeta> predMeta = std::static_pointer_cast<MgscMeta>(entry.predMetas[getComponentIdx()]);
     for (unsigned int k = 0; k < numEntriesFirstLocalHistories; ++k) {
         for (int i = 0; i < lTableNum; i++) {
-            indexLFoldedHist[k][i].recover(predMeta->indexLFoldedHist[k][i]);
+            state.indexLFoldedHist[k][i].recover(predMeta->indexLFoldedHist[k][i]);
         }
     }
-    doUpdateHist(history[getPcIndex(entry.startPC, log2(numEntriesFirstLocalHistories))], shamt, cond_taken,
-                 indexLFoldedHist[getPcIndex(entry.startPC, log2(numEntriesFirstLocalHistories))]);
+    const Addr localHistoryIndex =
+        getPcIndex(entry.startPC, log2(numEntriesFirstLocalHistories), entry.asidHash);
+    doUpdateHist(history[localHistoryIndex], shamt, cond_taken,
+                 state.indexLFoldedHist[localHistoryIndex]);
 }
 
+#ifndef UNIT_TEST
 // Constructor for TAGE statistics
 BTBMGSC::MgscStats::MgscStats(statistics::Group *parent)
     : statistics::Group(parent),
@@ -1091,12 +1398,50 @@ BTBMGSC::MgscStats::MgscStats(statistics::Group *parent)
       ADD_STAT(scPredMissTaken, statistics::units::Count::get(), "number of sc prediction miss taken"),
       ADD_STAT(scPredMissNotTaken, statistics::units::Count::get(), "number of sc prediction miss not taken"),
       ADD_STAT(scPredCorrectTageWrong, statistics::units::Count::get(),"number of sc prediction correct and tage wrong"),
-      ADD_STAT(scPredWrongTageCorrect, statistics::units::Count::get(),"number of sc prediction wrong and tage correct")
+      ADD_STAT(scPredWrongTageCorrect, statistics::units::Count::get(),
+               "number of sc prediction wrong and tage correct"),
+
+      ADD_STAT(bwWeightScaleDiff, statistics::units::Count::get(), "bw table weight scaling decisive"),
+      ADD_STAT(lWeightScaleDiff, statistics::units::Count::get(), "l table weight scaling decisive"),
+      ADD_STAT(iWeightScaleDiff, statistics::units::Count::get(), "i table weight scaling decisive"),
+      ADD_STAT(gWeightScaleDiff, statistics::units::Count::get(), "g table weight scaling decisive"),
+      ADD_STAT(pWeightScaleDiff, statistics::units::Count::get(), "p table weight scaling decisive"),
+      ADD_STAT(biasWeightScaleDiff, statistics::units::Count::get(), "bias table weight scaling decisive"),
+
+      ADD_STAT(bwPercsumCorrect, statistics::units::Count::get(), "bw table raw percsum sign correct"),
+      ADD_STAT(bwPercsumWrong, statistics::units::Count::get(), "bw table raw percsum sign wrong"),
+      ADD_STAT(lPercsumCorrect, statistics::units::Count::get(), "l table raw percsum sign correct"),
+      ADD_STAT(lPercsumWrong, statistics::units::Count::get(), "l table raw percsum sign wrong"),
+      ADD_STAT(iPercsumCorrect, statistics::units::Count::get(), "i table raw percsum sign correct"),
+      ADD_STAT(iPercsumWrong, statistics::units::Count::get(), "i table raw percsum sign wrong"),
+      ADD_STAT(gPercsumCorrect, statistics::units::Count::get(), "g table raw percsum sign correct"),
+      ADD_STAT(gPercsumWrong, statistics::units::Count::get(), "g table raw percsum sign wrong"),
+      ADD_STAT(pPercsumCorrect, statistics::units::Count::get(), "p table raw percsum sign correct"),
+      ADD_STAT(pPercsumWrong, statistics::units::Count::get(), "p table raw percsum sign wrong"),
+      ADD_STAT(biasPercsumCorrect, statistics::units::Count::get(), "bias table raw percsum sign correct"),
+      ADD_STAT(biasPercsumWrong, statistics::units::Count::get(), "bias table raw percsum sign wrong"),
+
+      ADD_STAT(pcThresholdInc, statistics::units::Count::get(), "pc threshold increment"),
+      ADD_STAT(pcThresholdDec, statistics::units::Count::get(), "pc threshold decrement"),
+      ADD_STAT(globalThresholdInc, statistics::units::Count::get(), "global threshold increment"),
+      ADD_STAT(globalThresholdDec, statistics::units::Count::get(), "global threshold decrement"),
+
+      ADD_STAT(scHighUseCorrect, statistics::units::Count::get(), "tage high conf, sc used, correct"),
+      ADD_STAT(scHighUseWrong, statistics::units::Count::get(), "tage high conf, sc used, wrong"),
+      ADD_STAT(scMidUseCorrect, statistics::units::Count::get(), "tage mid conf, sc used, correct"),
+      ADD_STAT(scMidUseWrong, statistics::units::Count::get(), "tage mid conf, sc used, wrong"),
+      ADD_STAT(scLowUseCorrect, statistics::units::Count::get(), "tage low conf, sc used, correct"),
+      ADD_STAT(scLowUseWrong, statistics::units::Count::get(), "tage low conf, sc used, wrong"),
+      ADD_STAT(scHighBypass, statistics::units::Count::get(), "tage high conf, sc not used"),
+      ADD_STAT(scMidBypass, statistics::units::Count::get(), "tage mid conf, sc not used"),
+      ADD_STAT(scLowBypass, statistics::units::Count::get(), "tage low conf, sc not used")
 {
 }
+#endif
 
+#ifndef UNIT_TEST
 void
-BTBMGSC::commitBranch(const FetchStream &stream, const DynInstPtr &inst)
+BTBMGSC::commitBranch(const FetchTarget &stream, const DynInstPtr &inst)
 {
     if (!inst->isCondCtrl()) {
         // tage olnly deals with conditional branches
@@ -1145,11 +1490,21 @@ BTBMGSC::commitBranch(const FetchStream &stream, const DynInstPtr &inst)
     }
 
 }
+#endif
 
 void
 BTBMGSC::checkFoldedHist(const boost::dynamic_bitset<> &Ghistory, const boost::dynamic_bitset<> &PHistory,
                          const std::vector<boost::dynamic_bitset<>> &LHistory, const char *when)
 {
+    checkFoldedHist(Ghistory, PHistory, LHistory, 0, when);
+}
+
+void
+BTBMGSC::checkFoldedHist(const boost::dynamic_bitset<> &Ghistory, const boost::dynamic_bitset<> &PHistory,
+                         const std::vector<boost::dynamic_bitset<>> &LHistory,
+                         ThreadID tid, const char *when)
+{
+    auto &state = historyState(tid);
     DPRINTF(MGSC, "checking folded history when %s\n", when);
     if (debug::MGSC) {
         std::string hist_str;
@@ -1157,21 +1512,25 @@ BTBMGSC::checkFoldedHist(const boost::dynamic_bitset<> &Ghistory, const boost::d
         DPRINTF(MGSC, "history:\t%s\n", hist_str.c_str());
     }
     for (int t = 0; t < gTableNum; t++) {
-        auto &foldedHist = indexGFoldedHist[t];
+        auto &foldedHist = state.indexGFoldedHist[t];
         foldedHist.check(Ghistory);
     }
     for (int t = 0; t < pTableNum; t++) {
-        auto &foldedHist = indexPFoldedHist[t];
+        auto &foldedHist = state.indexPFoldedHist[t];
         foldedHist.check(PHistory);
     }
     for (int t = 0; t < lTableNum; t++) {
-        assert(LHistory.size() == indexLFoldedHist.size());
+        assert(LHistory.size() == state.indexLFoldedHist.size());
         for (int i = 0; i < LHistory.size(); i++) {
-            auto &foldedHist = indexLFoldedHist[i][t];
+            auto &foldedHist = state.indexLFoldedHist[i][t];
             foldedHist.check(LHistory[i]);
         }
     }
 }
+
+#ifdef UNIT_TEST
+}  // namespace test
+#endif
 
 }  // namespace btb_pred
 

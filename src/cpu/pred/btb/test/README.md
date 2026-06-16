@@ -73,8 +73,8 @@ boost::dynamic_bitset<> history(64, 0);
 // Make prediction to generate meta data
 tage->putPCHistory(startPC, history, stagePreds);
 
-// update (folded) histories for tage
-tage->specUpdateHist(s0History, finalPred);
+// update folded histories for tage
+tage->specUpdateGHist(s0History, finalPred, finalPred.getGHistUpdate());
 tage->getPredictionMeta();
 
 // shift history
@@ -88,7 +88,7 @@ tage->checkFoldedHist(s0History, "speculative update");
 2. Update Phase:
 ```cpp
 // Setup update stream
-FetchStream stream;
+FetchTarget stream;
 stream.startPC = pc;
 stream.exeBranchInfo = entry;
 stream.exeTaken = taken;
@@ -101,7 +101,7 @@ tage->update(stream);
 3. control squash/Recovery Phase:
 ```cpp
 // set up recover stream
-FetchStream recoverStream;
+FetchTarget recoverStream;
 recoverStream.startPC = pc;
 recoverStream.exeBranchInfo = entry;
 recoverStream.exeTaken = taken;
@@ -149,7 +149,7 @@ auto meta = btb->getPredictionMeta();
 2. Update Phase:
 ```cpp
 // Setup update stream
-FetchStream stream;
+FetchTarget stream;
 stream.startPC = pc;
 stream.predMetas[0] = meta;
 

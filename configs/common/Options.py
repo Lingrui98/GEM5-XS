@@ -279,16 +279,6 @@ def addCommonOptions(parser, configure_xiangshan=False):
                         help="enable bp database for specified subdatabase, "
                         "basic branch trace is enabled by default even without specifying, "
                         "available subdatabase: basic, tage, ras, loop")
-    parser.add_argument("--disable-sc", default=False, action="store_true",
-                        help="disable SC (enabled by default, only for FTBTAGE)")
-    parser.add_argument("--disable-mgsc", default=False, action="store_true",
-                        help="disable MGSC (only for BTBTAGE)")
-    parser.add_argument("--enable-loop-buffer", default=False, action="store_true",
-                        help="enable loop buffer (only for ftb branch predictor)")
-    parser.add_argument("--enable-loop-predictor", default=False, action="store_true",
-                        help="enable loop predictor (only for ftb branch predictor)")
-    parser.add_argument("--enable-jump-ahead-predictor", default=False, action="store_true",
-                        help="enable jump ahead predictor (only for ftb branch predictor)")
 
     parser.add_argument("--list-rp-types",
                         action=ListRP, nargs=0,
@@ -300,9 +290,6 @@ def addCommonOptions(parser, configure_xiangshan=False):
     parser.add_argument("--functional-tlb", action="store_true", default=False,
                         help="""
                         Use functional TLB""")
-    parser.add_argument("--open-sv48", action="store_true", default=False,
-                        help="""
-                        Enable sv48""")
     parser.add_argument("--list-hwp-types",
                         action=ListHWP, nargs=0,
                         help="List available hardware prefetcher types")
@@ -318,6 +305,12 @@ def addCommonOptions(parser, configure_xiangshan=False):
     parser.add_argument("--pht-pf-level", action="store", default=2,
                         help="""
                         Prefetching cache level for SMS'pht""")
+
+    parser.add_argument("--disable-pf-buffer", action="store_false",
+                        dest="enable_pf_buffer", default=True,
+                        help="""
+                        Force all hardware prefetchers to disable their
+                        optional prefetch buffer (QueuedPrefetcher.use_pf_buffer).""")
 
     parser.add_argument("--cpu-clock", action="store", type=str,
                         default='3GHz',
@@ -357,16 +350,18 @@ def addCommonOptions(parser, configure_xiangshan=False):
         "that are present under any of the roots. If not given, dump all "
         "stats. ")
 
+    parser.add_argument(
+        "--smt", action="store_true", default=False,
+        help=(
+            "RISCV SMT support, which requires multitThread-supported "
+            "gcpt restore and diff-ref-so"
+        ))
+
     if configure_xiangshan:
         return
     # Following options are not available in XiangShan
 
     parser.add_argument("--checker", action="store_true")
-    parser.add_argument("--smt", action="store_true", default=False,
-                        help="""
-                      Only used if multiple programs are specified. If true,
-                      then the number of threads per cpu is same as the
-                      number of programs.""")
     parser.add_argument(
         "--elastic-trace-en", action="store_true",
         help="""Enable capture of data dependency and instruction
@@ -642,10 +637,34 @@ def addFSOptions(parser):
     parser.add_argument("--wait-gdb", default=False, action='store_true',
                         help="Wait for remote GDB to connect.")
 
-def addXiangshanFSOptions(parser):
+def addXiangshanCommonOptions(parser):
     # Xiangshan related options
-    parser.add_argument("--xiangshan-system", action= "store_true",
+    parser.add_argument("--xiangshan-system", action="store_true",
                         help="Use memory layout of Xiangshan system")
+    parser.add_argument("--mmc-img", action="store", type=str,
+                        default=None, help="The path of mmc img")
+    parser.add_argument("--mmc-cptbin", action="store",
+                        type=str, default=None, help="The path of mmc cptbin")
+
+    # Difftest option
+    parser.set_defaults(enable_difftest=None)
+    parser.add_argument("--enable-difftest",
+                        action="store_true",
+                        dest="enable_difftest",
+                        help="use NEMU as ref to do difftest")
+    parser.add_argument("--disable-difftest",
+                        action="store_false",
+                        dest="enable_difftest",
+                        help="disable NEMU difftest")
+
+    parser.add_argument("--difftest-ref-so",
+                        action="store",
+                        default=None,
+                        help="The shared lib file used to do difftest")
+
+
+def addXiangshanFSOptions(parser):
+    addXiangshanCommonOptions(parser)
 
     parser.add_argument("--enable-h-gcpt", action= "store_true",
                         help="enable h checkpoint")
@@ -658,21 +677,6 @@ def addXiangshanFSOptions(parser):
 
     parser.add_argument("--raw-cpt", action= "store_true",
                         help = "The checkpoint file is not gz but binary")
-
-    parser.add_argument("--mmc-img", action="store", type=str,
-                        default=None, help="The path of mmc img")
-    parser.add_argument("--mmc-cptbin", action="store",
-                        type=str, default=None, help="The path of mmc cptbin")
-
-    # Difftest option
-    parser.add_argument("--enable-difftest",
-                        action="store_true",
-                        help="use NEMU as ref to do difftest")
-
-    parser.add_argument("--difftest-ref-so",
-                        action="store",
-                        default=None,
-                        help="The shared lib file used to do difftest")
 
 def addXiangshanTraceOptions(parser):
     # Add trace-specific arguments for trace-driven simulation

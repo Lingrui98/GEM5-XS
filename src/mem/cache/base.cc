@@ -103,7 +103,7 @@ BaseCache::SendTimingRespEvent::description() const
 }
 
 BaseCache::SendCustomEvent::SendCustomEvent(BaseCache* cache, PacketPtr pkt, int sig, bool deletePkt)
-    : Event(Stat_Event_Pri, AutoDelete),
+    : Event(Minimum_Pri, AutoDelete),
       cache(cache),
       pkt(pkt),
       sig(sig),
@@ -178,6 +178,7 @@ BaseCache::BaseCache(const BaseCacheParams &p, unsigned blk_size)
       blocked(0),
       order(0),
       noTargetMSHR(nullptr),
+      noMshrBlockedStartCycle(Cycles(0)),
       missCount(p.max_miss_count),
       addrRanges(p.addr_ranges.begin(), p.addr_ranges.end()),
       archDBer(p.arch_db),
@@ -310,6 +311,14 @@ BaseCache::init()
         fatal("Cache ports on %s are not connected\n", name());
     cpuSidePort.sendRangeChange();
     forwardSnoops = cpuSidePort.isSnooping();
+    mshrQueue.resetOccupancyStats(curTick());
+}
+
+void
+BaseCache::resetStats()
+{
+    ClockedObject::resetStats();
+    mshrQueue.resetOccupancyStats(curTick());
 }
 
 Port &
@@ -333,6 +342,30 @@ BaseCache::inRange(Addr addr) const
        }
     }
     return false;
+}
+
+double
+BaseCache::getMshrAvgEntryNum() const
+{
+    const Tick now = curTick();
+    const Tick elapsed = mshrQueue.getOccupancyElapsedTicks(now);
+    if (elapsed == 0) {
+        return 0.0;
+    }
+
+    return static_cast<double>(mshrQueue.getOccupancyEntryTicks(now)) /
+        static_cast<double>(elapsed);
+}
+
+double
+BaseCache::getMshrOccupancyRatio() const
+{
+    const int num_entries = mshrQueue.getNumEntries();
+    if (num_entries <= 0) {
+        return 0.0;
+    }
+
+    return getMshrAvgEntryNum() / static_cast<double>(num_entries);
 }
 
 bool
@@ -513,6 +546,13 @@ BaseCache::handleTimingReqMiss(PacketPtr pkt, MSHR *mshr, CacheBlk *blk,
                     pkt->missOnLatePf = true;
                     pkt->pfSource = mshr->getPFSource();
                     pkt->pfDepth = mshr->getPFDepth();
+
+                    // Demand request merging into prefetch-only MSHR
+                    if (pkt->isDemand()) {
+                        stats.demandMergedIntoPfMSHR++;
+                        DPRINTF(Cache, "Demand request %#lx merged into prefetch MSHR\n",
+                                pkt->getAddr());
+                    }
 
                 } else if (mshr->hasFromCPU()) {
                     // no pkt in mshr originated from cache; all of them are from cpu
@@ -924,7 +964,10 @@ BaseCache::recvTimingResp(PacketPtr pkt)
         // Optionally indicate that the Dcache received a refill request
         // to drive LSQ-side modelling.
         if (simulateDcacheRefill && cacheLevel == 1 && pkt->getLSQPtr()) {
-            pkt->getLSQPtr()->pendingDcacheRefill = true;
+            const Addr refill_addr =
+                pkt->req && pkt->req->hasVaddr() ? pkt->req->getVaddr() :
+                pkt->getAddr();
+            pkt->getLSQPtr()->notifyDcacheRefill(refill_addr);
             stats.DcacheRefillTimes++;
         }
         blk = handleFill(pkt, blk, writebacks, allocate);
@@ -2852,6 +2895,12 @@ BaseCache::CacheStats::CacheStats(BaseCache &c)
     ADD_STAT(overallAvgMshrUncacheableLatency, statistics::units::Rate<
                 statistics::units::Tick, statistics::units::Count>::get(),
              "average overall mshr uncacheable latency"),
+    ADD_STAT(mshrAvgEntryNum, statistics::units::Ratio::get(),
+             "average number of allocated MSHR entries"),
+    ADD_STAT(mshrOccupancyRatio, statistics::units::Ratio::get(),
+             "average allocated MSHR entry ratio"),
+    ADD_STAT(noMshrBlockedCycles, statistics::units::Cycle::get(),
+             "number of cycles blocked by no MSHR entries"),
     ADD_STAT(bytesRecvPerCycle, statistics::units::Ratio::get(),
              "average bandwidth receiving data from lower cache."),
     ADD_STAT(replacements, statistics::units::Count::get(),
@@ -2884,6 +2933,12 @@ BaseCache::CacheStats::CacheStats(BaseCache &c)
              "number of squashed dead block replacements"),
     ADD_STAT(squashedLiveBlockReplacements, statistics::units::Count::get(),
                 "number of squashed live block replacements"),
+    ADD_STAT(pfMergedWithDemand, statistics::units::Count::get(),
+             "number of MSHR completions where prefetch was merged with demand"),
+    ADD_STAT(pfOnlyFill, statistics::units::Count::get(),
+             "number of MSHR completions with only prefetch (no demand merge)"),
+    ADD_STAT(demandMergedIntoPfMSHR, statistics::units::Count::get(),
+             "number of demand requests that merged into prefetch MSHR"),
     ADD_STAT(squashedDemandHits, statistics::units::Count::get(),
              "number of squashed inst block demand hits"),
     ADD_STAT(loadTagReadFails, statistics::units::Count::get(),
@@ -3142,6 +3197,14 @@ BaseCache::CacheStats::regStats()
         overallAvgMshrUncacheableLatency.subname(i,
             system->getRequestorName(i));
     }
+
+    mshrAvgEntryNum
+        .flags(nonan)
+        .functor([this]() { return cache.getMshrAvgEntryNum(); });
+
+    mshrOccupancyRatio
+        .flags(nonan)
+        .functor([this]() { return cache.getMshrOccupancyRatio(); });
 
     bytesRecvPerCycle.flags(total | nozero | nonan);
     bytesRecvPerCycle = bytesRecv / simTicks * cache.clockPeriod();

@@ -61,6 +61,34 @@ class XiangshanECore2Read(XiangshanCore):
 
 addToPath('../')
 
+_warned_deprecated_entrypoint = False
+
+
+def _warn_if_deprecated_xiangshan_entrypoint():
+    """
+    Defensive UX: historically some docs/scripts used `configs/example/xiangshan.py`.
+
+    We no longer keep that entrypoint in this repo. If users still run a legacy
+    config script named `xiangshan.py`, emit a warning and point them to the
+    maintained entrypoints.
+    """
+    global _warned_deprecated_entrypoint
+    if _warned_deprecated_entrypoint:
+        return
+
+    # In gem5, sys.argv[0] is typically the config script path.
+    argv0 = os.path.basename(sys.argv[0]) if sys.argv else ""
+    argv_joined = " ".join(sys.argv) if sys.argv else ""
+
+    if argv0 == "xiangshan.py" or "configs/example/xiangshan.py" in argv_joined:
+        warn(
+            "Deprecated config entrypoint detected (xiangshan.py). "
+            "Please use configs/example/kmhv3.py (RTL-aligned) or "
+            "configs/example/idealkmhv3.py (ideal/perf)."
+        )
+        _warned_deprecated_entrypoint = True
+
+
 def _trace_timing_ptw_settings(args: argparse.Namespace):
     enabled = bool(getattr(args, 'trace_timing_ptw', False))
     if not enabled:
@@ -105,35 +133,196 @@ def _apply_trace_timing_ptw_cpu_params(args: argparse.Namespace, cpus, *, shrink
         cpu.traceAddrSize = int(cpu.traceAddrSize) - reserved_bytes
 
 
+def resolve_linux_cmdline(args: argparse.Namespace, default_cmdline: str) -> str:
+    command_line = getattr(args, "command_line", None)
+    command_line_file = getattr(args, "command_line_file", None)
+
+    if command_line and command_line_file:
+        fatal("--command-line and --command-line-file are mutually exclusive")
+
+    if command_line:
+        return command_line.strip()
+
+    if command_line_file:
+        with open(command_line_file) as cmdline_file:
+            return cmdline_file.read().strip()
+
+    return default_cmdline
+
+
+def generate_xiangshan_dtb(system, *, cmdline: str, outdir: str = None) -> str:
+    if outdir is None:
+        outdir = m5.options.outdir
+    dtb_path = os.path.join(outdir, "device.dtb")
+    dts_path = os.path.join(outdir, "device.dts")
+    state = FdtState(addr_cells=2, size_cells=2, cpu_cells=1)
+    root = FdtNode("/")
+    root.append(state.addrCellsProperty())
+    root.append(state.sizeCellsProperty())
+    root.appendCompatible(["freechips,rocketchip-unknown-soc"])
+    root.append(FdtPropertyStrings("model", "xiangshan-raw-linux"))
+
+    chosen = FdtNode("chosen")
+    if cmdline:
+        chosen.append(FdtPropertyStrings("bootargs", cmdline))
+    chosen.append(FdtPropertyStrings("stdout-path", "/soc/serial@40600000"))
+    chosen.append(FdtPropertyStrings("linux,stdout-path", "/soc/serial@40600000"))
+    root.append(chosen)
+
+    for mem_range in system.mem_ranges:
+        node = FdtNode("memory@%x" % int(mem_range.start))
+        node.append(FdtPropertyStrings("device_type", ["memory"]))
+        node.append(
+            FdtPropertyWords(
+                "reg",
+                state.addrCells(mem_range.start) +
+                state.sizeCells(mem_range.size())
+            )
+        )
+        root.append(node)
+
+    cpus_node = FdtNode("cpus")
+    cpus_state = FdtState(addr_cells=1, size_cells=0)
+    cpus_node.append(cpus_state.addrCellsProperty())
+    cpus_node.append(cpus_state.sizeCellsProperty())
+    cpus_node.append(FdtPropertyWords("timebase-frequency", [10000000]))
+
+    mmu_type = "riscv,sv48"
+    isa_string = "rv64imafdc"
+
+    for i, cpu in enumerate(system.cpu):
+        node = FdtNode(f"cpu@{i}")
+        node.append(FdtPropertyStrings("device_type", "cpu"))
+        node.append(FdtPropertyWords("reg", state.CPUAddrCells(i)))
+        node.append(FdtPropertyStrings("mmu-type", mmu_type))
+        node.append(FdtPropertyStrings("status", "okay"))
+        node.append(FdtPropertyStrings("riscv,isa", isa_string))
+        freq = int(cpu.clk_domain.unproxy(cpu).clock[0].frequency)
+        node.append(FdtPropertyWords("clock-frequency", freq))
+        node.appendCompatible(["riscv"])
+        node.appendPhandle(f"cpu@{i}")
+
+        int_node = FdtNode("interrupt-controller")
+        int_state = FdtState(interrupt_cells=1)
+        int_phandle = int_state.phandle(f"cpu@{i}.int_state")
+        int_node.append(int_state.interruptCellsProperty())
+        int_node.append(FdtProperty("interrupt-controller"))
+        int_node.appendCompatible("riscv,cpu-intc")
+        int_node.append(FdtPropertyWords("phandle", [int_phandle]))
+
+        node.append(int_node)
+        cpus_node.append(node)
+
+    root.append(cpus_node)
+
+    soc_node = FdtNode("soc")
+    soc_state = FdtState(addr_cells=2, size_cells=2)
+    soc_node.append(soc_state.addrCellsProperty())
+    soc_node.append(soc_state.sizeCellsProperty())
+    soc_node.append(FdtProperty("ranges"))
+    soc_node.appendCompatible(["simple-bus"])
+
+    clint = system.lint
+    clint_node = clint.generateBasicPioDeviceNode(
+        soc_state, "clint", clint.pio_addr, clint.pio_size
+    )
+    clint_interrupts = []
+    for i, _cpu in enumerate(system.cpu):
+        phandle = soc_state.phandle(f"cpu@{i}.int_state")
+        clint_interrupts.extend([phandle, 0x3, phandle, 0x7])
+    clint_node.append(FdtPropertyWords("interrupts-extended", clint_interrupts))
+    clint_node.appendCompatible(["riscv,clint0"])
+    soc_node.append(clint_node)
+
+    plic = system.plic
+    plic_node = plic.generateBasicPioDeviceNode(
+        soc_state, "plic", plic.pio_addr, plic.pio_size
+    )
+    plic_int_state = FdtState(addr_cells=0, interrupt_cells=1)
+    plic_node.append(plic_int_state.addrCellsProperty())
+    plic_node.append(plic_int_state.interruptCellsProperty())
+    plic_phandle = plic_int_state.phandle("xiangshan-plic")
+    plic_node.append(FdtPropertyWords("phandle", [plic_phandle]))
+    plic_node.append(FdtPropertyWords("riscv,ndev", [31]))
+    plic_interrupts = []
+    for i, _cpu in enumerate(system.cpu):
+        phandle = state.phandle(f"cpu@{i}.int_state")
+        plic_interrupts.extend([phandle, 0xB, phandle, 0x9])
+    plic_node.append(FdtPropertyWords("interrupts-extended", plic_interrupts))
+    plic_node.append(FdtProperty("interrupt-controller"))
+    plic_node.appendCompatible(["riscv,plic0"])
+    soc_node.append(plic_node)
+
+    uart = system.uartlite
+    uart_node = uart.generateBasicPioDeviceNode(
+        soc_state, "serial", uart.pio_addr, uart.pio_size
+    )
+    uart_node.append(FdtPropertyWords("clock-frequency", [0]))
+    uart_node.append(FdtPropertyStrings("status", "okay"))
+    uart_node.appendCompatible(["xlnx,xps-uartlite-1.00.a"])
+    soc_node.append(uart_node)
+
+    root.append(soc_node)
+
+    fdt = Fdt()
+    fdt.add_rootnode(root)
+    fdt.writeDtsFile(dts_path)
+    fdt.writeDtbFile(dtb_path)
+    return dtb_path
+
+
+def configure_xiangshan_linux_workload(system, args: argparse.Namespace,
+                                       default_cmdline: str = "console=ttyS0 earlycon=sbi loglevel=7") -> None:
+    cmdline = resolve_linux_cmdline(args, default_cmdline)
+    if hasattr(system.workload, "command_line"):
+        system.workload.command_line = cmdline
+    system.workload.dtb_addr = 0x87e00000
+
+    if getattr(args, "dtb_filename", None):
+        dtb_path = args.dtb_filename
+    else:
+        dtb_path = generate_xiangshan_dtb(system, cmdline=cmdline)
+    system.workload.dtb_filename = dtb_path
+
+
+def resolve_xiangshan_ref_so(args: argparse.Namespace):
+    ref_so = None
+    if args.difftest_ref_so is not None:
+        ref_so = args.difftest_ref_so
+        print("Obtained ref_so from args.difftest_ref_so: ", ref_so)
+    elif (args.num_cpus > 1 or args.smt) and "GCBV_MULTI_CORE_REF_SO" in os.environ:
+        ref_so = os.environ["GCBV_MULTI_CORE_REF_SO"]
+        print("Obtained ref_so from GCBV_MULTI_CORE_REF_SO: ", ref_so)
+    elif "GCBV_REF_SO" in os.environ:
+        ref_so = os.environ["GCBV_REF_SO"]
+        print("Obtained ref_so from GCBV_REF_SO: ", ref_so)
+    elif "GCBH_REF_SO" in os.environ:
+        ref_so = os.environ["GCBH_REF_SO"]
+        print("Obtained ref_so from GCBH_REF_SO: ", ref_so)
+    elif "NEMU_HOME" in os.environ:
+        ref_so = os.path.join(os.environ["NEMU_HOME"], "build/riscv64-nemu-interpreter-so")
+        print("Obtained ref_so from NEMU_HOME: ", ref_so)
+    else:
+        fatal("No valid ref_so file specified for the functional model to "
+              "compare against. Please 1) either specify a valid ref_so file using "
+              "the --difftest-ref-so option;\n"
+              "2) or specify GCBV_REF_SO/GCBV_MULTI_CORE_REF_SO/GCBH_REF_SO that points to the ref_so file;\n"
+              "3) or specify NEMU_HOME that contains build/riscv64-nemu-interpreter-so")
+    return ref_so
+
+
+def get_xiangshan_cpu_class(args: argparse.Namespace):
+    if args.xiangshan_ecore:
+        args.cpu_clock = '2.4GHz'
+        return XiangshanECore
+    return XiangshanCore
+
+
 def config_xiangshan_inputs(args: argparse.Namespace, sys):
     ref_so = None
 
-    # configure difftest input
-    if args.enable_difftest and args.difftest_ref_so is None:
-        # ref so should be either provided from the command line or from the env
-        if args.num_cpus > 1 and "GCBV_MULTI_CORE_REF_SO" in os.environ:
-            ref_so = os.environ["GCBV_MULTI_CORE_REF_SO"]
-            print("Obtained ref_so from GCBV_MULTI_CORE_REF_SO: ", ref_so)
-        elif "GCBV_REF_SO" in os.environ:
-            ref_so = os.environ["GCBV_REF_SO"]
-            print("Obtained ref_so from GCBV_REF_SO: ", ref_so)
-        elif "GCBH_REF_SO" in os.environ:
-            ref_so = os.environ["GCBH_REF_SO"]
-            print("Obtained ref_so from GCBH_REF_SO: ", ref_so)
-        elif "NEMU_HOME" in os.environ:
-            ref_so = os.path.join(os.environ["NEMU_HOME"], "build/riscv64-nemu-interpreter-so")
-            print("Obtained ref_so from NEMU_HOME: ", ref_so)
-        else:
-            if "GCBV_REF_SO" in os.environ:
-                print("Currently XS-GEM5 always turn on RVV and require a ref_so with RVV support")
-            fatal("No valid ref_so file specified for the functional model to "
-                  "compare against. Please 1) either specify a valid ref_so file using "
-                  "the --difftest-ref-so option;\n"
-                  "2) or specify GCBV_REF_SO/GCBV_MULTI_CORE_REF_SO/GCBH_REF_SO that points to the ref_so file;\n"
-                  "3) or specify NEMU_HOME that contains build/riscv64-nemu-interpreter-so")
-    elif args.enable_difftest and args.difftest_ref_so is not None:
-        ref_so = args.difftest_ref_so
-        print("Obtained ref_so from args.difftest_ref_so: ", ref_so)
+    if args.enable_difftest:
+        ref_so = resolve_xiangshan_ref_so(args)
 
     args.difftest_ref_so = ref_so
 
@@ -141,12 +330,12 @@ def config_xiangshan_inputs(args: argparse.Namespace, sys):
         if args.raw_cpt:
             # If using raw binary, no restorer is needed.
             gcpt_restorer = None
-        elif args.num_cpus > 1:
+        elif args.num_cpus > 1 or args.smt:
             if "GCB_MULTI_CORE_RESTORER" in os.environ:
                 gcpt_restorer = os.environ["GCB_MULTI_CORE_RESTORER"]
                 print("Obtained gcpt_restorer from GCB_MULTI_CORE_RESTORER: ", gcpt_restorer)
             else:
-                fatal("Plz set $GCB_MULTI_CORE_RESTORER when model Xiangshan with multi-core")
+                fatal("Plz set $GCB_MULTI_CORE_RESTORER when model Xiangshan with multi-context difftest")
         elif args.restore_rvv_cpt:
             if "GCBV_RESTORER" in os.environ:
                 gcpt_restorer = os.environ["GCBV_RESTORER"]
@@ -160,18 +349,14 @@ def config_xiangshan_inputs(args: argparse.Namespace, sys):
             else:
                 fatal("Plz set $GCBH_RESTORER when running RVH checkpoints")
         else:
-            if "GCB_RESTORER" in os.environ:
-                gcpt_restorer = os.environ["GCB_RESTORER"]
-                print("Obtained gcpt_restorer from GCB_RESTORER: ", gcpt_restorer)
-            else:
-                fatal("Plz set $GCB_RESTORER or pass it through --gcpt-restorer"
-                      " when running non-RVV checkpoints")
+            gcpt_restorer = ""
+            print("Using restorer embedded in checkpoint")
     else:
         print("Obtained gcpt_restorer from args.gcpt_restorer: ", args.gcpt_restorer)
         gcpt_restorer = args.gcpt_restorer
 
-    if args.num_cpus > 1:
-        print("Simulating a multi-core system, demanding a larger GCPT restorer size (2M).")
+    if args.num_cpus > 1 or args.smt:
+        print("Simulating a multi-context system, demanding a larger GCPT restorer size (2M).")
         sys.gcpt_restorer_size_limit = 2**20
     elif args.restore_rvv_cpt:
         print("Simulating single core with RVV, demanding GCPT restorer size of 0x1000.")
@@ -218,7 +403,7 @@ def config_difftest(cpu_list, args, sys):
     if not args.enable_difftest:
         return
     else:
-        if len(cpu_list) > 1:
+        if len(cpu_list) > 1 or args.smt:
             sys.enable_mem_dedup = True
             for cpu in cpu_list:
                 cpu.enable_mem_dedup = True
@@ -230,71 +415,9 @@ def config_difftest(cpu_list, args, sys):
             cpu_list[0].enable_difftest = True
             cpu_list[0].difftest_ref_so = args.difftest_ref_so
 
-def build_xiangshan_system(args):
+def _finish_xiangshan_system(args, test_sys, TestCPUClass, ruby):
     np = args.num_cpus
-    assert buildEnv['TARGET_ISA'] == "riscv"
-
-    # override cpu class and clock
-    if args.xiangshan_ecore:
-        TestCPUClass = XiangshanECore
-        args.cpu_clock = '2.4GHz'
-    else:
-        TestCPUClass = XiangshanCore
-
-    ruby = False
-    if hasattr(args, 'ruby') and args.ruby:
-        ruby = True
-
-    # Create system using FS mode with trace-specific memory configuration
-    test_sys = makeBareMetalXiangshanSystem('timing', SysConfig(mem=args.mem_size), None, np=np, ruby=ruby)
-
-    # CRITICAL FIX: Configure trace-specific memory ranges and functional TLB for trace mode
-    if hasattr(args, 'enable_trace_mode') and args.enable_trace_mode:
-        if bool(getattr(args, 'trace_timing_ptw', False)):
-            print("Trace mode: Using FS mode with timing MMU (timing-PTW enabled)")
-        else:
-            print("Trace mode: Using FS mode with functional TLB to bypass MMU translation issues")
-        print("Trace mode: Configuring expanded memory ranges for trace address mapping")
-        # Force functional TLB to bypass complex MMU translation
-        args.functional_tlb = True
-    else:
-        print("Checkpoint mode: Using standard FS mode with normal MMU translation")
-    test_sys.num_cpus = np
-
-    test_sys.xiangshan_system = True
-    # args.enable_difftest should be normalized by xiangshan_system_init().
-    test_sys.enable_difftest = args.enable_difftest
-
-    # Configure XiangShan inputs - skip checkpoint loading in trace mode
-    if hasattr(args, 'enable_trace_mode') and args.enable_trace_mode:
-        args.difftest_ref_so = None
-
-        # Trace mode FS configuration with functional TLB.
-        # We run without a bootloader but must still set the bootloader
-        # parameter explicitly, since RiscvBareMetal.bootloader has no
-        # default. An empty string is treated as "no bootloader" and we
-        # reuse the xiangshan_cpt flag to take the no-bootloader path in
-        # the BareMetal workload implementation.
-        test_sys.workload.bootloader = ''
-        test_sys.workload.xiangshan_cpt = True   # Reuse GCPT path to skip bootloader
-        test_sys.restore_from_gcpt = False       # Disable GCPT restoration
-        print("Trace mode: Running without bootloader (no GCPT)")
-
-        # Configure DRAMsim3 if needed for memory controller
-        if args.mem_type == 'DRAMsim3' and args.dramsim3_ini is None:
-            root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-            args.dramsim3_ini = os.path.join(root_dir,
-                                             'ext/dramsim3/xiangshan_configs/xiangshan_DDR4_8Gb_x8_3200_2ch.ini')
-
-        if bool(getattr(args, 'trace_timing_ptw', False)):
-            print("Trace mode: Timing MMU will be applied for timing-PTW")
-        else:
-            print("Trace mode: FS mode with functional TLB configured to bypass MMU translation issues")
-    else:
-        # Standard checkpoint-based configuration
-        config_xiangshan_inputs(args, test_sys)
-
-     # Set the cache line size for the entire system
+    # Set the cache line size for the entire system
     test_sys.cache_line_size = args.cacheline_size
 
     # Create a top-level voltage domain
@@ -316,11 +439,15 @@ def build_xiangshan_system(args):
     test_sys.cpu = [TestCPUClass(clk_domain=test_sys.cpu_clk_domain, cpu_id=i)
                     for i in range(np)]
     # Configure MMU for trace-aware FS mode
+    if args.smt:
+        test_sys.multi_thread = True
+
     for cpu in test_sys.cpu:
+        if args.smt:
+            cpu.numThreads = 2
         cpu.mmu.pma_checker = PMAChecker(
             uncacheable=[AddrRange(0, size=0x80000000)])
         cpu.mmu.functional = args.functional_tlb
-        cpu.mmu.enable_sv48 = args.open_sv48
 
         if hasattr(args, 'enable_trace_mode') and args.enable_trace_mode:
             timing_ptw = bool(getattr(args, 'trace_timing_ptw', False))
@@ -329,50 +456,27 @@ def build_xiangshan_system(args):
             print(f"Trace mode: CPU {cpu.cpu_id} configured with {mode_str} translation")
 
     # configure BP
-    args.enable_loop_predictor = True
-    if args.enable_riscv_vector:
-        args.enable_loop_buffer = True
-
     for i in range(np):
         if args.kmh_align:
             test_sys.cpu[i].enable_storeSet_train = False
 
-        if args.bp_type is None or args.bp_type == 'DecoupledBPUWithFTB' or args.bp_type == 'DecoupledBPUWithBTB':
-            enable_bp_db = len(args.enable_bp_db) > 1
-            if enable_bp_db:
-                bp_db_switches = args.enable_bp_db[1] + ['basic']
-                print("BP db switches:", bp_db_switches)
-            else:
-                bp_db_switches = []
-            # for DecoupledBPUWithBTB, loop predictor and jump ahead predictor are not supported
-            #if args.bp_type == 'DecoupledBPUWithBTB':
-            if args.enable_loop_predictor or args.enable_loop_buffer:
-                print("loop predictor and loop buffer not supported for DecoupledBPUWithBTB")
-                args.enable_loop_predictor = False
-                args.enable_loop_buffer = False
-            if args.enable_jump_ahead_predictor:
-                print("jump ahead predictor not supported for DecoupledBPUWithBTB")
-                args.enable_jump_ahead_predictor = False
+        if args.bp_type != 'DecoupledBPUWithBTB':
+            fatal(
+                "Only --bp-type=DecoupledBPUWithBTB is supported for Xiangshan in this repo "
+                f"(got --bp-type={args.bp_type})."
+            )
 
-            BPClass = DecoupledBPUWithBTB() if args.bp_type == 'DecoupledBPUWithBTB' else DecoupledBPUWithFTB()
-            test_sys.cpu[i].branchPred = BPClass(
-                                            bpDBSwitches=bp_db_switches,
-                                            enableLoopBuffer=args.enable_loop_buffer,
-                                            enableLoopPredictor=args.enable_loop_predictor,
-                                            enableJumpAheadPredictor=args.enable_jump_ahead_predictor
-                                            )
-            test_sys.cpu[i].branchPred.tage.enableSC = not args.disable_sc
-            test_sys.cpu[i].branchPred.isDumpMisspredPC = True
-
+        enable_bp_db = len(args.enable_bp_db) > 1
+        if enable_bp_db:
+            bp_db_switches = list(args.enable_bp_db[1])
+            print("BP db switches:", bp_db_switches)
         else:
-            BPClass = ObjectList.bp_list.get(args.bp_type)
-            test_sys.cpu[i].branchPred = BPClass()
+            bp_db_switches = []
 
-        if args.indirect_bp_type:
-            IndirectBPClass = ObjectList.indirect_bp_list.get(
-                args.indirect_bp_type)
-            test_sys.cpu[i].branchPred.indirectBranchPred = \
-                    IndirectBPClass()
+        test_sys.cpu[i].branchPred = DecoupledBPUWithBTB(
+            bpDBSwitches=bp_db_switches,
+        )
+        test_sys.cpu[i].branchPred.isDumpMisspredPC = True
 
     # configure memory related
     if args.mem_type == 'DRAMsim3':
@@ -578,7 +682,7 @@ def build_xiangshan_system(args):
         perfCCT_cmd += PerfRecord.vals[0] + " bigint unsigned NOT NULL"
         for i in range(1, len(PerfRecord.vals)):
             name = PerfRecord.vals[i]
-            type_str = "bigint unsigned" if name.lower().startswith(('at', 'pc')) else "char(20)"
+            type_str = "bigint unsigned" if name.lower().startswith(('at', 'pc', 'result')) else "char(20)"
             perfCCT_cmd += "," + name + " " + type_str + " NOT NULL"
         perfCCT_cmd += ");"
 
@@ -605,6 +709,7 @@ CREATE TABLE LoadLifeTimeCommitTrace(
         test_sys.arch_db.dump_l3_evict_trace = False
         test_sys.arch_db.dump_l1_miss_trace = False
         test_sys.arch_db.dump_bop_train_trace = False
+        test_sys.arch_db.dump_stride_train_trace = False
         test_sys.arch_db.dump_sms_train_trace = False
         test_sys.arch_db.dump_vaddr_trace = False
         test_sys.arch_db.dump_lifetime = False
@@ -677,6 +782,29 @@ CREATE TABLE LoadLifeTimeCommitTrace(
             "Conf INT NOT NULL," \
             "Miss BOOL NOT NULL," \
             "SITE TEXT);"
+            ,
+            "CREATE TABLE StrideTrainTrace(" \
+            "ID INTEGER PRIMARY KEY AUTOINCREMENT," \
+            "Tick INT NOT NULL," \
+            "Addr INT NOT NULL," \
+            "PC INT NOT NULL," \
+            "HashPC INT NOT NULL," \
+            "QueryHit BOOL NOT NULL," \
+            "IsFirstShot BOOL NOT NULL," \
+            "Miss BOOL NOT NULL," \
+            "IsTrain BOOL NOT NULL," \
+            "SITE TEXT);"
+            ,
+            "CREATE TABLE DespacitoTrainTrace(" \
+            "ID INTEGER PRIMARY KEY AUTOINCREMENT," \
+            "Tick INT NOT NULL," \
+            "vAddr INT NOT NULL," \
+            "pAddr INT NOT NULL," \
+            "PC INT NOT NULL," \
+            "hasPC BOOL NOT NULL," \
+            "Miss BOOL NOT NULL," \
+            "IsTrain BOOL NOT NULL," \
+            "SITE TEXT);"
             ,# perfCounter CommitTrace
             perfCCT_cmd
         ]
@@ -693,12 +821,72 @@ CREATE TABLE LoadLifeTimeCommitTrace(
     return test_sys
 
 
+def build_xiangshan_system(args):
+    np = args.num_cpus
+    assert buildEnv['TARGET_ISA'] == "riscv"
+
+    TestCPUClass = get_xiangshan_cpu_class(args)
+    ruby = bool(hasattr(args, 'ruby') and args.ruby)
+    num_threads = np * (2 if getattr(args, 'smt', False) else 1)
+
+    test_sys = makeBareMetalXiangshanSystem(
+        'timing', SysConfig(mem=args.mem_size), None, np=np, ruby=ruby,
+        num_threads=num_threads)
+
+    if hasattr(args, 'enable_trace_mode') and args.enable_trace_mode:
+        if bool(getattr(args, 'trace_timing_ptw', False)):
+            print("Trace mode: Using FS mode with timing MMU (timing-PTW enabled)")
+        else:
+            print("Trace mode: Using FS mode with functional TLB to bypass MMU translation issues")
+        print("Trace mode: Configuring expanded memory ranges for trace address mapping")
+        args.functional_tlb = True
+    else:
+        print("Checkpoint mode: Using standard FS mode with normal MMU translation")
+    test_sys.num_cpus = np
+    test_sys.xiangshan_system = True
+    test_sys.enable_difftest = args.enable_difftest
+
+    if hasattr(args, 'enable_trace_mode') and args.enable_trace_mode:
+        args.difftest_ref_so = None
+        test_sys.workload.bootloader = ''
+        test_sys.workload.xiangshan_cpt = True
+        test_sys.restore_from_gcpt = False
+        print("Trace mode: Running without bootloader (no GCPT)")
+
+        if args.mem_type == 'DRAMsim3' and args.dramsim3_ini is None:
+            root_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            args.dramsim3_ini = os.path.join(root_dir,
+                                             'ext/dramsim3/xiangshan_configs/xiangshan_DDR4_8Gb_x8_3200_2ch.ini')
+
+        if bool(getattr(args, 'trace_timing_ptw', False)):
+            print("Trace mode: Timing MMU will be applied for timing-PTW")
+        else:
+            print("Trace mode: FS mode with functional TLB configured to bypass MMU translation issues")
+    else:
+        config_xiangshan_inputs(args, test_sys)
+
+    return _finish_xiangshan_system(args, test_sys, TestCPUClass, ruby)
+
+
 def xiangshan_system_init():
+    _warn_if_deprecated_xiangshan_entrypoint()
     # Add args
     parser = argparse.ArgumentParser()
     Options.addCommonOptions(parser, configure_xiangshan=True)
     Options.addXiangshanFSOptions(parser)
     Options.addXiangshanTraceOptions(parser)
+    parser.add_argument(
+        "--btb-tage-upper-bound",
+        action="store_true",
+        default=False,
+        help="Use BTBTAGEUpperBound in kmhv3 instead of the default BTBTAGE",
+    )
+    parser.add_argument(
+        "--standalone-sc",
+        action="store_true",
+        default=False,
+        help="Disable direction TAGE sources in kmhv3 and force MGSC standalone SC prediction",
+    )
 
     # Add the ruby specific and protocol specific args
     if '--ruby' in sys.argv:
@@ -711,7 +899,8 @@ def xiangshan_system_init():
     args.xiangshan_system = True
     # Only enable difftest if not in trace mode - trace mode doesn't need reference model verification
     if not (hasattr(args, 'enable_trace_mode') and args.enable_trace_mode):
-        args.enable_difftest = True
+        if args.enable_difftest is None:
+            args.enable_difftest = True
     else:
         args.enable_difftest = False
         print("Trace mode: Difftest disabled for trace execution")
