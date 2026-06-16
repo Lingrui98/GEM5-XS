@@ -1798,7 +1798,7 @@ Fetch::handleDecodeSquash(ThreadID tid)
                 mispred_inst->staticInst, mispred_inst->getInstBytes(),
                 fromDecode->decodeInfo[tid].branchTaken,
                 mispred_inst->seqNum, tid, mispred_inst->getLoopIteration(),
-                false);
+                false, isTraceMode() && mispred_inst->hasTraceBranchInfo());
         } else {
             warn("Unexpected non-control squash from decode.\n");
         }

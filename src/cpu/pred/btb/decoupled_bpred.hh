@@ -397,7 +397,8 @@ class DecoupledBPUWithBTB : public BPredUnit
                        const StaticInstPtr &static_inst, unsigned inst_bytes,
                        bool actually_taken, const InstSeqNum &squashed_sn,
                        ThreadID tid, const unsigned &currentLoopIter,
-                       const bool fromCommit);
+                       const bool fromCommit,
+                       const bool trustTargetPc = false);
 
     // keep the target: original prediction might be right
     // For memory violation, target continues after squashing
