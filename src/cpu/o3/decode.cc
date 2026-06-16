@@ -794,13 +794,27 @@ Decode::decodeInsts(ThreadID tid)
         }
         // unpredicted return can make use of ras results to get earlier resteer
         if (inst->isReturn() && !inst->isNonSpeculative() && !inst->readPredTaken()) {
+            std::unique_ptr<PCStateBase> target;
+            if (cpu->isTraceMode() && inst->hasTraceBranchInfo()) {
+                target = std::make_unique<RiscvISA::PCState>(
+                    inst->traceBranchNextPC());
+                if (*target == inst->readPredTarg()) {
+                    DPRINTF(Decode,
+                            "[tid:%i] [sn:%llu] Trace return target already "
+                            "matches prediction: PredPC: %s TracePC: %s\n",
+                            tid, inst->seqNum, inst->readPredTarg(), *target);
+                    continue;
+                }
+            } else {
+                // return target cannot be computed in decode stage since it
+                // is an indirect branch; inquire bpu to get the target.
+                auto return_addr = fetch_ptr->getPreservedReturnAddr(inst);
+                target = std::make_unique<RiscvISA::PCState>(return_addr);
+            }
+
             ++stats.branchMispred;
             decode_stalls.push(StallReason::InstMisPred);
             breakDecode = StallReason::InstMisPred;
-            // return target cannot be computed in decode stage since it is an indirect branch
-            // need to inquire bpu to get the target
-            auto return_addr = fetch_ptr->getPreservedReturnAddr(inst);
-            auto target = std::make_unique<RiscvISA::PCState>(return_addr);
             DPRINTF(Decode, "[tid:%i] [sn:%llu] Updating predictions:"
                     " Return not identified by bp: predTaken %d, PredPC: %s Now PC %s\n",
                     tid, inst->seqNum, inst->readPredTaken(), inst->readPredTarg(), *target);
