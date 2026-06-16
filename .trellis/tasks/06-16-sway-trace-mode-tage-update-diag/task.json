@@ -1,0 +1,43 @@
+{
+  "id": "sway-trace-mode-tage-update-diag",
+  "name": "sway-trace-mode-tage-update-diag",
+  "title": "Diagnose why TAGE update path is silent in trace mode",
+  "description": "",
+  "status": "pending",
+  "dev_type": "investigation",
+  "scope": "src",
+  "package": "gem5-sway",
+  "priority": "P2",
+  "creator": "glr",
+  "assignee": null,
+  "createdAt": "2026-06-16",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "sway/phase-stranded-probe",
+  "worktree_path": "/nfs/home/goulingrui/project/GEM5-sway",
+  "current_phase": 0,
+  "next_action": [
+    {"phase": 1, "action": "instrument"},
+    {"phase": 2, "action": "root-cause"},
+    {"phase": 3, "action": "fix-or-document"}
+  ],
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/btb_tage.cc",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/decoupled_bpred.cc",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/o3/fetch.cc",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/o3/commit.cc",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/o3/trace/TraceFetch.cc",
+    "/nfs/home/goulingrui/project/papers/sway-paper/runs/W100K_champ/ipc1_W100K/ipc1_client_001/stats.txt"
+  ],
+  "notes": "Symptom: in trace mode, system.cpu.branchPred.tage.updateMispred == 0 across all 7 championship traces collected on 2026-06-16, while system.cpu.branchPred.tage.predHit is non-zero (>260K on ipc1_client_001). MBTB+BTBTAGE-active-ways probe also reads 0 for all TAGE tables under trace mode. cpt mode (SPEC17) shows the expected non-zero update path. This blocks using championship traces as Q2 (stranded->IPC) evidence; for the CAL paper SPEC17 cpt data is sufficient, so this is P2. Becomes P1 when starting HPCA extension since DaCapo javac + extended workloads will also need trace mode.",
+  "meta": {
+    "owning_project": "/nfs/home/goulingrui/project/papers/sway-paper",
+    "blocks": "HPCA extension Q2 / Figure 1 cohort expansion",
+    "evidence_path": "/nfs/home/goulingrui/project/papers/sway-paper/runs/W100K_champ"
+  }
+}
