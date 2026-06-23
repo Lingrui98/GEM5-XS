@@ -3,7 +3,7 @@
   "name": "sway-trace-mode-tage-update-diag",
   "title": "Diagnose why TAGE update path is silent in trace mode",
   "description": "",
-  "status": "pending",
+  "status": "done",
   "dev_type": "investigation",
   "scope": "src",
   "package": "gem5-sway",
@@ -11,16 +11,12 @@
   "creator": "glr",
   "assignee": null,
   "createdAt": "2026-06-16",
-  "completedAt": null,
+  "completedAt": "2026-06-16",
   "branch": null,
   "base_branch": "sway/phase-stranded-probe",
   "worktree_path": "/nfs/home/goulingrui/project/GEM5-sway",
-  "current_phase": 0,
-  "next_action": [
-    {"phase": 1, "action": "instrument"},
-    {"phase": 2, "action": "root-cause"},
-    {"phase": 3, "action": "fix-or-document"}
-  ],
+  "current_phase": 3,
+  "next_action": [],
   "commit": null,
   "pr_url": null,
   "subtasks": [],
@@ -34,7 +30,7 @@
     "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/o3/trace/TraceFetch.cc",
     "/nfs/home/goulingrui/project/papers/sway-paper/runs/W100K_champ/ipc1_W100K/ipc1_client_001/stats.txt"
   ],
-  "notes": "Symptom: in trace mode, system.cpu.branchPred.tage.updateMispred == 0 across all 7 championship traces collected on 2026-06-16, while system.cpu.branchPred.tage.predHit is non-zero (>260K on ipc1_client_001). MBTB+BTBTAGE-active-ways probe also reads 0 for all TAGE tables under trace mode. cpt mode (SPEC17) shows the expected non-zero update path. This blocks using championship traces as Q2 (stranded->IPC) evidence; for the CAL paper SPEC17 cpt data is sufficient, so this is P2. Becomes P1 when starting HPCA extension since DaCapo javac + extended workloads will also need trace mode.",
+  "notes": "Resolved 2026-06-16. The latest three trace-fix commits were ruled out by older ancestor evidence. Phase-1 counters showed trace mode reaches resolved update and BTBTAGE::update, but all update entries were filtered because resolved conditional entries stayed alwaysTaken. Deeper root cause: trace decode/IEW squash paths passed predicted taken as branchTaken instead of traceBranchTaken, so predicted-taken/actual-not-taken trace branches were recorded as hit-taken and never cleared MBTB alwaysTaken. Fix uses traceBranchTaken() as actual outcome in Decode::selfSquash and IEW::squashDueToBranch when trace branch metadata exists; BTBTAGE keeps the normal !alwaysTaken filter. Follow-up audit fixed similar trace metadata gaps: Decode::selfSquash now redirects to traceBranchNextPC, Commit no longer re-overrides trace branchTaken for static uncond branches, trace branch type now feeds DynInst/BranchInfo/CommitTrace classification, and ChampSim taken branches now carry an estimated mapped target. Audit cbp2025/int_0 500K smoke: mbtb.condHitNotTakens=4, tage.updateFilteredEntries=192, updateMispred=3, updateAllocSuccess=3. Audit CPT blender/26411 500K smoke stayed unchanged at updateFilteredEntries=60158, updateMispred=2835, updateAllocSuccess=2810.",
   "meta": {
     "owning_project": "/nfs/home/goulingrui/project/papers/sway-paper",
     "blocks": "HPCA extension Q2 / Figure 1 cohort expansion",
