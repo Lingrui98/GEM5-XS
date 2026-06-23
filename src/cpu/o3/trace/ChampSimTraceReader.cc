@@ -250,6 +250,10 @@ ChampSimTraceReader::convertInstruction(const ChampSimInstr &cs_instr,
         inst_type == TraceInstruction::InstType::UNCOND_DIRECT_BRANCH ||
         inst_type == TraceInstruction::InstType::UNCOND_INDIRECT_BRANCH) {
         trace_instr.setBranchTaken(eff_taken);
+        if (eff_taken) {
+            trace_instr.setBranchTarget(mapTracePcToVirtual(
+                estimateBranchTarget(cs_instr), cfg));
+        }
     }
 
     // Extract memory operations
