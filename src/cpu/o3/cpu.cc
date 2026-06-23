@@ -1787,6 +1787,13 @@ CPU::isTraceInstruction(InstSeqNum seqNum) const
     return fetch.isTraceInstruction(seqNum);
 }
 
+bool
+CPU::shouldDropFdipRefill(ContextID contextId,
+                          const Request::XsMetadata &xsMeta) const
+{
+    return fetch.shouldDropFdipRefill(contextId, xsMeta);
+}
+
 const o3::TraceInstruction*
 CPU::getTraceInstMetadata(InstSeqNum seqNum) const
 {
