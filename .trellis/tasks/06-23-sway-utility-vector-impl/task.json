@@ -1,0 +1,43 @@
+{
+  "id": "sway-utility-vector-impl",
+  "name": "sway-utility-vector-impl",
+  "title": "SWAY Phase 1 Task A: implement utility-vector probe",
+  "description": "Add an internal SwayController probe that dumps per-phase utility vectors from existing way-visit snapshots without changing BPU allocation behavior.",
+  "status": "completed",
+  "dev_type": "impl",
+  "scope": "src+data",
+  "package": "gem5-sway",
+  "priority": "P0",
+  "creator": "glr",
+  "assignee": "codex",
+  "createdAt": "2026-06-23",
+  "completedAt": "2026-06-23",
+  "branch": "sway/phase-stranded-probe",
+  "base_branch": "sway/phase-stranded-probe",
+  "worktree_path": "/nfs/home/goulingrui/project/GEM5-sway",
+  "current_phase": 3,
+  "next_action": [
+    {"phase": 1, "action": "implement utility CSV"},
+    {"phase": 2, "action": "smoke and batch validate"},
+    {"phase": 3, "action": "figure and closeout"}
+  ],
+  "commit": "b99edc67a6",
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/decoupled_bpred.hh",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/decoupled_bpred_stats.cc",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/mbtb.cc",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/btb_tage.cc",
+    "/nfs/home/goulingrui/project/papers/sway-paper/figures/figure3_utility.py",
+    "/nfs/home/goulingrui/project/papers/sway-paper/PLAN.md"
+  ],
+  "notes": "DONE 2026-06-23. Source commit b99edc67a6 adds measurement-only SwayController utility rows and dumps sway_utility_by_phase.csv without changing BPU allocation behavior. Build passed. Smoke blender_26411 500K/W=50K produced 90 utility rows + header and 90 stranded rows + header. Batch 10 SPEC17 cpt workloads W=100K/5M completed with 0 aborts; each workload produced 49 phases x 10 scopes. Figure 3 generated at ~/project/papers/sway-paper/figures/figure3_utility_per_phase.pdf.",
+  "meta": {
+    "owning_project": "/nfs/home/goulingrui/project/papers/sway-paper",
+    "phase": "Phase 1 Step A",
+    "metric": "utility = active_ways / total_ways from per-phase visit snapshots"
+  }
+}
