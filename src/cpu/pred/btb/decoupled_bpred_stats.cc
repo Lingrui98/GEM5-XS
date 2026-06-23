@@ -65,6 +65,8 @@ DecoupledBPUWithBTB::collectSwayWayVisitForPhase(int phaseID)
 {
     auto append = [&](const std::string& scope, uint64_t totalWays,
                       uint64_t validWays, uint64_t activeWays) {
+        swayController.collectPhaseScope(phaseID, scope, totalWays,
+                                         activeWays);
         swayStrandedByPhase.push_back({phaseID, scope, totalWays,
                                        validWays, activeWays});
     };
@@ -368,6 +370,20 @@ DecoupledBPUWithBTB::dumpStats()
             out << row.phaseID << ',' << row.scope << ','
                 << row.totalWays << ',' << row.validWays << ','
                 << row.activeWays << '\n';
+        }
+        simout.close(handle);
+    }
+
+    // 11. SWAY measurement-only utility vector rows.
+    {
+        auto handle = createOutputFile(
+            "sway_utility_by_phase.csv",
+            "phaseID,scope,total_ways,active_ways,utility");
+        auto& out = *handle->stream();
+        for (const auto& row : swayController.rows()) {
+            out << row.phaseID << ',' << row.scope << ','
+                << row.totalWays << ',' << row.activeWays << ','
+                << row.utility << '\n';
         }
         simout.close(handle);
     }
