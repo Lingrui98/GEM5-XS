@@ -28,6 +28,7 @@ of:
 | [Database Guidelines](./database-guidelines.md) | SQLite-based tracing/instrumentation conventions | Ready |
 | [Control-PC Contracts](./control-pc-contracts.md) | Executable contracts for decoder/fetch/predictor PC semantics and inherited predictor params | Ready |
 | [FDIP Guidelines](./fdip-guidelines.md) | Executable contracts for the current FTQ-directed ICache prefetch model, parameters, stats, and cleanup semantics | Ready |
+| [Trace Mode Contracts](./trace-mode-contracts.md) | Executable contracts for synthetic instructions vs trace-aware control-flow/BPU training semantics | Ready |
 | [Error Handling](./error-handling.md) | Runtime checks, fatal paths, warnings, and assertions | Ready |
 | [Quality Guidelines](./quality-guidelines.md) | Build/test expectations, hooks, and review checklist | Ready |
 | [Logging Guidelines](./logging-guidelines.md) | Debug flags, `warn`/`inform`, and what to emit | Ready |
@@ -45,6 +46,9 @@ Read these before changing code:
 - Read [Control-PC Contracts](./control-pc-contracts.md) before changing
   RISC-V partial decode, predictor-visible PC semantics, fetch ownership
   handoff, or inherited `TimedBaseBTBPredictor` params.
+- Read [Trace Mode Contracts](./trace-mode-contracts.md) before changing
+  trace-driven branch metadata, synthetic instruction generation, trace-mode
+  squash/redirect behavior, or trace-mode BPU update/classification paths.
 - Read [FDIP Guidelines](./fdip-guidelines.md) before changing FDIP knobs,
   fetch-side FDIP lifecycle/state, old-path refill drop, recent-unused
   suppression, or FDIP-related stats.
