@@ -382,6 +382,17 @@ class BTBTAGE : public TimedBaseBTBPredictor
         Scalar updateAllocSuccess;
         Scalar updateMispred;
         Scalar updateResetU;
+        Scalar updateCalls;
+        Scalar updateNoPredMeta;
+        Scalar updateRawEntries;
+        Scalar updateRawCondEntries;
+        Scalar updateRawResolvedEntries;
+        Scalar updateRawAlwaysTakenEntries;
+        Scalar updateRawCondResolvedEntries;
+        Scalar updateRawCondNotAlwaysTakenEntries;
+        Scalar updateFilteredEntries;
+        Scalar updateCallsWithNoFilteredEntries;
+        Scalar updateMissingOriginalPred;
         Scalar resolveBranchHasProvider;
         Scalar resolveBranchUseProvider;
         Scalar resolveBranchHasAlt;
