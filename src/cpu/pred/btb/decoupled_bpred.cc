@@ -7,6 +7,7 @@
 
 #include "arch/riscv/regs/misc.hh"
 #include "base/debug_helper.hh"
+#include "base/logging.hh"
 #include "base/output.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
@@ -294,6 +295,10 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
              smtFTQThreshold > ftqEntries,
              "SMT FTQ threshold (%u) exceeds total FTQ entries (%u)",
              smtFTQThreshold, ftqEntries);
+
+    fatal_if(enableFDIP && !fdipFlushPartialOnEpochChangeCfg,
+             "FDIP with --no-fdip-flush-partial-on-epoch-change is not "
+             "implemented yet in this MVP");
 
     if (bpDBSwitches.size() > 0) {
         initDB();

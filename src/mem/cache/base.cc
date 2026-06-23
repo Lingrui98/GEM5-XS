@@ -59,6 +59,7 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/lsq.hh"
+#include "cpu/thread_context.hh"
 #include "debug/ArchDB.hh"
 #include "debug/Cache.hh"
 #include "debug/CacheComp.hh"
@@ -1276,13 +1277,16 @@ BaseCache::recvTimingReq(PacketPtr pkt)
         ppHit->notify(pkt);
 
         bool first_acc_after_pf = false;
-        if (prefetcher && blk && blk->wasPrefetched()) {
+        if (blk && blk->wasPrefetched()) {
             DPRINTF(Cache, "Hit on prefetch for addr %#x (%s), source: %i\n", pkt->getAddr(),
                     pkt->isSecure() ? "s" : "ns", blk->getXsMetadata().prefetchSource);
             // pass the pf source from block to req, it may be used by either load inst or L(n-1) cache
             pkt->req->setPFSource(blk->getXsMetadata().prefetchSource);
             DPRINTF(Cache, "Mark req %p pf source: %i\n", pkt->req, pkt->req->getPFSource());
             pkt->req->setPFDepth(0);
+            if (isL1I() && pkt->isDemand() && isFdipBlk(blk)) {
+                stats.fdipUsefulHits++;
+            }
             blk->clearPrefetched();
             first_acc_after_pf = true;
         }
@@ -2799,6 +2803,32 @@ BaseCache::exclusiveCacheInvalidate(bool from_cache, CacheBlk *blk)
      !blk->isSet(CacheBlk::DirtyBit) && clusivity == enums::mostly_excl;
 }
 
+bool
+BaseCache::shouldDropFdipRefill(MSHR *mshr, const PacketPtr pkt) const
+{
+    if (!isL1I() || !mshr || !pkt || !pkt->req || mshr->hasFromDemand() ||
+        !isFdipPkt(pkt) || !pkt->req->hasXsMetadata()) {
+        return false;
+    }
+
+    const ContextID context_id = pkt->req->contextId();
+    if (context_id < 0 || context_id >= system->threads.size()) {
+        return false;
+    }
+
+    ThreadContext *thread_context = system->threads[context_id];
+    if (!thread_context) {
+        return false;
+    }
+
+    auto *cpu = dynamic_cast<o3::CPU *>(thread_context->getCpuPtr());
+    if (!cpu) {
+        return false;
+    }
+
+    return cpu->shouldDropFdipRefill(context_id, pkt->req->getXsMetadata());
+}
+
 void
 BaseCache::maintainClusivity(bool from_cache, CacheBlk *blk)
 {
@@ -3236,7 +3266,13 @@ BaseCache::invalidateBlock(CacheBlk *blk)
     }
     // If block is still marked as prefetched, then it hasn't been used
     if (blk->wasPrefetched()) {
-        prefetcher->prefetchUnused(regenerateBlkAddr(blk), blk->getXsMetadata().prefetchSource);
+        if (isL1I() && isFdipBlk(blk)) {
+            stats.fdipUnused++;
+        }
+        if (prefetcher) {
+            prefetcher->prefetchUnused(regenerateBlkAddr(blk),
+                                       blk->getXsMetadata().prefetchSource);
+        }
     }
 
     // Notify that the data contents for this address are no longer present
@@ -3949,8 +3985,12 @@ BaseCache::CacheStats::CacheStats(BaseCache &c)
              "number of data contractions"),
     ADD_STAT(fdipInstalled, statistics::units::Count::get(),
              "number of L1I fills installed by FDIP-triggered misses"),
+    ADD_STAT(fdipUsefulHits, statistics::units::Count::get(),
+             "number of L1I demand hits on FDIP-prefetched lines"),
     ADD_STAT(fdipLate, statistics::units::Count::get(),
              "number of late FDIP observations in L1I"),
+    ADD_STAT(fdipUnused, statistics::units::Count::get(),
+             "number of unused FDIP-prefetched L1I evictions"),
     ADD_STAT(fdipProbeMerged, statistics::units::Count::get(),
              "number of FDIP probes merged into an existing miss"),
     ADD_STAT(fdipEpochMismatch, statistics::units::Count::get(),

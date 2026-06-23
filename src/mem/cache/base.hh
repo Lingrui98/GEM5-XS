@@ -1468,8 +1468,14 @@ class BaseCache : public ClockedObject, public CacheAccessor
         /** Number of L1I fills installed by FDIP-triggered misses. */
         statistics::Scalar fdipInstalled;
 
+        /** Number of L1I demand hits on FDIP-prefetched lines. */
+        statistics::Scalar fdipUsefulHits;
+
         /** Number of L1I late FDIP observations. */
         statistics::Scalar fdipLate;
+
+        /** Number of unused L1I FDIP-prefetched evictions. */
+        statistics::Scalar fdipUnused;
 
         /** Number of FDIP probes merged into an existing miss. */
         statistics::Scalar fdipProbeMerged;

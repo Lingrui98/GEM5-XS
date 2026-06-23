@@ -5351,5 +5351,17 @@ Fetch::getTracePCByIndex(uint64_t index)
     return traceFetch ? traceFetch->getTracePCByIndex(index) : 0;
 }
 
+bool
+Fetch::shouldDropFdipRefill(ContextID contextId,
+                            const Request::XsMetadata &xsMeta) const
+{
+    if (!xsMeta.isFdip() || !dbpbtb->fdipDropRefillOnEpochMismatch()) {
+        return false;
+    }
+
+    const ThreadID tid = cpu->contextToThread(contextId);
+    return xsMeta.fdipEpoch != fdipEpoch[tid];
+}
+
 } // namespace o3
 } // namespace gem5

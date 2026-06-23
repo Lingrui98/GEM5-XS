@@ -47,6 +47,7 @@
 #include <deque>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "arch/generic/decoder.hh"
 #include "arch/generic/mmu.hh"

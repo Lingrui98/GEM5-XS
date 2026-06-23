@@ -52,6 +52,11 @@ GTest('history_manager.test',
     'history_manager.test.cc',
 )
 
+GTest('ftq_prefetch_head.test',
+    'ftq_prefetch_head.test.cc',
+    '../ftq.cc',
+)
+
 # add --unit-test to enable unit test mode for RAS
 # TODO: Fix RAS test
 # GTest('ras.test',
@@ -77,4 +82,5 @@ env.Append(UNITTESTS=['uras.test',
         'history_manager.test',
         'jump_ahead.test',
         'fetch_target_queue.test',
+        'ftq_prefetch_head.test',
         'decoupled_bpred.test'])

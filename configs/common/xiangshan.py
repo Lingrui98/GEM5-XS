@@ -932,6 +932,7 @@ def xiangshan_system_init():
     Options.addCommonOptions(parser, configure_xiangshan=True)
     Options.addXiangshanFSOptions(parser)
     Options.addXiangshanTraceOptions(parser)
+    Options.addXiangshanFDIPOptions(parser)
     parser.add_argument(
         "--btb-tage-upper-bound",
         action="store_true",

@@ -126,6 +126,11 @@ MSHR::TargetList::updateFlags(PacketPtr pkt, Target::Source source,
             pfDepth = pkt->req->getXsMetadata().prefetchDepth;
         }
 
+        if (is_fdip && !hasFromFDIP) {
+            pfSource = pkt->req->getXsMetadata().prefetchSource;
+            pfDepth = pkt->req->getXsMetadata().prefetchDepth;
+        }
+
         if (source == Target::FromPrefetcher) {
             hasFromPref = true;
         }

@@ -91,6 +91,15 @@ void
 FetchTargetQueue::finishTarget(ThreadID tid)
 {
     queue[tid].fetchptr++;
+    if (queue[tid].prefetchptr < queue[tid].fetchptr) {
+        queue[tid].prefetchptr = queue[tid].fetchptr;
+    }
+}
+
+void
+FetchTargetQueue::finishPrefetchTarget(ThreadID tid)
+{
+    queue[tid].prefetchptr++;
 }
 
 void
