@@ -152,3 +152,86 @@ The FDIP task is complete for the Trellis-owned P0/P1 stabilization scope. The c
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: SWAY paper CHECKPOINT 1 + trace-mode TAGE update fix
+
+**Date**: 2026-06-15 → 2026-06-23
+**Task**: SWAY paper CHECKPOINT 1 motivation data; xs-dev merge; trace-mode TAGE silence root-cause fix
+**Branch**: `sway/phase-stranded-probe`
+
+### Summary
+
+Three task arcs completed across the SWAY paper / GEM5-sway / mytools repos.
+The work resolved CHECKPOINT 1 of the SWAY paper four weeks ahead of
+schedule (target was Week 5–6, delivered Week 1), merged the upstream
+xs-dev sync into the SWAY worktree along with three trace-mode fixes,
+then root-caused and fixed a separate trace-mode TAGE-update silence
+that surfaced once trace-mode runs became possible. Final figures and
+analysis use a post-merge binary.
+
+### Arcs and results
+
+| Arc | Result |
+|------|--------|
+| Arc 1 — cpt-mode batch infra | Added `run_cpt_gem5.sh` + `backend.gem5_cpt.sample.json` in mytools so the distributed scheduler can drive GCB-V cpt workloads. Smoke verified end-to-end (blender_26411 cpt 500K W=50K). |
+| Arc 2 — SPEC17 cpt batch + Figure 1 | 10 SPEC17 cpts × 3 W ∈ {10K,100K,200K} × 5M instr = 30 runs, 0 abort across 19 nodes. Cross-workload aggregate stranded fraction = 33.95× at W=100K on the pre-merge binary; thesis-collapse risk (PENDING-9 ≥ 3×) cleared. Generated Figure 1 (main + W sweep sensitivities) and the cohort-tidy CSV. Closed PENDING-1/9/10/11 in the SWAY paper. |
+| Arc 3 — xs-dev merge | Merged `trace-new-sync-xs-dev-WIP` (`8c16e392c1 cpu,util: Merge xs-dev into trace-new` + three trace fixes) into `sway/phase-stranded-probe`. Three conflicts resolved (`btb_tage.cc/hh`, `decoupled_bpred.cc`). MicroTAGE detached from BTBTAGE upstream → dropped from SWAY probe (matches the user's fast-predictor exclusion policy). Post-merge rebuild clean. |
+| Arc 4 — refresh on post-merge binary | Re-ran all 30 SPEC17 cpts plus 7 championship traces (3 IPC1 + 2 CVP1 + 2 CBP2025) at W=100K, 0 abort. Refreshed Figure 1, Figure 2 (per-phase time series, stability CV, per-scope extremes), and Q2 stranded→IPC causal-chain analysis. Cross-workload spread climbed to 148.6× on the SPEC17 cohort under the post-merge binary; the conclusion direction (max=gcc_pp_O2, min=perlbench_split) is stable across all three W values. Q2 Pearson r: str_T_lo ↔ commit_mpki = +0.918, str_T_lo ↔ IPC = −0.349, commit_mpki ↔ IPC = −0.496. Loose Belady IPC uplift upper bound: arith mean +3.82%, max mcf +16.4%. |
+| Arc 5 — trace-mode TAGE silence | Diagnosed and fixed the unrelated symptom that championship-trace runs gave `tage.updateMispred = 0` while `tage.predHit` was non-zero. Root cause: trace-mode squash paths recorded predicted outcome as actual outcome, so MBTB never cleared `alwaysTaken` and `BTBTAGE::prepareUpdateEntries()` filtered every conditional. Fix: Decode::selfSquash, IEW::squashDueToBranch, and Commit::commit now use `traceBranchTaken()`/`traceBranchNextPC()` when trace branch metadata is present; BTBTAGE keeps the normal `!alwaysTaken` filter. Follow-up audit fixed four more trace-metadata fan-out gaps (`DynInst::is*` accessors, `CommitTrace` re-classify, `ChampSimTraceReader` mapped target, `fetch.cc` DynInst forwarding into squash redirects). Added 17 lightweight diagnostic stat counters along the commit → updatePredictorComponents → BTBTAGE::update chain so future trace-mode update silences can be localised in one experiment. |
+
+### Cross-repo commits
+
+| Repo | Hash | Title |
+|------|------|-------|
+| mytools | `1fb282c` | feat(distributed-trace-scheduler): add cpt-mode XS-GEM5 backend |
+| mytools | `ed68452` | feat(distributed-trace-scheduler): inject XS_PHASE_SIZE_BY_INST in trace backend |
+| GEM5-sway | `9296c14b94` | misc: close CHECKPOINT 1 trellis tasks for SWAY paper |
+| GEM5-sway | `927f6e3613` | cpu-o3,bpu: Merge xs-dev sync into sway probe |
+| GEM5-sway | `338a25cb88` | misc: Open trellis task for trace-mode TAGE update silence |
+| GEM5-sway | `1e6bed3e98` | cpu-o3,bpu: Fix trace-mode TAGE update silence |
+| GEM5-sway | `483f546ef6` | misc: Close trace-mode TAGE diag, add trace contracts spec |
+| sway-paper | `1d7e9ac` | docs: handoff for session 2026-06-15 |
+| sway-paper | `593c85f` | CHECKPOINT 1 cleared: Figure 1 + PENDING-1/9/10/11 resolved |
+| sway-paper | `78039cb` | CHECKPOINT 1 refresh on post-xs-dev-merge binary |
+| sway-paper | `a4c938e` | docs: refresh NEXT_ACTIONS with post-merge numbers |
+
+### Validation evidence
+
+- 30 SPEC17 cpt + 7 championship trace runs all completed, 0 abort
+- Trace smoke `cbp2025/int_0 500K W=50K`: `tage.updateMispred 0 → 3`,
+  `updateAllocSuccess 0 → 3`, `mbtb.condHitNotTakens 0 → 4` post-fix
+- CPT regression smoke `blender/26411 500K W=50K`: `tage.updateMispred`
+  stays at 2835, `updateAllocSuccess` stays at 2810 (within
+  expected range)
+- Figure 1 PDFs regenerated and committed; tidy CSV has 20 rows for
+  SPEC17 W=100K main (10 workloads × 2 groups)
+- 60 500-row merged data file (`runs/figure1_merged_stranded.csv`) is
+  the durable summary feeding the plot scripts
+
+### Code-spec / docs
+
+- `.trellis/spec/backend/trace-mode-contracts.md` added (211 lines)
+  with executable contracts for synthetic-vs-trace meaning,
+  Decode/IEW/Commit/CommitTrace/DynInst/ChampSimTraceReader rules,
+  and the BTBTAGE alwaysTaken filter invariant
+- `.trellis/spec/backend/index.md` cross-links the new doc with a
+  read-this-before guard
+- SWAY paper docs: `PLAN.md`, `PENDING.md`, `HANDOFF.md`,
+  `docs/NEXT_ACTIONS.md` all reflect the post-merge numbers
+- Project memory: `sway-paper-checkpoint1.md`,
+  `sway-scope-exclusions.md`, `sway-gem5-build-quirks.md`,
+  `mytools-cpt-backend.md` added under
+  `~/.claude/projects/-nfs-home-goulingrui-project-papers-sway-paper/memory/`
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- `/ars-plan` in `~/project/papers/sway-paper` to fold the
+  post-merge numbers (149× spread, Q2 correlations, IPC uplift
+  bound) into §I/§III prose
+- Phase 1 SWAY mechanism: open a new Trellis task for the
+  marginal-utility controller + realloc PoC in `cpu/pred/btb/`
