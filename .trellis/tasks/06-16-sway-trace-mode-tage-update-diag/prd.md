@@ -39,6 +39,154 @@ extension starts pulling in trace-mode workloads (DaCapo javac, etc.).
 
 ## Evidence already collected
 
+### Latest trace-fix commits are not the initial cause
+
+The first check was whether the latest three trace-fix commits introduced the
+silence:
+
+- `064029e6ef cpu-o3,util: Fix trace recovery replay`
+- `803b6ec090 cpu-o3,bpu: Fix trace return target recovery`
+- `add587d180 cpu-o3,bpu: Fix trace non-control wrong-path`
+
+Diff inspection shows these commits touch trace replay/PC recovery, return
+target squash handling, wrong-path non-control prediction cleanup, and trace
+helper scripts, but not `BTBTAGE::update()`. More importantly, an older ancestor
+run from commit `24d73b0c1a cpu: align ChampSimTraceReader tests` already shows
+the same symptom before all three commits:
+
+```
+$ grep -E "simInsts|branchPred\.fsqEntryCommitted|branchPred\.tage\.(predHit|updateMispred|updateAllocSuccess)|commit\.branchMispredicts" \
+  /nfs/home/goulingrui/project/GEM5/.worktrees/baseline/m5out/reg_matrix/fixcmp7/baseline/cbp_int_0/stats.txt
+simInsts                                        50005
+system.cpu.branchPred.fsqEntryCommitted          4803
+system.cpu.branchPred.tage.updateAllocSuccess       0
+system.cpu.branchPred.tage.updateMispred            0
+system.cpu.branchPred.tage.predHit               1553
+system.cpu.commit.branchMispredicts               140
+```
+
+`24d73b0c1a` is an ancestor of current HEAD and of `add587d180`, so the issue
+predates the three latest trace-fix commits. The current investigation should
+therefore focus on the older trace-mode FTQ/update contract, not on reverting
+those fixes.
+
+### Phase 1 verdict and root cause
+
+The diagnostic counters rule out the FTQ/commit path as the failure point. A
+500K-instruction trace smoke on `cbp2025/int_0` reached the resolved-update path
+and called `BTBTAGE::update()` 16478 times:
+
+```
+simInsts                                                   500002
+system.cpu.branchPred.fsqEntryCommitted                     47043
+system.cpu.branchPred.prepareResolveUpdateEntriesHitTaken    16478
+system.cpu.branchPred.markCFIResolvedMatchedEntries          16197
+system.cpu.branchPred.resolveUpdateHitTaken                  16478
+system.cpu.branchPred.resolveUpdateBlocked                       0
+system.cpu.branchPred.tage.updateCalls                       16478
+system.cpu.branchPred.tage.updateNoPredMeta                      0
+system.cpu.branchPred.tage.updateRawCondResolvedEntries      15776
+system.cpu.branchPred.tage.updateRawAlwaysTakenEntries       16478
+system.cpu.branchPred.tage.updateRawCondNotAlwaysTakenEntries    0
+system.cpu.branchPred.tage.updateFilteredEntries                 0
+system.cpu.branchPred.tage.updateMispred                         0
+```
+
+So the silence is not caused by missing FTQ ids, missing prediction metadata, or
+resolved-update bank blocking. The first symptom was that
+`BTBTAGE::prepareUpdateEntries()` received only `alwaysTaken=true` conditional
+entries and therefore filtered them all out. A deeper check showed why: trace
+mode had not been reporting any conditional BTB hit-not-taken updates. The trace
+itself has not-taken branches, but decode-time trace squashes passed
+`inst->readPredTaken() || inst->isUncondCtrl()` as the actual outcome. For a
+trace branch that was predicted taken but actually not taken, this wrote
+`actually_taken=true` into the FTQ target, so MBTB counted it as hit-taken and
+never cleared `alwaysTaken`.
+
+The fix is to make trace-mode squash paths use trace ground truth:
+
+- `Decode::selfSquash()` sets `decodeInfo.branchTaken` from
+  `inst->traceBranchTaken()` when trace branch metadata is present.
+- `IEW::squashDueToBranch()` sets `toCommit->branchTaken` from
+  `inst->traceBranchTaken()` for trace branches.
+- `BTBTAGE::prepareUpdateEntries()` keeps the normal `!alwaysTaken` filter; no
+  trace-only bypass is needed.
+
+Root-fix trace smoke on the same input:
+
+```
+simInsts                                                   500006
+system.cpu.branchPred.mbtb.condHits                         15695
+system.cpu.branchPred.mbtb.condHitTakens                    15691
+system.cpu.branchPred.mbtb.condHitNotTakens                     4
+system.cpu.branchPred.mbtb.condMissNotTakens                 5390
+system.cpu.branchPred.tage.updateCalls                       16480
+system.cpu.branchPred.tage.updateRawCondResolvedEntries      15777
+system.cpu.branchPred.tage.updateRawCondNotAlwaysTakenEntries  192
+system.cpu.branchPred.tage.updateFilteredEntries               192
+system.cpu.branchPred.tage.updateMispred                         3
+system.cpu.branchPred.tage.updateAllocSuccess                    3
+system.cpu.branchPred.tage.predHit                           15695
+```
+
+Root-fix CPT smoke on `blender/26411` remains unchanged at the relevant TAGE
+counters:
+
+```
+simInsts                                                   500001
+system.cpu.branchPred.mbtb.condHitNotTakens                 41811
+system.cpu.branchPred.tage.updateCalls                       71389
+system.cpu.branchPred.tage.updateFilteredEntries             60158
+system.cpu.branchPred.tage.updateMispred                      2835
+system.cpu.branchPred.tage.updateAllocSuccess                 2810
+system.cpu.branchPred.tage.predHit                           56081
+```
+
+### Follow-up audit: other trace metadata paths
+
+After the root cause was found, the trace metadata fan-out was audited for
+similar "trace truth exists but downstream uses static/predicted state" gaps.
+Three additional gaps were fixed:
+
+- `Decode::selfSquash()` now uses `traceBranchNextPC()` for trace branch
+  redirects, not a recomputed static branch target. This matters for formats
+  that keep a branch target even when the actual trace outcome is not taken.
+- `Commit` no longer overwrites an IEW-provided trace branch outcome with
+  `true` just because the synthetic/static instruction decodes as unconditional.
+- Trace branch type now carries conditional/call/return/indirect information
+  into `DynInst` control-flow predicates and `DecoupledBPUWithBTB::BranchInfo`,
+  so BPU classification and update metadata can prefer trace truth when the
+  synthetic instruction is an approximation. `CommitTrace` also uses that trace
+  type when checking committed instruction type.
+
+One trace-reader-specific gap was also found and fixed: `ChampSimTraceReader`
+computed estimated targets but did not attach them to taken trace branches, so
+`setTraceBranchInfo()` would fall back to the fall-through PC. Taken ChampSim
+branches now get the estimated mapped target.
+
+Audit smoke after these fixes on `cbp2025/int_0` still matches the root fix:
+
+```
+simInsts                                                   500006
+system.cpu.branchPred.mbtb.condHitNotTakens                     4
+system.cpu.branchPred.tage.updateFilteredEntries               192
+system.cpu.branchPred.tage.updateMispred                         3
+system.cpu.branchPred.tage.updateAllocSuccess                    3
+system.cpu.branchPred.tage.predHit                           15695
+system.cpu.traceReader.stats.branchInstr                     21843
+```
+
+Audit CPT smoke on `blender/26411` stays unchanged at the relevant counters:
+
+```
+simInsts                                                   500001
+system.cpu.branchPred.mbtb.condHitNotTakens                 41811
+system.cpu.branchPred.tage.updateFilteredEntries             60158
+system.cpu.branchPred.tage.updateMispred                      2835
+system.cpu.branchPred.tage.updateAllocSuccess                 2810
+system.cpu.branchPred.tage.predHit                           56081
+```
+
 ### Trace-mode (broken)
 ```
 $ grep "tage\." runs/W100K_champ/ipc1_W100K/ipc1_client_001/stats.txt | head
@@ -200,26 +348,22 @@ Add a new memory entry either way:
 
 ## Open questions
 
-- Does the FTQ even need to fire updates in trace mode if the trace
-  reader already carries ground truth? Conceptually yes — TAGE needs
-  the *resolution* to update its counters, and the trace gives us
-  exactly that. The only question is whether the existing
-  `update(FetchTarget)` signature is compatible with trace-injected
-  resolution data.
-- Does fixing this affect the SPEC17 cpt numbers? Risk: low (cpt mode
-  already exercises the path), but the Phase 3 validation gate above
-  guards against it.
+- Does fixing this affect the SPEC17 cpt numbers? The 500K `blender/26411`
+  smoke kept the relevant TAGE counters unchanged, but a broader SPEC17 sweep is
+  still the right gate before using this for final paper figures.
+- Should `MicroTAGE` receive the same trace-mode filter relaxation? The current
+  task is specifically BTBTAGE/SWAY stranded accounting. `microtage.updateMispred`
+  is already non-zero in the post-fix trace smoke, so this was left unchanged.
 
 ## Done definition
 
-- [ ] Phase 1 instrumented build runs both modes; verdict table filled in
-- [ ] Root cause documented in this PRD's "Open questions" section
-- [ ] Either: code fix committed on `sway/phase-stranded-probe` with cpt
-      smoke value unchanged and trace smoke shows `tage.updateMispred > 0`;
-      or: limitation documented and acknowledged in SWAY paper PENDING.md
-- [ ] Memory entry written: `memory/sway-trace-mode-tage.md`
-- [ ] If a code fix is upstreamable (XS-GEM5 main), open a PR; otherwise
-      keep the patch on the sway branch and note for the HPCA extension.
+- [x] Phase 1 instrumented build runs both modes; verdict table filled in
+- [x] Root cause documented in this PRD
+- [x] Code fix implemented on `sway/phase-stranded-probe`; cpt smoke value is
+      unchanged and trace smoke shows `tage.updateMispred > 0`
+- [x] Memory entry written: `memory/sway-trace-mode-tage.md`
+- [x] Patch kept on `sway/phase-stranded-probe`; regenerate championship trace
+      SWAY data before using it for the HPCA extension.
 
 ## Triggers that escalate this from P2 to P1
 
