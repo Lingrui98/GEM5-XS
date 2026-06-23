@@ -859,18 +859,48 @@ BTBTAGE::doResolveUpdate(const FetchTarget &stream) {
  */
 void
 BTBTAGE::update(const FetchTarget &stream) {
+    tageStats.updateCalls++;
+
     Addr startAddr = stream.getRealStartPC();
     unsigned updateBank = getBankId(startAddr);
 
     DPRINTF(TAGE, "update startAddr: %#lx, bank: %u\n", startAddr, updateBank);
 
     // ========== Normal Update Logic ==========
+    auto raw_entries = stream.updateBTBEntries;
+    if (!stream.updateIsOldEntry) {
+        raw_entries.push_back(stream.updateNewBTBEntry);
+    }
+    tageStats.updateRawEntries += raw_entries.size();
+    for (const auto &entry : raw_entries) {
+        if (entry.isCond) {
+            tageStats.updateRawCondEntries++;
+        }
+        if (entry.resolved) {
+            tageStats.updateRawResolvedEntries++;
+        }
+        if (entry.alwaysTaken) {
+            tageStats.updateRawAlwaysTakenEntries++;
+        }
+        if (entry.isCond && entry.resolved) {
+            tageStats.updateRawCondResolvedEntries++;
+        }
+        if (entry.isCond && !entry.alwaysTaken) {
+            tageStats.updateRawCondNotAlwaysTakenEntries++;
+        }
+    }
+
     // Prepare BTB entries to update
     auto entries_to_update = prepareUpdateEntries(stream);
-    
+    tageStats.updateFilteredEntries += entries_to_update.size();
+    if (entries_to_update.empty()) {
+        tageStats.updateCallsWithNoFilteredEntries++;
+    }
+
     // Get prediction metadata snapshot and bind to member for helpers
     auto predMeta = std::static_pointer_cast<TageMeta>(stream.predMetas[getComponentIdx()]);
     if (!predMeta) {
+        tageStats.updateNoPredMeta++;
         DPRINTF(TAGE, "update: no prediction meta, skip\n");
         return;
     }
@@ -887,6 +917,7 @@ BTBTAGE::update(const FetchTarget &stream) {
         if (has_original_pred) {
             original_pred = orig_it->second;
         } else if (!is_new_entry) {
+            tageStats.updateMissingOriginalPred++;
             DPRINTF(TAGE, "update: missing original prediction for old entry pc %#lx, skip\n",
                     btb_entry.pc);
             continue;
@@ -1318,6 +1349,28 @@ BTBTAGE::TageStats::TageStats(statistics::Group* parent, int numPredictors, int 
     ADD_STAT(updateAllocSuccess, statistics::units::Count::get(), "alloc success when update"),
     ADD_STAT(updateMispred, statistics::units::Count::get(), "mispred when update"),
     ADD_STAT(updateResetU, statistics::units::Count::get(), "reset u when update"),
+    ADD_STAT(updateCalls, statistics::units::Count::get(), "calls to BTBTAGE::update"),
+    ADD_STAT(updateNoPredMeta, statistics::units::Count::get(),
+             "BTBTAGE updates skipped because prediction metadata is missing"),
+    ADD_STAT(updateRawEntries, statistics::units::Count::get(),
+             "raw BTB entries seen before BTBTAGE update filtering"),
+    ADD_STAT(updateRawCondEntries, statistics::units::Count::get(),
+             "raw conditional BTB entries seen before update filtering"),
+    ADD_STAT(updateRawResolvedEntries, statistics::units::Count::get(),
+             "raw resolved BTB entries seen before update filtering"),
+    ADD_STAT(updateRawAlwaysTakenEntries, statistics::units::Count::get(),
+             "raw always-taken BTB entries seen before update filtering"),
+    ADD_STAT(updateRawCondResolvedEntries, statistics::units::Count::get(),
+             "raw conditional resolved BTB entries seen before filtering"),
+    ADD_STAT(updateRawCondNotAlwaysTakenEntries,
+             statistics::units::Count::get(),
+             "raw conditional non-always-taken BTB entries before filtering"),
+    ADD_STAT(updateFilteredEntries, statistics::units::Count::get(),
+             "conditional BTB entries kept for BTBTAGE update"),
+    ADD_STAT(updateCallsWithNoFilteredEntries, statistics::units::Count::get(),
+             "BTBTAGE update calls with no conditional entries after filter"),
+    ADD_STAT(updateMissingOriginalPred, statistics::units::Count::get(),
+             "BTBTAGE update entries missing original prediction metadata"),
     ADD_STAT(resolveBranchHasProvider, statistics::units::Count::get(),
         "resolved conditional branches whose recomputed TAGE state has a provider"),
     ADD_STAT(resolveBranchUseProvider, statistics::units::Count::get(),

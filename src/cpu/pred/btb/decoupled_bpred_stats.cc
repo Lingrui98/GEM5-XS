@@ -460,6 +460,41 @@ DecoupledBPUWithBTB::DBPBTBStats::DBPBTBStats(
     ADD_STAT(predictionBlockedForUpdate, statistics::units::Count::get(), "prediction blocked for update priority"),
     ADD_STAT(predictionBlockedForRunahead, statistics::units::Count::get(),
              "prediction blocked by BPU runahead window"),
+    ADD_STAT(commitCallsTotal, statistics::units::Count::get(),
+             "calls to DecoupledBPUWithBTB::commit"),
+    ADD_STAT(commitWithDoneFtqId, statistics::units::Count::get(),
+             "commit calls with a non-zero done FTQ id"),
+    ADD_STAT(updatePredictorComponentsTotal, statistics::units::Count::get(),
+             "calls to commit-time predictor component update"),
+    ADD_STAT(updatePredictorComponentsHitTaken,
+             statistics::units::Count::get(),
+             "commit-time component updates passing hit-or-taken gate"),
+    ADD_STAT(prepareResolveUpdateEntriesTotal,
+             statistics::units::Count::get(),
+             "calls preparing resolved-update entries"),
+    ADD_STAT(prepareResolveUpdateEntriesHitTaken,
+             statistics::units::Count::get(),
+             "resolved-update prepares passing hit-or-taken gate"),
+    ADD_STAT(prepareResolveUpdateEntriesBTBEntries,
+             statistics::units::Count::get(),
+             "BTB entries prepared for resolved update"),
+    ADD_STAT(markCFIResolvedCalls, statistics::units::Count::get(),
+             "calls marking resolved CFI entries"),
+    ADD_STAT(markCFIResolvedMatchedEntries, statistics::units::Count::get(),
+             "resolved CFI marks matching a prepared BTB entry"),
+    ADD_STAT(resolveUpdateTotal, statistics::units::Count::get(),
+             "calls to DecoupledBPUWithBTB::resolveUpdate"),
+    ADD_STAT(resolveUpdateMissingTarget, statistics::units::Count::get(),
+             "resolved updates whose FTQ target is missing"),
+    ADD_STAT(resolveUpdateSkippedNoHitTaken, statistics::units::Count::get(),
+             "resolved updates skipped because target is neither hit nor "
+             "taken"),
+    ADD_STAT(resolveUpdateHitTaken, statistics::units::Count::get(),
+             "resolved updates passing hit-or-taken gate"),
+    ADD_STAT(resolveUpdateBlocked, statistics::units::Count::get(),
+             "resolved updates blocked by a component readiness check"),
+    ADD_STAT(resolveUpdateComponentUpdates, statistics::units::Count::get(),
+             "resolved-update component update calls"),
     ADD_STAT(s1PredWrongFallthrough, statistics::units::Count::get(), "S1pred wrong full throughs"),
     ADD_STAT(s1PredWrongUbtb, statistics::units::Count::get(),"S1pred wrong using ubtb "),
     ADD_STAT(s1PredWrongAbtb, statistics::units::Count::get(), "S1pred wrong using abtb "),
@@ -811,10 +846,13 @@ DecoupledBPUWithBTB::commitBranch(const DynInstPtr &inst, bool mispred)
     // ---------- Extract branch information ----------
     Addr branchAddr = inst->pcState().instAddr();
     const auto &rv_pc = inst->pcState().as<RiscvISA::PCState>();
-    Addr targetAddr = rv_pc.npc();
+    Addr targetAddr = inst->hasTraceBranchInfo() ?
+        inst->traceBranchNextPC() : rv_pc.npc();
     Addr fallThruPC = rv_pc.getFallThruPC();
-    BranchInfo info(branchAddr, targetAddr, inst->staticInst, fallThruPC-branchAddr);
-    bool taken = rv_pc.branching() || inst->isUncondCtrl();
+    BranchInfo info = makeBranchInfo(
+        branchAddr, targetAddr, inst, inst->staticInst, fallThruPC-branchAddr);
+    bool taken = inst->hasTraceBranchInfo() ?
+        inst->traceBranchTaken() : (rv_pc.branching() || inst->isUncondCtrl());
 
     // ---------- Process misprediction and update statistics ----------
     processMisprediction(entry, branchAddr, info, taken, mispred);

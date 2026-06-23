@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 
 #include "arch/riscv/regs/misc.hh"
 #include "base/debug_helper.hh"
@@ -596,6 +597,25 @@ DecoupledBPUWithBTB::processNewPrediction(ThreadID tid)
  * @param static_inst Static instruction pointer (for control squash)
  * @param control_inst_size Size of the control instruction (for control squash)
  */
+BranchInfo
+DecoupledBPUWithBTB::makeBranchInfo(Addr control_pc, Addr target_pc,
+                                    const DynInstPtr &inst,
+                                    const StaticInstPtr &static_inst,
+                                    unsigned inst_size) const
+{
+    assert(static_inst || inst);
+    const auto &base_inst = static_inst ? static_inst : inst->staticInst;
+    BranchInfo info(control_pc, target_pc, base_inst, inst_size);
+    if (inst && inst->hasTraceBranchInfo()) {
+        info.isCond = inst->traceIsCond();
+        info.isIndirect = inst->traceIsIndirect();
+        info.isDirect = !info.isIndirect;
+        info.isCall = inst->traceIsCall();
+        info.isReturn = inst->traceIsReturn();
+    }
+    return info;
+}
+
 void
 DecoupledBPUWithBTB::handleSquash(ThreadID tid, unsigned target_id,
                                  SquashType squash_type,
@@ -604,7 +624,8 @@ DecoupledBPUWithBTB::handleSquash(ThreadID tid, unsigned target_id,
                                  bool is_conditional,
                                  bool actually_taken,
                                  const StaticInstPtr &static_inst,
-                                 unsigned control_inst_size)
+                                 unsigned control_inst_size,
+                                 const DynInstPtr &inst)
 {
     // Set squashing state
     threads[tid].squashing = true;
@@ -634,7 +655,9 @@ DecoupledBPUWithBTB::handleSquash(ThreadID tid, unsigned target_id,
     // Special handling for control squash - create branch info
     if (squash_type == SQUASH_CTRL && static_inst) {
         // Use full branch info with static_inst if available
-        target.exeBranchInfo = BranchInfo(squash_pc.instAddr(), redirect_pc, static_inst, control_inst_size);
+        target.exeBranchInfo = makeBranchInfo(
+            squash_pc.instAddr(), redirect_pc, inst, static_inst,
+            control_inst_size);
         dumpFsq("Before control squash");
     }
 
@@ -659,6 +682,7 @@ void
 DecoupledBPUWithBTB::controlSquash(unsigned target_id,
                             const PCStateBase &control_pc,
                             const PCStateBase &corr_target,
+                            const DynInstPtr &inst,
                             const StaticInstPtr &static_inst,
                             unsigned control_inst_size, bool actually_taken,
                             const InstSeqNum &seq, ThreadID tid,
@@ -667,15 +691,18 @@ DecoupledBPUWithBTB::controlSquash(unsigned target_id,
 {
     if (fromCommit) {
         dbpBtbStats.controlSquashFromCommit++;
-        auto branchClass = classifyBranch(static_inst);
+        auto branchClass = inst ? classifyBranch(inst) : classifyBranch(static_inst);
         addControlSquashCommitStat(branchClass);
     } else {
         dbpBtbStats.controlSquashFromDecode++;
     }
 
     // Get branch type information
-    bool is_conditional = static_inst->isCondCtrl();
-    bool is_indirect = static_inst->isIndirectCtrl();
+    auto squashBranchInfo = makeBranchInfo(
+        control_pc.instAddr(), corr_target.instAddr(), inst, static_inst,
+        control_inst_size);
+    bool is_conditional = squashBranchInfo.isCond;
+    bool is_indirect = squashBranchInfo.isIndirect;
 
     if (!ftq.hasTarget(target_id, tid)) {
         DPRINTF(DecoupleBP, "The squashing target is insane, ignore squash on it");
@@ -684,7 +711,7 @@ DecoupledBPUWithBTB::controlSquash(unsigned target_id,
     auto &target = ftq.get(target_id, tid);
     // Get target address
     Addr real_target = corr_target.instAddr();
-    if (!fromCommit && static_inst->isReturn() &&
+    if (!fromCommit && squashBranchInfo.isReturn &&
         !static_inst->isNonSpeculative() && !trustTargetPc) {
         // get ret addr from ras meta
         real_target = ras->getTopAddrFromMetas(target);
@@ -702,7 +729,8 @@ DecoupledBPUWithBTB::controlSquash(unsigned target_id,
 
     // Call shared squash handling logic
     handleSquash(tid, target_id, SQUASH_CTRL, control_pc,
-                real_target, is_conditional, actually_taken, static_inst, control_inst_size);
+                real_target, is_conditional, actually_taken, static_inst,
+                control_inst_size, inst);
 }
 
 void
@@ -737,6 +765,11 @@ DecoupledBPUWithBTB::trapSquash(unsigned target_id,
 void
 DecoupledBPUWithBTB::commit(unsigned target_id, ThreadID tid)
 {
+    dbpBtbStats.commitCallsTotal++;
+    if (target_id != 0) {
+        dbpBtbStats.commitWithDoneFtqId++;
+    }
+
     // No need to dequeue when queue is empty
     if (ftq.empty(tid)) {
         return;
@@ -774,7 +807,10 @@ DecoupledBPUWithBTB::commit(unsigned target_id, ThreadID tid)
 bool
 DecoupledBPUWithBTB::resolveUpdate(unsigned &target_id, ThreadID tid)
 {
+    dbpBtbStats.resolveUpdateTotal++;
+
     if (!ftq.hasTarget(target_id, tid)) {
+        dbpBtbStats.resolveUpdateMissingTarget++;
         DPRINTF(DecoupleBP, "Target id %u not found in fetchTargetQueue, cannot update predictors\n", target_id);
         return true;
     }
@@ -783,13 +819,16 @@ DecoupledBPUWithBTB::resolveUpdate(unsigned &target_id, ThreadID tid)
 
     // Update predictor components only if the target is hit or taken
     if (!(target.isHit || target.exeTaken)) {
+        dbpBtbStats.resolveUpdateSkippedNoHitTaken++;
         return true;
     }
+    dbpBtbStats.resolveUpdateHitTaken++;
 
     // Phase 1: probe all resolved-update components to ensure no blocker
     for (int i = 0; i < numComponents; ++i) {
         if (components[i]->getResolvedUpdate()) {
             if (!components[i]->canResolveUpdate(target)) {
+                dbpBtbStats.resolveUpdateBlocked++;
                 return false;
             }
         }
@@ -798,6 +837,7 @@ DecoupledBPUWithBTB::resolveUpdate(unsigned &target_id, ThreadID tid)
     // Phase 2: all clear, perform updates once
     for (int i = 0; i < numComponents; ++i) {
         if (components[i]->getResolvedUpdate()) {
+            dbpBtbStats.resolveUpdateComponentUpdates++;
             components[i]->doResolveUpdate(target);
         }
     }
@@ -831,6 +871,8 @@ DecoupledBPUWithBTB::blockPredictionOnce(ThreadID tid)
 void
 DecoupledBPUWithBTB::prepareResolveUpdateEntries(unsigned &target_id, ThreadID tid)
 {
+    dbpBtbStats.prepareResolveUpdateEntriesTotal++;
+
     if (!ftq.hasTarget(target_id, tid)) {
         DPRINTF(DecoupleBP, "Target id %u not found in fetchTargetQueue, cannot update predictors\n", target_id);
         return;
@@ -838,6 +880,8 @@ DecoupledBPUWithBTB::prepareResolveUpdateEntries(unsigned &target_id, ThreadID t
     auto &target = ftq.get(target_id, tid);
 
     if (target.isHit || target.exeTaken) {
+        dbpBtbStats.prepareResolveUpdateEntriesHitTaken++;
+
         // Prepare target for update
         target.setUpdateInstEndPC(predictWidth);
         target.setUpdateBTBEntries();
@@ -846,18 +890,27 @@ DecoupledBPUWithBTB::prepareResolveUpdateEntries(unsigned &target_id, ThreadID t
         if (mbtb->isEnabled()) {
             mbtb->getAndSetNewBTBEntry(target);
         }
+        dbpBtbStats.prepareResolveUpdateEntriesBTBEntries +=
+            target.updateBTBEntries.size();
     }
 }
 
 void
 DecoupledBPUWithBTB::markCFIResolved(unsigned &target_id, uint64_t resolvedInstPC, ThreadID tid)
 {
+    dbpBtbStats.markCFIResolvedCalls++;
 
     if (!ftq.hasTarget(target_id, tid)) {
         DPRINTF(DecoupleBP, "Target id %u not found in fetchTargetQueue, cannot update predictors\n", target_id);
         return;
     }
     auto &target = ftq.get(target_id, tid);
+
+    for (const auto &entry : target.updateBTBEntries) {
+        if (entry.valid && entry.pc == resolvedInstPC) {
+            dbpBtbStats.markCFIResolvedMatchedEntries++;
+        }
+    }
 
     if (target.updateNewBTBEntry.pc == resolvedInstPC) {
         target.updateNewBTBEntry.resolved = true;
@@ -869,8 +922,12 @@ DecoupledBPUWithBTB::markCFIResolved(unsigned &target_id, uint64_t resolvedInstP
 void
 DecoupledBPUWithBTB::updatePredictorComponents(FetchTarget &target)
 {
+    dbpBtbStats.updatePredictorComponentsTotal++;
+
     // Update predictor components only if the target is hit or taken
     if (target.isHit || target.exeTaken) {
+        dbpBtbStats.updatePredictorComponentsHitTaken++;
+
         // Prepare target for update
         target.setUpdateInstEndPC(predictWidth);
         target.setUpdateBTBEntries();
