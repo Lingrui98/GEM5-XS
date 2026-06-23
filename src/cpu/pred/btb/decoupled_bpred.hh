@@ -737,6 +737,50 @@ class DecoupledBPUWithBTB : public BPredUnit
     };
     std::vector<SwayStrandedRow> swayStrandedByPhase;
 
+    struct SwayUtilityRow
+    {
+        int phaseID;
+        std::string scope;
+        uint64_t totalWays;
+        uint64_t activeWays;
+        double utility;
+    };
+
+    /**
+     * @brief SWAY measurement-only utility probe.
+     *
+     * Task A only derives a per-phase utility vector from the existing
+     * per-way visit snapshots. It does not change ownership, allocation, or
+     * predictor lookup/update behavior.
+     */
+    class SwayController
+    {
+      public:
+        void collectPhaseScope(int phaseID, const std::string& scope,
+                               uint64_t totalWays, uint64_t activeWays)
+        {
+            utilityByPhase.push_back(
+                {phaseID, scope, totalWays, activeWays,
+                 computeUtility(totalWays, activeWays)});
+        }
+
+        const std::vector<SwayUtilityRow>& rows() const
+        {
+            return utilityByPhase;
+        }
+
+      private:
+        static double computeUtility(uint64_t totalWays, uint64_t activeWays)
+        {
+            return totalWays == 0 ? 0.0 :
+                static_cast<double>(activeWays) /
+                static_cast<double>(totalWays);
+        }
+
+        std::vector<SwayUtilityRow> utilityByPhase;
+    };
+    SwayController swayController;
+
     /**
      * @brief Snapshot SWAY per-way visit counters at a phase boundary.
      */
