@@ -14,6 +14,7 @@
 #include "cpu/o3/limits.hh"
 #include "cpu/pred/btb/common.hh"
 #include "cpu/pred/btb/folded_hist.hh"
+#include "cpu/pred/btb/sway_realloc.hh"
 #include "cpu/pred/btb/test_stats.hh"
 #include "cpu/pred/btb/timed_base_pred.hh"
 
@@ -88,9 +89,12 @@ class BTBTAGE : public TimedBaseBTBPredictor
             Addr index;     // Index in the table
             Addr tag;       // Tag that was matched
             unsigned way;    // Which way this entry was found in
-            TageTableInfo() : found(false), table(0), index(0), tag(0), way(0) {}
-            TageTableInfo(bool found, TageEntry entry, unsigned table, Addr index, Addr tag, unsigned way) :
-                        found(found), entry(entry), table(table), index(index), tag(tag), way(way) {}
+            bool isExtra;    // Whether the way comes from SWAY borrowed capacity
+            TageTableInfo() : found(false), table(0), index(0), tag(0), way(0), isExtra(false) {}
+            TageTableInfo(bool found, TageEntry entry, unsigned table, Addr index,
+                          Addr tag, unsigned way, bool isExtra = false) :
+                        found(found), entry(entry), table(table), index(index),
+                        tag(tag), way(way), isExtra(isExtra) {}
             bool taken() const {
                 return entry.taken();
             }
@@ -275,6 +279,8 @@ class BTBTAGE : public TimedBaseBTBPredictor
      *  PENDING-9 / Figure 1.
      */
     std::vector<std::vector<std::vector<uint32_t>>> wayVisitCnt;
+    std::vector<std::vector<std::vector<TageEntry>>> swayExtraTable;
+    std::vector<std::vector<std::vector<uint32_t>>> swayExtraVisitCnt;
 
     struct WayPhaseSnapshot
     {
@@ -286,7 +292,17 @@ class BTBTAGE : public TimedBaseBTBPredictor
     };
     std::vector<WayPhaseSnapshot> collectAndResetWayVisitCounts();
 
+    void setSwayReallocEnabled(bool enabled);
+    unsigned countSwayOwnedWays(uint8_t owner) const;
+    unsigned transferSwayWays(uint8_t donor, uint8_t donee, unsigned count);
+    void addSwayBorrowedWayCounts(sway::ScopeCounts &counts) const;
+    void syncSwayBorrowedWayCounts(const sway::ScopeCounts &counts);
+
+#ifdef UNIT_TEST
+  public:
+#else
   protected:
+#endif
 
     const unsigned maxBranchPositions;  // Maximum branch positions per 64-byte block
 
@@ -337,6 +353,14 @@ class BTBTAGE : public TimedBaseBTBPredictor
 
     // Whether to update on read
     bool updateOnRead;
+
+    bool enableSwayRealloc{false};
+    std::vector<std::vector<uint8_t>> swayWayOwner;
+    bool swayNativeWayVisible(unsigned table, unsigned way) const;
+    unsigned swayExtraWayCount(unsigned table) const;
+    void resizeSwayExtraWays(unsigned table, unsigned ways);
+    void squashNativeWay(unsigned table, unsigned way);
+    TageEntry &mutableTageEntry(const TageTableInfo &info);
 
     // ========== Bank Configuration ==========
     // Bank mechanism to simulate hardware bank conflicts

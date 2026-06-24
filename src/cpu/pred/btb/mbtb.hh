@@ -44,6 +44,7 @@
 
 #include "base/types.hh"
 #include "cpu/pred/btb/common.hh"
+#include "cpu/pred/btb/sway_realloc.hh"
 #include "cpu/pred/btb/test_stats.hh"
 #include "cpu/pred/btb/timed_base_pred.hh"
 
@@ -404,6 +405,12 @@ class MBTB : public TimedBaseBTBPredictor
     };
     std::vector<WayPhaseSnapshot> collectAndResetWayVisitCounts();
 
+    void setSwayReallocEnabled(bool enabled);
+    unsigned countSwayOwnedWays(uint8_t owner) const;
+    unsigned transferSwayWays(uint8_t donor, uint8_t donee, unsigned count);
+    void addSwayBorrowedWayCounts(sway::ScopeCounts &counts) const;
+    void syncSwayBorrowedWayCounts(const sway::ScopeCounts &counts);
+
   private:
     /** SRAM selection helper function */
     inline int getSRAMId(Addr pc) {
@@ -425,6 +432,19 @@ class MBTB : public TimedBaseBTBPredictor
 
     /** Branch counter */
     unsigned numBr;  // Number of branches seen
+
+    bool enableSwayRealloc{false};
+    std::vector<uint8_t> swayOwner0, swayOwner1;
+    std::vector<BTBSet> swayExtra0, swayExtra1;
+    std::vector<std::vector<uint32_t>> swayExtraVisit0, swayExtraVisit1;
+
+    bool swayNativeWayVisible(int sramId, unsigned way) const;
+    unsigned swayExtraWayCount(int sramId) const;
+    void resizeSwayExtraWays(int sramId, unsigned ways);
+    void squashNativeWay(int sramId, unsigned way);
+    BTBSet &swayExtraSet(int sramId, Addr idx);
+    std::vector<std::vector<uint32_t>> &swayExtraVisit(int sramId);
+    void updateBTBEntrySway(const BTBEntry& entry, const FetchTarget &stream);
 
     enum Mode {
         READ, WRITE, EVICT

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <limits>
 #include <sstream>
 #include <tuple>
 
@@ -60,13 +61,136 @@ DecoupledBPUWithBTB::initDB()
     }
 }
 
+DecoupledBPUWithBTB::SwayController::Decision
+DecoupledBPUWithBTB::SwayController::chooseReallocation(
+    const std::vector<SwayUtilityRow>& phaseRows) const
+{
+    Decision decision;
+    if (!enabled || phaseRows.size() < 2) {
+        return decision;
+    }
+
+    const SwayUtilityRow *donor = nullptr;
+    const SwayUtilityRow *donee = nullptr;
+    for (const auto &row : phaseRows) {
+        const uint8_t owner = sway::ownerFromScope(row.scope);
+        if (owner == sway::InvalidOwner || row.totalWays == 0) {
+            continue;
+        }
+        if (!donor || row.utility < donor->utility) {
+            donor = &row;
+        }
+        if (!donee || row.utility > donee->utility) {
+            donee = &row;
+        }
+    }
+
+    if (!donor || !donee || donor->scope == donee->scope) {
+        return decision;
+    }
+
+    if ((donee->utility - donor->utility) <= hysteresisMargin) {
+        return decision;
+    }
+
+    decision.valid = true;
+    decision.donor = sway::ownerFromScope(donor->scope);
+    decision.donee = sway::ownerFromScope(donee->scope);
+    decision.donorUtility = donor->utility;
+    decision.doneeUtility = donee->utility;
+    return decision;
+}
+
+unsigned
+DecoupledBPUWithBTB::countSwayOwnedWays(uint8_t owner) const
+{
+    unsigned count = 0;
+    if (mbtb) {
+        count += mbtb->countSwayOwnedWays(owner);
+    }
+    if (tage) {
+        count += tage->countSwayOwnedWays(owner);
+    }
+    return count;
+}
+
+unsigned
+DecoupledBPUWithBTB::transferSwayWays(uint8_t donor, uint8_t donee,
+                                      unsigned ways)
+{
+    unsigned moved = 0;
+    if (mbtb) {
+        moved += mbtb->transferSwayWays(donor, donee, ways - moved);
+    }
+    if (tage && moved < ways) {
+        moved += tage->transferSwayWays(donor, donee, ways - moved);
+    }
+    return moved;
+}
+
+void
+DecoupledBPUWithBTB::syncSwayBorrowedWayCounts()
+{
+    sway::ScopeCounts borrowed{};
+    borrowed.fill(0);
+    if (mbtb) {
+        mbtb->addSwayBorrowedWayCounts(borrowed);
+    }
+    if (tage) {
+        tage->addSwayBorrowedWayCounts(borrowed);
+    }
+    if (mbtb) {
+        mbtb->syncSwayBorrowedWayCounts(borrowed);
+    }
+    if (tage) {
+        tage->syncSwayBorrowedWayCounts(borrowed);
+    }
+}
+
+void
+DecoupledBPUWithBTB::trySwayReallocForPhase(
+    const std::vector<SwayUtilityRow>& phaseRows)
+{
+    auto decision = swayController.chooseReallocation(phaseRows);
+    if (!decision.valid) {
+        return;
+    }
+
+    if (swayController.isQuiescing()) {
+        return;
+    }
+
+    constexpr unsigned minOwnedWays = 1;
+    const unsigned donorOwned = countSwayOwnedWays(decision.donor);
+    if (donorOwned <= minOwnedWays) {
+        return;
+    }
+    const unsigned requestWays = std::min(swayController.waysPerTransfer(),
+                                          donorOwned - minOwnedWays);
+    const unsigned moved = transferSwayWays(decision.donor, decision.donee,
+                                            requestWays);
+    if (moved == 0) {
+        return;
+    }
+
+    syncSwayBorrowedWayCounts();
+    swayStats.reallocCount++;
+    swayStats.ownerOverrides[decision.donee] += moved;
+    swayController.startQuiesce();
+}
+
 void
 DecoupledBPUWithBTB::collectSwayWayVisitForPhase(int phaseID)
 {
+    std::vector<SwayUtilityRow> phaseRows;
     auto append = [&](const std::string& scope, uint64_t totalWays,
                       uint64_t validWays, uint64_t activeWays) {
         swayController.collectPhaseScope(phaseID, scope, totalWays,
                                          activeWays);
+        phaseRows.push_back({phaseID, scope, totalWays, activeWays,
+                             totalWays == 0 ? 0.0 :
+                             static_cast<double>(activeWays) /
+                             static_cast<double>(totalWays)});
         swayStrandedByPhase.push_back({phaseID, scope, totalWays,
                                        validWays, activeWays});
     };
@@ -88,6 +212,9 @@ DecoupledBPUWithBTB::collectSwayWayVisitForPhase(int phaseID)
     // 2026-06 xs-dev merge, MicroTAGE no longer inherits from BTBTAGE and
     // therefore does not expose collectAndResetWayVisitCounts(); we skip it
     // here to keep the probe focused on MBTB + BTBTAGE.
+    if (enableSwayRealloc) {
+        trySwayReallocForPhase(phaseRows);
+    }
 }
 
 void
@@ -574,6 +701,21 @@ DecoupledBPUWithBTB::DBPBTBStats::DBPBTBStats(
         branchClassCounts.subname(i, BranchClassLabels[i]);
         branchClassMisses.subname(i, BranchClassLabels[i]);
         controlSquashByClass.subname(i, BranchClassLabels[i]);
+    }
+}
+
+DecoupledBPUWithBTB::SwayStats::SwayStats(statistics::Group* parent):
+    statistics::Group(parent, "sway"),
+    ADD_STAT(reallocCount, statistics::units::Count::get(),
+             "SWAY owner-register reallocation events"),
+    ADD_STAT(reallocBlockedQuiesce, statistics::units::Count::get(),
+             "cycles where SWAY quiesce blocks prediction after reallocation"),
+    ADD_STAT(ownerOverrides, statistics::units::Count::get(),
+             "SWAY transferred ways received by logical owner scope")
+{
+    ownerOverrides.init(sway::NumScopes);
+    for (uint8_t owner = 0; owner < sway::NumScopes; ++owner) {
+        ownerOverrides.subname(owner, sway::scopeName(owner));
     }
 }
 
