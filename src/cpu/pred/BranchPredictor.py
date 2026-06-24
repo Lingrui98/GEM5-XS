@@ -1231,3 +1231,5 @@ class DecoupledBPUWithBTB(BranchPredictor):
         "Number of ways transferred per SWAY reallocation decision")
     swayReallocHysteresis = Param.Float(0.0,
         "Minimum utility gap required before SWAY transfers a way")
+    swayReallocTageDoneeHysteresis = Param.Float(0.0,
+        "Minimum utility gap required when SWAY transfers a way to TAGE")

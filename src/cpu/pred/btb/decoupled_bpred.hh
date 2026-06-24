@@ -688,11 +688,13 @@ class DecoupledBPUWithBTB : public BPredUnit
             double doneeUtility{0.0};
         };
 
-        void configure(bool enable, unsigned ways, double hysteresis)
+        void configure(bool enable, unsigned ways, double hysteresis,
+                       double tageDoneeHysteresis)
         {
             enabled = enable;
             transferWays = ways == 0 ? 1 : ways;
             hysteresisMargin = hysteresis;
+            tageDoneeHysteresisMargin = tageDoneeHysteresis;
         }
 
         bool isEnabled() const { return enabled; }
@@ -744,6 +746,7 @@ class DecoupledBPUWithBTB : public BPredUnit
         bool enabled{false};
         unsigned transferWays{1};
         double hysteresisMargin{0.0};
+        double tageDoneeHysteresisMargin{0.0};
         unsigned quiesceCyclesRemaining{0};
         std::vector<SwayUtilityRow> utilityByPhase;
     };
@@ -776,6 +779,7 @@ class DecoupledBPUWithBTB : public BPredUnit
     bool enableSwayRealloc{false};
     unsigned swayReallocWays{1};
     double swayReallocHysteresis{0.0};
+    double swayReallocTageDoneeHysteresis{0.0};
 
     /**
      * @brief Next sub-phase ID to dump statistics for
