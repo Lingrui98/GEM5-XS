@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 4
-- **Last Active**: 2026-06-23
+- **Total Sessions**: 5
+- **Last Active**: 2026-06-24
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~237 | Active |
+| `journal-1.md` | ~320 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 5 | 2026-06-24 | SWAY Phase 1 utility vector and realloc controller PoC | `b99edc67a6`, `bdcfcccb4e`, `b2822df86c`, `7699b29e67`, `a48d6355f1`, `7a43981`, `ed2f642` | `sway/phase-stranded-probe` |
 | 4 | 2026-06-23 | SWAY paper CHECKPOINT 1 + trace-mode TAGE update fix | `9296c14b94`, `927f6e3613`, `338a25cb88`, `1e6bed3e98`, `483f546ef6` | `sway/phase-stranded-probe` |
 | 3 | 2026-04-23 | FDIP P0/P1 stabilization cut on sub-worktree | `917eb08d37`, `5925a5da8c`, `ce57b30b6c`, `f02d1a1f62` | `fdip-phase2-xsdev` |
 | 2 | 2026-04-17 | Wave-1 IPF runtime skeleton | `e419db4428` | `ipf-research-framework-wave1` |
