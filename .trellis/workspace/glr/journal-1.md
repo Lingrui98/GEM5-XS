@@ -235,3 +235,84 @@ analysis use a post-merge binary.
   bound) into §I/§III prose
 - Phase 1 SWAY mechanism: open a new Trellis task for the
   marginal-utility controller + realloc PoC in `cpu/pred/btb/`
+
+
+## Session 5: SWAY Phase 1 utility vector and realloc controller PoC
+
+**Date**: 2026-06-23 -> 2026-06-24
+**Task**: SWAY Phase 1 Task A utility-vector probe and Task B way-granularity realloc controller PoC
+**Branch**: `sway/phase-stranded-probe`
+
+### Summary
+
+Completed the SWAY Phase 1 mechanism path from measurement-only utility
+vectors to a default-off logical way reallocation controller, then recorded
+paper artifacts and experiment provenance in the SWAY paper repository.
+Task A produced per-phase utility vectors without changing predictor behavior.
+Task B added per-way owner registers for MBTB/BTBTAGE, a phase-boundary
+SwayController transfer policy, 1-cycle quiesce modeling, and Figure 4
+baseline-vs-SWAY IPC evidence.
+
+### Main Changes
+
+| Area | Result |
+|------|--------|
+| Task A utility probe | Added `sway_utility_by_phase.csv` generation from existing way-visit snapshots while keeping BPU allocation behavior unchanged. |
+| Task B owner model | Added per-way owner registers for MBTB and BTBTAGE, owner-filtered lookup/allocation, valid-bit squash before owner transfer, and no physical SRAM migration. |
+| Controller | Added default-off `enableSwayRealloc`, parameterized `swayReallocWays`, 1-cycle quiesce accounting, donor/donee selection from phase utility, and SWAY realloc stats. |
+| Policy guard | Added `swayReallocTageDoneeHysteresis=0.45` after the first policy attempt hurt `mcf`; final K=1 policy passes the strict Phase 1 gate but with narrow `mcf` margin. |
+| Evaluation | Ran baseline, SWAY K=1, and SWAY K=4 10-workload W=100K / 5M-instruction batches; all completed with 0 aborts. |
+| Paper artifacts | Generated Figure 3 utility plots, Figure 4 IPC uplift plots, PLAN/PENDING measured-number updates, and a tracked experiment record under the paper repo. |
+| Trellis lifecycle | Archived completed tasks `06-23-sway-utility-vector-impl` and `06-XX-sway-realloc-controller-poc`. |
+
+### Results
+
+- Main K=1 Figure 4 geomean IPC delta: `+0.773573%`
+- `gcc_pp_O2_1869` IPC delta: `+2.310559%`
+- `mcf_17135` IPC delta: `+0.501948%`
+- Baseline `sway_stranded_by_phase.csv` matched Task A output for all 10 W=100K workloads
+- K=4 sensitivity completed and converged to the same effective result under the TAGE-donee guard
+
+### Cross-repo commits
+
+| Repo | Hash | Title |
+|------|------|-------|
+| GEM5-sway | `b99edc67a6` | bpu: Add SWAY utility probe |
+| GEM5-sway | `bdcfcccb4e` | misc: Record SWAY utility closeout |
+| GEM5-sway | `b2822df86c` | bpu: Add SWAY way owner realloc controller |
+| GEM5-sway | `7699b29e67` | bpu: Add SWAY realloc eval closeout |
+| GEM5-sway | `a48d6355f1` | bpu: Guard SWAY TAGE realloc decisions |
+| sway-paper | `7a43981` | docs: Record SWAY realloc Figure 4 |
+| sway-paper | `ed2f642` | docs: Add SWAY realloc experiment record |
+
+### Validation evidence
+
+- `scons build/RISCV/gem5.opt --gold-linker -j64`: passed
+- `build/RISCV/cpu/pred/btb/test/tage.test.opt`: 28/28 passed
+- `build/RISCV/cpu/pred/btb/test/btb.test.opt`: 19/19 passed
+- Baseline W=100K batch: 10 completed, 0 abort
+- SWAY K=1 W=100K batch: 10 completed, 0 abort
+- SWAY K=4 W=100K batch: 10 completed, 0 abort
+- `figures/figure4_ipc_uplift.pdf`: generated and pushed to `sway-paper`
+- `docs/experiments/2026-06-24-sway-realloc-controller.md`: pushed to `sway-paper` with run roots, configs, commands, results, gate checks, and risks
+
+### Notes
+
+- This checkout lacks `.trellis/scripts/get_context.py`, `task.py`, and
+  `add_session.py`, so the record-session flow was performed manually using
+  the existing `.trellis/workspace/glr/` journal format.
+- Paper repo raw `runs/` remain intentionally ignored; reduced CSV/PDF and the
+  experiment provenance record are tracked.
+- Local untracked `runs/` and `.codex/hooks/` in GEM5-sway were not part of the
+  recorded commits.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Replace the hand-tuned TAGE-donee guard with an outcome-aware policy
+  using BTB target misses, TAGE update mispredictions, cooldown, or rollback.
+- Keep adding one tracked `docs/experiments/` record for each paper figure or
+  measured claim that depends on ignored raw run directories.
