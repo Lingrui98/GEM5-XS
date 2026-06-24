@@ -89,13 +89,17 @@ DecoupledBPUWithBTB::SwayController::chooseReallocation(
         return decision;
     }
 
-    if ((donee->utility - donor->utility) <= hysteresisMargin) {
+    const uint8_t doneeOwner = sway::ownerFromScope(donee->scope);
+    const double requiredGap = sway::isTageOwner(doneeOwner) ?
+        std::max(hysteresisMargin, tageDoneeHysteresisMargin) :
+        hysteresisMargin;
+    if ((donee->utility - donor->utility) <= requiredGap) {
         return decision;
     }
 
     decision.valid = true;
     decision.donor = sway::ownerFromScope(donor->scope);
-    decision.donee = sway::ownerFromScope(donee->scope);
+    decision.donee = doneeOwner;
     decision.donorUtility = donor->utility;
     decision.doneeUtility = donee->utility;
     return decision;

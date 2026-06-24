@@ -98,8 +98,10 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     enableSwayRealloc = p.enableSwayRealloc;
     swayReallocWays = p.swayReallocWays;
     swayReallocHysteresis = p.swayReallocHysteresis;
+    swayReallocTageDoneeHysteresis = p.swayReallocTageDoneeHysteresis;
     swayController.configure(enableSwayRealloc, swayReallocWays,
-                             swayReallocHysteresis);
+                             swayReallocHysteresis,
+                             swayReallocTageDoneeHysteresis);
     if (mbtb) {
         mbtb->setSwayReallocEnabled(enableSwayRealloc);
     }
