@@ -274,7 +274,8 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
       smtFTQThreshold(p.smtFTQThreshold),
       ftq(p.numThreads, p.ftq_size),
       resolveBlockThreshold(p.resolveBlockThreshold),
-      dbpBtbStats(this, p.numStages, p.fsq_size, maxInstsNum, p.numThreads)
+      dbpBtbStats(this, p.numStages, p.fsq_size, maxInstsNum, p.numThreads),
+      swayStats(this)
 {
     fatal_if(enableFDIP && !fdipFlushPartialOnEpochChangeCfg,
              "FDIP requires fdip_flush_partial_on_epoch_change=true: "
@@ -289,6 +290,19 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     panic_if(numPredictingThreads > 1 && pairtage->isEnabled(),
              "PairTAGE does not yet support concurrent SMT predictions; "
              "disable PairTAGE or set smtNumPredictingThreads to one");
+    enableSwayRealloc = p.enableSwayRealloc;
+    swayReallocWays = p.swayReallocWays;
+    swayReallocHysteresis = p.swayReallocHysteresis;
+    swayController.configure(enableSwayRealloc, swayReallocWays,
+                             swayReallocHysteresis);
+    if (mbtb) {
+        mbtb->setSwayReallocEnabled(enableSwayRealloc);
+    }
+    if (tage) {
+        tage->setSwayReallocEnabled(enableSwayRealloc);
+    }
+    syncSwayBorrowedWayCounts();
+
     panic_if(ftqMode == SMTFTQMode::Shared &&
              ftqPolicy == SMTFTQPolicy::Threshold &&
              smtFTQThreshold > ftqEntries,
@@ -518,6 +532,13 @@ void
 DecoupledBPUWithBTB::tick()
 {
     DPRINTF(Override, "DecoupledBPUWithBTB::tick()\n");
+
+    // SWAY: a way-owner transfer consumes one quiesce prediction cycle.
+    if (swayController.consumeQuiesceCycle()) {
+        swayStats.reallocBlockedQuiesce++;
+        DPRINTF(Override, "SWAY reallocation quiesce cycle consumed\n");
+        return;
+    }
 
     for (int tid = 0; tid < numThreads; ++tid) {
         auto &thread = threads[tid];

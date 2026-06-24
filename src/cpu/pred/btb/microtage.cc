@@ -99,8 +99,6 @@ MicroTAGE::MicroTAGE(const Params& p)
     // Initialize base table for fallback predictions
     threadHistory.resize(MaxThreads);
     threadMeta.resize(MaxThreads);
-    // SWAY per-way visit counters, mirror tageTable shape.
-    wayVisitCnt.resize(numPredictors);
 
     for (unsigned int i = 0; i < numPredictors; ++i) {
         //initialize ittage predictor
@@ -109,8 +107,6 @@ MicroTAGE::MicroTAGE(const Params& p)
         for (unsigned int j = 0; j < tableSizes[i]; ++j) {
             tageTable[i][j].resize(numWays);
         }
-        wayVisitCnt[i].assign(tableSizes[i],
-                              std::vector<uint32_t>(numWays, 0));
 
         tableIndexBits[i] = ceilLog2(tableSizes[i]);
 
@@ -162,36 +158,6 @@ MicroTAGE::historyState(ThreadID tid) const
 {
     assert(tid < threadHistory.size());
     return threadHistory[tid];
-}
-
-std::vector<MicroTAGE::WayPhaseSnapshot>
-MicroTAGE::collectAndResetWayVisitCounts()
-{
-    std::vector<WayPhaseSnapshot> out;
-    out.reserve(numPredictors);
-    for (unsigned t = 0; t < numPredictors; ++t) {
-        WayPhaseSnapshot snap;
-        snap.scope = dbName + "_t" + std::to_string(t);
-        snap.table = t;
-        snap.totalWays = static_cast<uint64_t>(tableSizes[t]) * numWays;
-        snap.validWays = 0;
-        snap.activeWays = 0;
-        for (unsigned idx = 0; idx < tableSizes[t]; ++idx) {
-            auto& wayEntries = tageTable[t][idx];
-            auto& wayCounts = wayVisitCnt[t][idx];
-            for (unsigned w = 0; w < numWays; ++w) {
-                if (w < wayEntries.size() && wayEntries[w].valid) {
-                    ++snap.validWays;
-                }
-                if (w < wayCounts.size() && wayCounts[w] > 0) {
-                    ++snap.activeWays;
-                    wayCounts[w] = 0;
-                }
-            }
-        }
-        out.push_back(snap);
-    }
-    return out;
 }
 
 // Set up tracing for debugging
@@ -288,13 +254,6 @@ MicroTAGE::generateSinglePrediction(const BTBEntry &btb_entry,
                 match = true;
 
                 // Do not use LRU; keep logic simple and align with CBP-style replacement
-
-                // SWAY: per-way demand counter for stranded-ratio profiling.
-                if (i < (int)wayVisitCnt.size() &&
-                    index < wayVisitCnt[i].size() &&
-                    way < wayVisitCnt[i][index].size()) {
-                    ++wayVisitCnt[i][index][way];
-                }
 
                 DPRINTF(UTAGE, "hit  table %d[%lu][%u]: valid %d, tag %lu, ctr %d, useful %d, btb_pc %#lx, pos %u\n",
                     i, index, way, entry.valid, entry.tag, entry.counter, entry.useful, btb_entry.pc, position);
