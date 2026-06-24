@@ -8,7 +8,7 @@
     "XS_MAX_INSTS": "5000000",
     "XS_PHASE_SIZE_BY_INST": "100000",
     "XS_MEM_SIZE": "128GB",
-    "XS_EXTRA_PARAMS": "system.cpu[0].branchPred.enableSwayRealloc=True;system.cpu[0].branchPred.swayReallocWays=1"
+    "XS_EXTRA_PARAMS": "system.cpu[0].branchPred.enableSwayRealloc=True;system.cpu[0].branchPred.swayReallocWays=1;system.cpu[0].branchPred.swayReallocTageDoneeHysteresis=0.45"
   },
   "args": []
 }

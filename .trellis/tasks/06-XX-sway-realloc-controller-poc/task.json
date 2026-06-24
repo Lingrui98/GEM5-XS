@@ -22,7 +22,7 @@
     {"phase": 3, "action": "completed: build, smoke baseline vs SWAY, then run 10-workload batches"},
     {"phase": 4, "action": "completed: generate figure4 and update PLAN/PENDING closeout"}
   ],
-  "commit": "b2822df86c",
+  "commit": "b2822df86c + follow-up TAGE-donee guard commit",
   "pr_url": null,
   "subtasks": [],
   "children": [],
@@ -39,16 +39,17 @@
     "/nfs/home/goulingrui/project/papers/sway-paper/PENDING.md",
     "/nfs/home/goulingrui/project/papers/sway-paper/figures/figure4_ipc_uplift.py"
   ],
-  "notes": "DONE 2026-06-24 with mixed performance result. Source commit b2822df86c adds default-off enableSwayRealloc, per-way owner registers for MBTB and BTBTAGE, valid-bit squash before owner transfer, 1-cycle quiesce, and SWAY stats. BTBTAGE tests 28/28 pass, BTB tests 19/19 pass, and gem5.opt builds with -j64. Baseline stranded CSVs match Task A for all 10 W=100K workloads. 10-workload baseline and K=1 SWAY batches completed with 0 aborts; geomean delta is +0.713%, gcc_pp_O2 is +2.31%, and mcf is -0.71%, so the strict mcf > +0.5% target is not met. K=4 sensitivity is negative at -0.921% geomean and mcf -11.56%.",
+  "notes": "DONE 2026-06-24. Source commit b2822df86c adds default-off enableSwayRealloc, per-way owner registers for MBTB and BTBTAGE, valid-bit squash before owner transfer, 1-cycle quiesce, and SWAY stats. A follow-up commit adds a TAGE-donee hysteresis guard for the main evaluation. BTBTAGE tests 28/28 pass, BTB tests 19/19 pass, and gem5.opt builds with -j64. Baseline stranded CSVs match Task A for all 10 W=100K workloads. 10-workload baseline, K=1 SWAY, and K=4 SWAY batches completed with 0 aborts. Main K=1 geomean delta is +0.774%, gcc_pp_O2 is +2.31%, and mcf is +0.502%; strict perf gate passes with a narrow mcf margin.",
   "meta": {
     "owning_project": "/nfs/home/goulingrui/project/papers/sway-paper",
     "phase": "Phase 1 Step B",
     "control_scope": "mbtb_sram0, mbtb_sram1, tage_t0..tage_t7",
     "default_enable_sway_realloc": false,
     "main_k": 1,
-    "main_geomean_delta_ipc_pct": 0.713,
+    "tage_donee_hysteresis": 0.45,
+    "main_geomean_delta_ipc_pct": 0.774,
     "gcc_pp_O2_delta_ipc_pct": 2.31,
-    "mcf_delta_ipc_pct": -0.71,
-    "strict_perf_gate": "mixed: geomean and gcc pass; mcf fails"
+    "mcf_delta_ipc_pct": 0.502,
+    "strict_perf_gate": "pass: geomean, gcc, and mcf all clear thresholds"
   }
 }
