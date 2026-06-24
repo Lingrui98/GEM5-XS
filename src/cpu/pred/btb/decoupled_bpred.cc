@@ -560,7 +560,13 @@ DecoupledBPUWithBTB::tick()
 
     unsigned predictionsStarted = 0;
     for (const ThreadID tid : scheduledTids) {
-        if (threads[tid].blockPredictionPending) {
+        if (bpuRunaheadBlocked(tid)) {
+            dbpBtbStats.predictionBlockedForRunahead++;
+            DPRINTF(Override,
+                    "Prediction blocked by BPU runahead window: "
+                    "distance=%u limit=%u\n",
+                    ftqFetchToAllocDistance(tid), bpuRunaheadEntriesCfg);
+        } else if (threads[tid].blockPredictionPending) {
             DPRINTF(Override, "Prediction blocked to prioritize resolve update\n");
             dbpBtbStats.predictionBlockedForUpdate++;
             threads[tid].blockPredictionPending = false;
@@ -819,6 +825,15 @@ DecoupledBPUWithBTB::processNewPrediction(ThreadID tid)
     if (ftqFull(tid)) {
         dbpBtbStats.fsqFullCannotEnq++;
         DPRINTF(Override, "FSQ is full (%lu entries)\n", ftq.size(tid));
+        return;
+    }
+
+    if (bpuRunaheadBlocked(tid)) {
+        dbpBtbStats.predictionBlockedForRunahead++;
+        DPRINTF(Override,
+                "Delaying FSQ enqueue due to BPU runahead window: "
+                "distance=%u limit=%u\n",
+                ftqFetchToAllocDistance(tid), bpuRunaheadEntriesCfg);
         return;
     }
 

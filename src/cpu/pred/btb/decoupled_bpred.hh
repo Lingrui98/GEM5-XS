@@ -184,6 +184,20 @@ class DecoupledBPUWithBTB : public BPredUnit
     bool canStartPrediction(ThreadID tid) const;
     std::vector<ThreadID> scheduleThreads();
 
+    unsigned ftqFetchToAllocDistance(ThreadID tid) const
+    {
+        if (!ftq.hasTarget(ftq.fetchId(tid), tid)) {
+            return 0;
+        }
+        return ftq.backId(tid) - ftq.fetchId(tid) + 1;
+    }
+
+    bool bpuRunaheadBlocked(ThreadID tid) const
+    {
+        return fdipEnabled() && bpuRunaheadEntriesCfg > 0 &&
+               ftqFetchToAllocDistance(tid) >= bpuRunaheadEntriesCfg;
+    }
+
     void processNewPrediction(ThreadID tid);
     void prepareTwoTakenTraining(ThreadID tid);
     void processTwoTakenBlock(ThreadID tid);
