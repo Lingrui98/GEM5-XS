@@ -274,7 +274,8 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
       smtFTQThreshold(p.smtFTQThreshold),
       ftq(p.numThreads, p.ftq_size),
       resolveBlockThreshold(p.resolveBlockThreshold),
-      dbpBtbStats(this, p.numStages, p.fsq_size, maxInstsNum, p.numThreads)
+      dbpBtbStats(this, p.numStages, p.fsq_size, maxInstsNum, p.numThreads),
+      swayStats(this)
 {
     fatal_if(enableFDIP && !fdipFlushPartialOnEpochChangeCfg,
              "FDIP requires fdip_flush_partial_on_epoch_change=true: "
@@ -299,6 +300,18 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     // build can sweep W via -P system.cpu[0].branchPred.phaseSizeByInst=N.
     phaseSizeByInst = p.phaseSizeByInst;
     subPhaseRatio = p.subPhaseRatio;
+    enableSwayRealloc = p.enableSwayRealloc;
+    swayReallocWays = p.swayReallocWays;
+    swayReallocHysteresis = p.swayReallocHysteresis;
+    swayController.configure(enableSwayRealloc, swayReallocWays,
+                             swayReallocHysteresis);
+    if (mbtb) {
+        mbtb->setSwayReallocEnabled(enableSwayRealloc);
+    }
+    if (tage) {
+        tage->setSwayReallocEnabled(enableSwayRealloc);
+    }
+    syncSwayBorrowedWayCounts();
     if (bpDBSwitches.size() > 0) {
         initDB();
     }
@@ -518,6 +531,13 @@ void
 DecoupledBPUWithBTB::tick()
 {
     DPRINTF(Override, "DecoupledBPUWithBTB::tick()\n");
+
+    // SWAY: a way-owner transfer consumes one quiesce prediction cycle.
+    if (swayController.consumeQuiesceCycle()) {
+        swayStats.reallocBlockedQuiesce++;
+        DPRINTF(Override, "SWAY reallocation quiesce cycle consumed\n");
+        return;
+    }
 
     for (int tid = 0; tid < numThreads; ++tid) {
         auto &thread = threads[tid];
