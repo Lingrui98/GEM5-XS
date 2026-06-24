@@ -77,3 +77,10 @@ microbench/dramsim3*
 *.log
 *.gz
 *.zstd
+# SWAY hysteresis-tuning scratch runs (Phase 1 Task B). Aggregate
+# evaluation data lives in ~/project/papers/sway-paper/runs/ which has
+# its own gitignore.
+runs/
+
+# codex-cli hooks live outside the gem5 source tree
+.codex/
