@@ -161,6 +161,9 @@ tageStats(this, p.numPredictors, p.numBanks)
 
     // SWAY per-way visit counters, mirror tageTable shape.
     wayVisitCnt.resize(numPredictors);
+    swayWayOwner.resize(numPredictors);
+    swayExtraTable.resize(numPredictors);
+    swayExtraVisitCnt.resize(numPredictors);
 
     for (unsigned int i = 0; i < numPredictors; ++i) {
         //initialize ittage predictor
@@ -172,6 +175,10 @@ tageStats(this, p.numPredictors, p.numBanks)
         }
         wayVisitCnt[i].assign(tableSizes[i],
                               std::vector<uint32_t>(ways, 0));
+        swayWayOwner[i].assign(ways, sway::tageOwner(i));
+        swayExtraTable[i].resize(tableSizes[i]);
+        swayExtraVisitCnt[i].assign(tableSizes[i],
+                                    std::vector<uint32_t>());
 
         tableIndexBits[i] = ceilLog2(tableSizes[i]);
         tableIndexMasks[i].resize(tableIndexBits[i], true);
@@ -229,29 +236,183 @@ BTBTAGE::historyState(ThreadID tid) const
     return threadHistory[tid];
 }
 
+void
+BTBTAGE::setSwayReallocEnabled(bool enabled)
+{
+    enableSwayRealloc = enabled;
+}
+
+bool
+BTBTAGE::swayNativeWayVisible(unsigned table, unsigned way) const
+{
+    if (!enableSwayRealloc) {
+        return true;
+    }
+    return table < swayWayOwner.size() &&
+        way < swayWayOwner[table].size() &&
+        swayWayOwner[table][way] == sway::tageOwner(table);
+}
+
+unsigned
+BTBTAGE::swayExtraWayCount(unsigned table) const
+{
+    if (table >= swayExtraTable.size() || swayExtraTable[table].empty()) {
+        return 0;
+    }
+    return swayExtraTable[table].front().size();
+}
+
+void
+BTBTAGE::resizeSwayExtraWays(unsigned table, unsigned ways)
+{
+    assert(table < swayExtraTable.size());
+    for (unsigned idx = 0; idx < tableSizes[table]; ++idx) {
+        const unsigned old_size = swayExtraTable[table][idx].size();
+        swayExtraTable[table][idx].resize(ways);
+        swayExtraVisitCnt[table][idx].resize(ways, 0);
+        for (unsigned way = old_size; way < ways; ++way) {
+            swayExtraTable[table][idx][way].valid = false;
+        }
+    }
+}
+
+void
+BTBTAGE::squashNativeWay(unsigned table, unsigned way)
+{
+    for (unsigned idx = 0; idx < tableSizes[table]; ++idx) {
+        if (way < tageTable[table][idx].size()) {
+            tageTable[table][idx][way].valid = false;
+        }
+        if (way < wayVisitCnt[table][idx].size()) {
+            wayVisitCnt[table][idx][way] = 0;
+        }
+    }
+}
+
+BTBTAGE::TageEntry &
+BTBTAGE::mutableTageEntry(const TageTableInfo &info)
+{
+    if (info.isExtra) {
+        return swayExtraTable[info.table][info.index][info.way];
+    }
+    return tageTable[info.table][info.index][info.way];
+}
+
+unsigned
+BTBTAGE::countSwayOwnedWays(uint8_t owner) const
+{
+    unsigned count = 0;
+    for (const auto &tableOwners : swayWayOwner) {
+        for (auto current : tableOwners) {
+            count += current == owner;
+        }
+    }
+    return count;
+}
+
+unsigned
+BTBTAGE::transferSwayWays(uint8_t donor, uint8_t donee, unsigned count)
+{
+    if (!enableSwayRealloc || count == 0 || donor == donee) {
+        return 0;
+    }
+
+    unsigned moved = 0;
+    for (int table = static_cast<int>(swayWayOwner.size()) - 1;
+         table >= 0 && moved < count; --table) {
+        auto &owners = swayWayOwner[table];
+        for (int way = static_cast<int>(owners.size()) - 1;
+             way >= 0 && moved < count; --way) {
+            if (owners[way] != donor) {
+                continue;
+            }
+            squashNativeWay(static_cast<unsigned>(table),
+                            static_cast<unsigned>(way));
+            owners[way] = donee;
+            ++moved;
+        }
+    }
+    return moved;
+}
+
+void
+BTBTAGE::addSwayBorrowedWayCounts(sway::ScopeCounts &counts) const
+{
+    for (unsigned table = 0; table < swayWayOwner.size(); ++table) {
+        const uint8_t native_owner = sway::tageOwner(table);
+        for (auto owner : swayWayOwner[table]) {
+            if (owner < sway::NumScopes && owner != native_owner) {
+                ++counts[owner];
+            }
+        }
+    }
+}
+
+void
+BTBTAGE::syncSwayBorrowedWayCounts(const sway::ScopeCounts &counts)
+{
+    if (!enableSwayRealloc) {
+        return;
+    }
+    for (unsigned table = 0; table < numPredictors; ++table) {
+        resizeSwayExtraWays(table, counts[sway::tageOwner(table)]);
+    }
+}
+
 std::vector<BTBTAGE::WayPhaseSnapshot>
 BTBTAGE::collectAndResetWayVisitCounts()
 {
     std::vector<WayPhaseSnapshot> out;
     out.reserve(numPredictors);
+#ifdef UNIT_TEST
+    const std::string scope_prefix = "tage";
+#else
+    const std::string scope_prefix = dbName;
+#endif
     for (unsigned t = 0; t < numPredictors; ++t) {
         const unsigned ways = getNumWays(t);
         WayPhaseSnapshot snap;
-        snap.scope = dbName + "_t" + std::to_string(t);
+        snap.scope = scope_prefix + "_t" + std::to_string(t);
         snap.table = t;
-        snap.totalWays = static_cast<uint64_t>(tableSizes[t]) * ways;
+        unsigned nativeWays = 0;
+        for (unsigned w = 0; w < ways; ++w) {
+            nativeWays += swayNativeWayVisible(t, w);
+        }
+        const unsigned extraWays =
+            enableSwayRealloc ? swayExtraWayCount(t) : 0;
+        snap.totalWays = static_cast<uint64_t>(tableSizes[t]) *
+            (nativeWays + extraWays);
         snap.validWays = 0;
         snap.activeWays = 0;
         for (unsigned idx = 0; idx < tableSizes[t]; ++idx) {
             auto& wayEntries = tageTable[t][idx];
             auto& wayCounts = wayVisitCnt[t][idx];
             for (unsigned w = 0; w < ways; ++w) {
-                if (w < wayEntries.size() && wayEntries[w].valid) {
+                if (w >= wayEntries.size()) {
+                    continue;
+                }
+                const bool visible = swayNativeWayVisible(t, w);
+                if (visible && wayEntries[w].valid) {
                     ++snap.validWays;
                 }
                 if (w < wayCounts.size() && wayCounts[w] > 0) {
-                    ++snap.activeWays;
+                    if (visible) {
+                        ++snap.activeWays;
+                    }
                     wayCounts[w] = 0;
+                }
+            }
+            if (enableSwayRealloc) {
+                auto &extraEntries = swayExtraTable[t][idx];
+                auto &extraCounts = swayExtraVisitCnt[t][idx];
+                for (unsigned w = 0; w < extraEntries.size(); ++w) {
+                    if (extraEntries[w].valid) {
+                        ++snap.validWays;
+                    }
+                    if (w < extraCounts.size() && extraCounts[w] > 0) {
+                        ++snap.activeWays;
+                        extraCounts[w] = 0;
+                    }
                 }
             }
         }
@@ -361,18 +522,23 @@ BTBTAGE::generateSinglePrediction(const BTBEntry &btb_entry,
                                      state.altTagFoldedHist[i].get(), position, asidHash);
 
         bool match = false; // for each table, only one way can be matched
+        bool matching_extra = false;
         TageEntry matching_entry;
         unsigned matching_way = 0;
 
         // Search all ways for a matching entry
         const unsigned ways = getNumWays(i);
         for (unsigned way = 0; way < ways; way++) {
+            if (!swayNativeWayVisible(i, way)) {
+                continue;
+            }
             auto &entry = tageTable[i][index][way];
             // entry valid, tag match (position already encoded in tag, no need to check pc)
             if (entry.valid && tag == entry.tag) {
                 matching_entry = entry;
                 matching_way = way;
                 match = true;
+                matching_extra = false;
 
                 // Do not use LRU; keep logic simple and align with CBP-style replacement
 
@@ -389,17 +555,44 @@ BTBTAGE::generateSinglePrediction(const BTBEntry &btb_entry,
             }
         }
 
+        if (!match && enableSwayRealloc) {
+            auto &extra_set = swayExtraTable[i][index];
+            for (unsigned way = 0; way < extra_set.size(); ++way) {
+                auto &entry = extra_set[way];
+                if (entry.valid && tag == entry.tag) {
+                    matching_entry = entry;
+                    matching_way = way;
+                    match = true;
+                    matching_extra = true;
+                    if (i < (int)swayExtraVisitCnt.size() &&
+                        index < swayExtraVisitCnt[i].size() &&
+                        way < swayExtraVisitCnt[i][index].size()) {
+                        ++swayExtraVisitCnt[i][index][way];
+                    }
+                    DPRINTF(TAGE, "hit extra table %d[%lu][%u]: valid %d, "
+                            "tag %lu, ctr %d, useful %d, btb_pc %#lx, "
+                            "pos %u\n",
+                            i, index, way, entry.valid, entry.tag,
+                            entry.counter, entry.useful, btb_entry.pc,
+                            position);
+                    break;
+                }
+            }
+        }
+
         if (match) {
             if (i < 64) {
                 hit_table_mask |= (1ULL << i);
             }
             if (!provided) {
                 // First match becomes main prediction
-                main_info = TageTableInfo(true, matching_entry, i, index, tag, matching_way);
+                main_info = TageTableInfo(true, matching_entry, i, index, tag,
+                                          matching_way, matching_extra);
                 provided = true;
             } else if (!alt_provided) {
                 // Second match becomes alternative prediction
-                alt_info = TageTableInfo(true, matching_entry, i, index, tag, matching_way);
+                alt_info = TageTableInfo(true, matching_entry, i, index, tag,
+                                         matching_way, matching_extra);
                 alt_provided = true;
                 break;
             }
@@ -656,7 +849,7 @@ BTBTAGE::updatePredictorStateAndCheckAllocation(const BTBEntry &entry,
         DPRINTF(TAGE, "prediction provided by table %d, idx %lu, way %u, updating corresponding entry\n",
             main_info.table, main_info.index, main_info.way);
 
-        auto &way = tageTable[main_info.table][main_info.index][main_info.way];
+        auto &way = mutableTageEntry(main_info);
 
         // Update prediction counter
         updateCounter(actual_taken, 3, way.counter);
@@ -675,7 +868,7 @@ BTBTAGE::updatePredictorStateAndCheckAllocation(const BTBEntry &entry,
 
     // Update alternative prediction provider
     if (used_alt && alt_info.found) {
-        auto &way = tageTable[alt_info.table][alt_info.index][alt_info.way];
+        auto &way = mutableTageEntry(alt_info);
         updateCounter(actual_taken, 3, way.counter);
         // No LRU maintenance
     }
@@ -784,19 +977,36 @@ BTBTAGE::handleNewEntryAllocation(const Addr &startPC,
             meta->tagFoldedHist[ti].get(), meta->altTagFoldedHist[ti].get(), position, asidHash);
 
         auto &set = tageTable[ti][newIndex];
+        auto &extra_set = swayExtraTable[ti][newIndex];
 
         const unsigned ways = getNumWays(ti);
 
         int selected_way = -1;
+        bool selected_extra = false;
         for (unsigned way = 0; way < ways; ++way) {
+            if (!swayNativeWayVisible(ti, way)) {
+                continue;
+            }
             if (!set[way].valid) {
                 selected_way = way;
                 break;
             }
         }
+        if (selected_way == -1) {
+            for (unsigned way = 0; way < extra_set.size(); ++way) {
+                if (!extra_set[way].valid) {
+                    selected_way = way;
+                    selected_extra = true;
+                    break;
+                }
+            }
+        }
 
         if (selected_way == -1) {
             for (unsigned way = 0; way < ways; ++way) {
+                if (!swayNativeWayVisible(ti, way)) {
+                    continue;
+                }
                 auto &cand = set[way];
                 const bool weakish = std::abs(cand.counter * 2 + 1) <= 3;
                 if (!cand.useful && weakish) {
@@ -805,11 +1015,34 @@ BTBTAGE::handleNewEntryAllocation(const Addr &startPC,
                 }
             }
         }
+        if (selected_way == -1) {
+            for (unsigned way = 0; way < extra_set.size(); ++way) {
+                auto &cand = extra_set[way];
+                const bool weakish = std::abs(cand.counter * 2 + 1) <= 3;
+                if (!cand.useful && weakish) {
+                    selected_way = way;
+                    selected_extra = true;
+                    break;
+                }
+            }
+        }
 
         if (selected_way == -1) {
             for (unsigned way = 0; way < ways; ++way) {
+                if (!swayNativeWayVisible(ti, way)) {
+                    continue;
+                }
                 if (!set[way].useful) {
                     selected_way = way;
+                    break;
+                }
+            }
+        }
+        if (selected_way == -1) {
+            for (unsigned way = 0; way < extra_set.size(); ++way) {
+                if (!extra_set[way].useful) {
+                    selected_way = way;
+                    selected_extra = true;
                     break;
                 }
             }
@@ -817,7 +1050,8 @@ BTBTAGE::handleNewEntryAllocation(const Addr &startPC,
 
         if (selected_way != -1) {
             short newCounter = actual_taken ? 0 : -1;
-            auto &victim = set[selected_way];
+            auto &victim = selected_extra ? extra_set[selected_way] :
+                set[selected_way];
             DPRINTF(TAGE, "allocating entry in table %d[%lu][%u], tag %lu (with pos %u), counter %d, pc %#lx\n",
                     ti, newIndex, selected_way, newTag, position, newCounter, entry.pc);
             allocInfo.success = true;
@@ -830,7 +1064,7 @@ BTBTAGE::handleNewEntryAllocation(const Addr &startPC,
             allocInfo.victimCounter = victim.counter;
             allocInfo.victimUseful = victim.useful;
             allocInfo.victimPC = victim.pc;
-            set[selected_way] = TageEntry(newTag, newCounter, entry.pc); // u = 0 default
+            victim = TageEntry(newTag, newCounter, entry.pc); // u = 0 default
             tageStats.updateAllocSuccess++;
             usefulResetCnt = usefulResetCnt <= 0 ? 0 : usefulResetCnt - 1;
             return true;
@@ -844,6 +1078,13 @@ BTBTAGE::handleNewEntryAllocation(const Addr &startPC,
         tageStats.updateResetU++;
         DPRINTF(TAGE, "reset useful bit of all entries\n");
         for (auto &table : tageTable) {
+            for (auto &set : table) {
+                for (auto &way : set) {
+                    way.useful = false;
+                }
+            }
+        }
+        for (auto &table : swayExtraTable) {
             for (auto &set : table) {
                 for (auto &way : set) {
                     way.useful = false;

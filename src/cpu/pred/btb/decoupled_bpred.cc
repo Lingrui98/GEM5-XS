@@ -78,7 +78,8 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
       smtFTQThreshold(p.smtFTQThreshold),
       ftq(p.numThreads, p.ftq_size),
       resolveBlockThreshold(p.resolveBlockThreshold),
-      dbpBtbStats(this, p.numStages, p.fsq_size, maxInstsNum)
+      dbpBtbStats(this, p.numStages, p.fsq_size, maxInstsNum),
+      swayStats(this)
 {
     panic_if(ftqMode == SMTFTQMode::Shared &&
              ftqPolicy == SMTFTQPolicy::Threshold &&
@@ -94,6 +95,18 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     // build can sweep W via -P system.cpu[0].branchPred.phaseSizeByInst=N.
     phaseSizeByInst = p.phaseSizeByInst;
     subPhaseRatio = p.subPhaseRatio;
+    enableSwayRealloc = p.enableSwayRealloc;
+    swayReallocWays = p.swayReallocWays;
+    swayReallocHysteresis = p.swayReallocHysteresis;
+    swayController.configure(enableSwayRealloc, swayReallocWays,
+                             swayReallocHysteresis);
+    if (mbtb) {
+        mbtb->setSwayReallocEnabled(enableSwayRealloc);
+    }
+    if (tage) {
+        tage->setSwayReallocEnabled(enableSwayRealloc);
+    }
+    syncSwayBorrowedWayCounts();
     if (bpDBSwitches.size() > 0) {
         initDB();
     }
@@ -287,6 +300,12 @@ void
 DecoupledBPUWithBTB::tick()
 {
     DPRINTF(Override, "DecoupledBPUWithBTB::tick()\n");
+
+    if (swayController.consumeQuiesceCycle()) {
+        swayStats.reallocBlockedQuiesce++;
+        DPRINTF(Override, "SWAY reallocation quiesce cycle consumed\n");
+        return;
+    }
 
     ThreadID curTid = scheduleThread();
     if (curTid == InvalidThreadID) {

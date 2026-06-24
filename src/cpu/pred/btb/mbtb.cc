@@ -145,6 +145,12 @@ MBTB::MBTB(const Params &p)
     // SWAY per-way visit counters, mirror sram0/sram1 shape.
     wayVisit0.assign(numSets, std::vector<uint32_t>(numWays, 0));
     wayVisit1.assign(numSets, std::vector<uint32_t>(numWays, 0));
+    swayOwner0.assign(numWays, sway::MbtbSram0);
+    swayOwner1.assign(numWays, sway::MbtbSram1);
+    swayExtra0.resize(numSets);
+    swayExtra1.resize(numSets);
+    swayExtraVisit0.assign(numSets, std::vector<uint32_t>());
+    swayExtraVisit1.assign(numSets, std::vector<uint32_t>());
 
     DPRINTF(BTB, "numEntries %d, numSets %d, numWays %d, tagBits %d, tagShiftAmt %d, "
         "idxMask %#lx, tagMask %#lx, victimCacheSize %d\n",
@@ -154,6 +160,140 @@ MBTB::MBTB(const Params &p)
     hasDB = true;
     dbName = std::string("MainBTB");
 #endif
+}
+
+void
+MBTB::setSwayReallocEnabled(bool enabled)
+{
+    enableSwayRealloc = enabled;
+}
+
+bool
+MBTB::swayNativeWayVisible(int sramId, unsigned way) const
+{
+    if (!enableSwayRealloc) {
+        return true;
+    }
+    const auto &owners = sramId == 0 ? swayOwner0 : swayOwner1;
+    return way < owners.size() && owners[way] == sway::mbtbOwner(sramId);
+}
+
+unsigned
+MBTB::swayExtraWayCount(int sramId) const
+{
+    const auto &extra = sramId == 0 ? swayExtra0 : swayExtra1;
+    return extra.empty() ? 0 : extra.front().size();
+}
+
+MBTB::BTBSet &
+MBTB::swayExtraSet(int sramId, Addr idx)
+{
+    return sramId == 0 ? swayExtra0[idx] : swayExtra1[idx];
+}
+
+std::vector<std::vector<uint32_t>> &
+MBTB::swayExtraVisit(int sramId)
+{
+    return sramId == 0 ? swayExtraVisit0 : swayExtraVisit1;
+}
+
+void
+MBTB::resizeSwayExtraWays(int sramId, unsigned ways)
+{
+    auto &extra = sramId == 0 ? swayExtra0 : swayExtra1;
+    auto &visits = sramId == 0 ? swayExtraVisit0 : swayExtraVisit1;
+    for (unsigned set = 0; set < numSets; ++set) {
+        const unsigned old_size = extra[set].size();
+        extra[set].resize(ways);
+        visits[set].resize(ways, 0);
+        for (unsigned way = old_size; way < ways; ++way) {
+            extra[set][way].valid = false;
+            extra[set][way].tick = 0;
+        }
+    }
+}
+
+void
+MBTB::squashNativeWay(int sramId, unsigned way)
+{
+    auto &sram = sramId == 0 ? sram0 : sram1;
+    auto &visits = sramId == 0 ? wayVisit0 : wayVisit1;
+    for (unsigned set = 0; set < numSets; ++set) {
+        if (way < sram[set].size()) {
+            sram[set][way].valid = false;
+        }
+        if (way < visits[set].size()) {
+            visits[set][way] = 0;
+        }
+    }
+}
+
+unsigned
+MBTB::countSwayOwnedWays(uint8_t owner) const
+{
+    unsigned count = 0;
+    for (auto current : swayOwner0) {
+        count += current == owner;
+    }
+    for (auto current : swayOwner1) {
+        count += current == owner;
+    }
+    return count;
+}
+
+unsigned
+MBTB::transferSwayWays(uint8_t donor, uint8_t donee, unsigned count)
+{
+    if (!enableSwayRealloc || count == 0 || donor == donee) {
+        return 0;
+    }
+
+    unsigned moved = 0;
+    auto transfer_from = [&](int sramId, std::vector<uint8_t> &owners) {
+        for (int way = static_cast<int>(owners.size()) - 1;
+             way >= 0 && moved < count; --way) {
+            if (owners[way] != donor) {
+                continue;
+            }
+            squashNativeWay(sramId, static_cast<unsigned>(way));
+            owners[way] = donee;
+            ++moved;
+        }
+    };
+
+    transfer_from(0, swayOwner0);
+    transfer_from(1, swayOwner1);
+    if (moved > 0) {
+        for (auto &entry : victimCache) {
+            entry.valid = false;
+        }
+    }
+    return moved;
+}
+
+void
+MBTB::addSwayBorrowedWayCounts(sway::ScopeCounts &counts) const
+{
+    for (auto owner : swayOwner0) {
+        if (owner < sway::NumScopes && owner != sway::MbtbSram0) {
+            ++counts[owner];
+        }
+    }
+    for (auto owner : swayOwner1) {
+        if (owner < sway::NumScopes && owner != sway::MbtbSram1) {
+            ++counts[owner];
+        }
+    }
+}
+
+void
+MBTB::syncSwayBorrowedWayCounts(const sway::ScopeCounts &counts)
+{
+    if (!enableSwayRealloc) {
+        return;
+    }
+    resizeSwayExtraWays(0, counts[sway::MbtbSram0]);
+    resizeSwayExtraWays(1, counts[sway::MbtbSram1]);
 }
 
 #ifndef UNIT_TEST
@@ -351,6 +491,10 @@ MBTB::lookupSingleBlock(Addr block_pc, uint8_t asidHash)
     auto& target_visit = (sram_id == 0) ? wayVisit0 : wayVisit1;
     unsigned way_idx = 0;
     for (auto &way : btb_set) {
+        if (!swayNativeWayVisible(sram_id, way_idx)) {
+            ++way_idx;
+            continue;
+        }
         if (way.valid && way.tag == current_tag) {
             res.push_back(way);
             way.tick = curTick(); // Update timestamp for MRU
@@ -362,6 +506,21 @@ MBTB::lookupSingleBlock(Addr block_pc, uint8_t asidHash)
         }
         ++way_idx;
     }
+    if (enableSwayRealloc) {
+        auto &extra_set = swayExtraSet(sram_id, btb_idx);
+        auto &extra_visit = swayExtraVisit(sram_id);
+        for (unsigned way = 0; way < extra_set.size(); ++way) {
+            auto &entry = extra_set[way];
+            if (entry.valid && entry.tag == current_tag) {
+                res.push_back(entry);
+                entry.tick = curTick();
+                if (btb_idx < extra_visit.size() &&
+                    way < extra_visit[btb_idx].size()) {
+                    ++extra_visit[btb_idx][way];
+                }
+            }
+        }
+    }
     return res;
 }
 
@@ -371,33 +530,212 @@ MBTB::collectAndResetWayVisitCounts()
     std::vector<WayPhaseSnapshot> out;
     out.reserve(2);
 
-    auto sweep = [&](const std::string& scope,
+    auto sweep = [&](const std::string& scope, int sramId,
                      std::vector<BTBSet>& sram,
-                     std::vector<std::vector<uint32_t>>& visit) {
+                     std::vector<std::vector<uint32_t>>& visit,
+                     std::vector<BTBSet>& extra,
+                     std::vector<std::vector<uint32_t>>& extraVisit) {
         WayPhaseSnapshot snap;
         snap.scope = scope;
-        snap.totalWays = static_cast<uint64_t>(numSets) * numWays;
+        const unsigned extraWays =
+            enableSwayRealloc && !extra.empty() ? extra.front().size() : 0;
+        unsigned nativeWays = 0;
+        for (unsigned w = 0; w < numWays; ++w) {
+            nativeWays += swayNativeWayVisible(sramId, w);
+        }
+        snap.totalWays = static_cast<uint64_t>(numSets) *
+            (nativeWays + extraWays);
         snap.validWays = 0;
         snap.activeWays = 0;
         for (unsigned s = 0; s < numSets; ++s) {
             const auto& set = sram[s];
             auto& vcounts = visit[s];
             for (unsigned w = 0; w < numWays; ++w) {
-                if (w < set.size() && set[w].valid) {
+                if (w >= set.size()) {
+                    continue;
+                }
+                const bool visible = swayNativeWayVisible(sramId, w);
+                if (visible && set[w].valid) {
                     ++snap.validWays;
                 }
                 if (w < vcounts.size() && vcounts[w] > 0) {
-                    ++snap.activeWays;
+                    if (visible) {
+                        ++snap.activeWays;
+                    }
                     vcounts[w] = 0;
+                }
+            }
+            if (enableSwayRealloc && s < extra.size()) {
+                auto& extra_set = extra[s];
+                auto& extra_counts = extraVisit[s];
+                for (unsigned w = 0; w < extra_set.size(); ++w) {
+                    if (extra_set[w].valid) {
+                        ++snap.validWays;
+                    }
+                    if (w < extra_counts.size() && extra_counts[w] > 0) {
+                        ++snap.activeWays;
+                        extra_counts[w] = 0;
+                    }
                 }
             }
         }
         out.push_back(snap);
     };
 
-    sweep("mbtb_sram0", sram0, wayVisit0);
-    sweep("mbtb_sram1", sram1, wayVisit1);
+    sweep("mbtb_sram0", 0, sram0, wayVisit0, swayExtra0, swayExtraVisit0);
+    sweep("mbtb_sram1", 1, sram1, wayVisit1, swayExtra1, swayExtraVisit1);
     return out;
+}
+
+void
+MBTB::updateBTBEntrySway(const BTBEntry& entry, const FetchTarget &stream)
+{
+    btbStats.updateTotal++;
+    Addr alignedPC = entry.pc & ~(blockSize - 1);
+    int sram_id = getSRAMId(alignedPC);
+    auto& target_sram = (sram_id == 0) ? sram0 : sram1;
+    auto& target_mru = (sram_id == 0) ? mru0 : mru1;
+    auto& extra_set = swayExtraSet(sram_id, getIndex(entry.pc, stream.asidHash));
+
+    Addr btb_idx = getIndex(entry.pc, stream.asidHash);
+
+    bool found = false;
+    bool found_extra = false;
+    BTBSetIter it = target_sram[btb_idx].begin();
+    for (unsigned way = 0; it != target_sram[btb_idx].end(); ++it, ++way) {
+        if (swayNativeWayVisible(sram_id, way) && *it == entry) {
+            found = true;
+            break;
+        }
+    }
+
+    unsigned extra_way = 0;
+    if (!found) {
+        for (; extra_way < extra_set.size(); ++extra_way) {
+            if (extra_set[extra_way] == entry) {
+                found_extra = true;
+                break;
+            }
+        }
+    }
+
+    bool found_in_vc = false;
+    int vc_idx = -1;
+    for (int i = 0; i < (int)victimCache.size(); i++) {
+        auto &vc_entry = victimCache[i];
+        if (vc_entry.valid && vc_entry.pc == entry.pc) {
+            found_in_vc = true;
+            vc_idx = i;
+            break;
+        }
+    }
+
+    const BTBEntry* existing_ptr = nullptr;
+    if (found) {
+        existing_ptr = static_cast<const BTBEntry*>(&(*it));
+    } else if (found_extra) {
+        existing_ptr = static_cast<const BTBEntry*>(&extra_set[extra_way]);
+    } else if (found_in_vc) {
+        existing_ptr = static_cast<const BTBEntry*>(&victimCache[vc_idx]);
+    }
+
+    auto entry_to_write = buildUpdatedEntry(entry, existing_ptr, stream);
+    auto ticked_entry = TickedBTBEntry(entry_to_write, curTick());
+
+    if (found) {
+        updateExistingInSRAMSet(btb_idx, target_mru[btb_idx], it,
+                                ticked_entry);
+        return;
+    }
+    if (found_extra) {
+        extra_set[extra_way] = ticked_entry;
+        btbStats.updateExisting++;
+        eraseFromVictimCacheByPC(ticked_entry.pc);
+        return;
+    }
+    if (found_in_vc) {
+        commitToVictimCache(vc_idx, ticked_entry);
+        return;
+    }
+
+    auto choose_invalid_native = [&]() -> BTBSetIter {
+        auto iter = target_sram[btb_idx].begin();
+        for (unsigned way = 0; iter != target_sram[btb_idx].end();
+             ++iter, ++way) {
+            if (swayNativeWayVisible(sram_id, way) && !iter->valid) {
+                return iter;
+            }
+        }
+        return target_sram[btb_idx].end();
+    };
+
+    auto invalid_native = choose_invalid_native();
+    if (invalid_native != target_sram[btb_idx].end()) {
+        *invalid_native = ticked_entry;
+        btbStats.updateReplace++;
+        std::make_heap(target_mru[btb_idx].begin(), target_mru[btb_idx].end(),
+                       older());
+        eraseFromVictimCacheByPC(ticked_entry.pc);
+        return;
+    }
+
+    for (auto &extra : extra_set) {
+        if (!extra.valid) {
+            extra = ticked_entry;
+            btbStats.updateReplace++;
+            eraseFromVictimCacheByPC(ticked_entry.pc);
+            return;
+        }
+    }
+
+    bool have_victim = false;
+    bool victim_extra = false;
+    unsigned victim_way = 0;
+    uint64_t victim_tick = 0;
+    for (unsigned way = 0; way < target_sram[btb_idx].size(); ++way) {
+        if (!swayNativeWayVisible(sram_id, way)) {
+            continue;
+        }
+        auto &cand = target_sram[btb_idx][way];
+        if (!have_victim || cand.tick < victim_tick) {
+            have_victim = true;
+            victim_extra = false;
+            victim_way = way;
+            victim_tick = cand.tick;
+        }
+    }
+    for (unsigned way = 0; way < extra_set.size(); ++way) {
+        auto &cand = extra_set[way];
+        if (!have_victim || cand.tick < victim_tick) {
+            have_victim = true;
+            victim_extra = true;
+            victim_way = way;
+            victim_tick = cand.tick;
+        }
+    }
+
+    if (!have_victim) {
+        return;
+    }
+
+    if (victim_extra) {
+        if (extra_set[victim_way].valid) {
+            btbStats.updateReplaceValidOne++;
+        }
+        extra_set[victim_way] = ticked_entry;
+        btbStats.updateReplace++;
+    } else {
+        auto &victim = target_sram[btb_idx][victim_way];
+        if (victim.valid) {
+            btbStats.updateReplaceValidOne++;
+            insertVictimCache(victim);
+        }
+        victim = ticked_entry;
+        btbStats.updateReplace++;
+        std::make_heap(target_mru[btb_idx].begin(), target_mru[btb_idx].end(),
+                       older());
+    }
+    eraseFromVictimCacheByPC(ticked_entry.pc);
 }
 
 std::vector<MBTB::TickedBTBEntry>
@@ -536,6 +874,11 @@ MBTB::checkPredictionHit(const FetchTarget &stream, const BTBMeta* meta)
 void
 MBTB::updateBTBEntry(const BTBEntry& entry, const FetchTarget &stream)
 {
+    if (enableSwayRealloc) {
+        updateBTBEntrySway(entry, stream);
+        return;
+    }
+
     btbStats.updateTotal++;
     // Select SRAM based on entry PC's 32B-aligned address
     Addr alignedPC = entry.pc & ~(blockSize - 1);

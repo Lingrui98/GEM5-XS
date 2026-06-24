@@ -26,6 +26,7 @@
 #include "cpu/pred/btb/mbtb.hh"
 #include "cpu/pred/btb/microtage.hh"
 #include "cpu/pred/btb/ras.hh"
+#include "cpu/pred/btb/sway_realloc.hh"
 #include "cpu/pred/btb/timed_base_pred.hh"
 #include "cpu/pred/general_arch_db.hh"
 #include "cpu/timebuf.hh"
@@ -377,6 +378,15 @@ class DecoupledBPUWithBTB : public BPredUnit
 
         DBPBTBStats(statistics::Group* parent, unsigned numStages, unsigned fsqSize, unsigned maxInstsNum);
     } dbpBtbStats;
+
+    struct SwayStats : public statistics::Group
+    {
+        statistics::Scalar reallocCount;
+        statistics::Scalar reallocBlockedQuiesce;
+        statistics::Vector ownerOverrides;
+
+        SwayStats(statistics::Group* parent);
+    } swayStats;
 
   public:
     /**
@@ -756,6 +766,44 @@ class DecoupledBPUWithBTB : public BPredUnit
     class SwayController
     {
       public:
+        struct Decision
+        {
+            bool valid{false};
+            uint8_t donor{sway::InvalidOwner};
+            uint8_t donee{sway::InvalidOwner};
+            double donorUtility{0.0};
+            double doneeUtility{0.0};
+        };
+
+        void configure(bool enable, unsigned ways, double hysteresis)
+        {
+            enabled = enable;
+            transferWays = ways == 0 ? 1 : ways;
+            hysteresisMargin = hysteresis;
+        }
+
+        bool isEnabled() const { return enabled; }
+        unsigned waysPerTransfer() const { return transferWays; }
+
+        bool consumeQuiesceCycle()
+        {
+            if (quiesceCyclesRemaining == 0) {
+                return false;
+            }
+            --quiesceCyclesRemaining;
+            return true;
+        }
+
+        bool isQuiescing() const
+        {
+            return quiesceCyclesRemaining > 0;
+        }
+
+        void startQuiesce()
+        {
+            quiesceCyclesRemaining = 1;
+        }
+
         void collectPhaseScope(int phaseID, const std::string& scope,
                                uint64_t totalWays, uint64_t activeWays)
         {
@@ -769,6 +817,9 @@ class DecoupledBPUWithBTB : public BPredUnit
             return utilityByPhase;
         }
 
+        Decision chooseReallocation(
+            const std::vector<SwayUtilityRow>& phaseRows) const;
+
       private:
         static double computeUtility(uint64_t totalWays, uint64_t activeWays)
         {
@@ -777,6 +828,10 @@ class DecoupledBPUWithBTB : public BPredUnit
                 static_cast<double>(totalWays);
         }
 
+        bool enabled{false};
+        unsigned transferWays{1};
+        double hysteresisMargin{0.0};
+        unsigned quiesceCyclesRemaining{0};
         std::vector<SwayUtilityRow> utilityByPhase;
     };
     SwayController swayController;
@@ -785,6 +840,11 @@ class DecoupledBPUWithBTB : public BPredUnit
      * @brief Snapshot SWAY per-way visit counters at a phase boundary.
      */
     void collectSwayWayVisitForPhase(int phaseID);
+    void trySwayReallocForPhase(
+        const std::vector<SwayUtilityRow>& phaseRows);
+    unsigned countSwayOwnedWays(uint8_t owner) const;
+    unsigned transferSwayWays(uint8_t donor, uint8_t donee, unsigned ways);
+    void syncSwayBorrowedWayCounts();
 
     /**
      * @brief Next phase ID to dump statistics for
@@ -800,6 +860,9 @@ class DecoupledBPUWithBTB : public BPredUnit
      * @brief Number of instructions per phase
      */
     int phaseSizeByInst{100000};
+    bool enableSwayRealloc{false};
+    unsigned swayReallocWays{1};
+    double swayReallocHysteresis{0.0};
 
     /**
      * @brief Next sub-phase ID to dump statistics for

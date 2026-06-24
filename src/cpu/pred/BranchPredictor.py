@@ -1243,3 +1243,9 @@ class DecoupledBPUWithBTB(BranchPredictor):
         "Instructions per main profiling phase (W in SWAY paper)")
     subPhaseRatio = Param.Unsigned(10,
         "Number of sub-phases per main phase")
+    enableSwayRealloc = Param.Bool(False,
+        "Enable SWAY logical way reallocation controller")
+    swayReallocWays = Param.Unsigned(1,
+        "Number of ways transferred per SWAY reallocation decision")
+    swayReallocHysteresis = Param.Float(0.0,
+        "Minimum utility gap required before SWAY transfers a way")
