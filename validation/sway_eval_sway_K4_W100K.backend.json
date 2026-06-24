@@ -1,0 +1,14 @@
+{
+  "_comment": "SWAY Phase 1 Task B K=4 sensitivity backend config for mytools distributed-trace-scheduler run_cpt_gem5.sh. Use with cpt_workloads.lst, W=100K, 5M instructions.",
+  "env": {
+    "GEM5_HOME": "/nfs/home/goulingrui/project/GEM5-sway",
+    "GEM5_BUILD_TYPE": "opt",
+    "GCBV_REF_SO": "/nfs/home/share/gem5_ci/ref/normal/riscv64-nemu-interpreter-so",
+    "GCB_RESTORER": "/nfs/home/share/gem5_ci/tools/normal-gcb-restorer.bin",
+    "XS_MAX_INSTS": "5000000",
+    "XS_PHASE_SIZE_BY_INST": "100000",
+    "XS_MEM_SIZE": "128GB",
+    "XS_EXTRA_PARAMS": "system.cpu[0].branchPred.enableSwayRealloc=True;system.cpu[0].branchPred.swayReallocWays=4"
+  },
+  "args": []
+}
