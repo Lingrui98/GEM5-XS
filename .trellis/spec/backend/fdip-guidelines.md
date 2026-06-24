@@ -1,7 +1,16 @@
 # FDIP Guidelines
 
-> Executable contracts for the current FTQ-directed ICache prefetch model in
-> `fdip-phase2-xsdev`.
+> Executable contracts for the current FTQ-directed ICache prefetch model.
+>
+> **Source of truth as of 2026-06-24:** `trace-new` (HEAD `bb60673446`). The
+> 7-commit `fdip-phase2-xsdev` port was fast-forwarded into `trace-new` main
+> on 2026-06-24 after PRD `.trellis/tasks/06-15-fdip-port-onto-trace-new`
+> acceptance criteria #1..#4 all PASS. The historical `fdip-phase2-xsdev`
+> worktree still exists at `~/project/GEM5/.worktrees/fdip-phase2-xsdev`
+> (HEAD `7868731908`) as a port-history reference; treat it as read-only.
+> See `docs/Gem5_Docs/frontend/fdip.md` for the user-facing FDIP doc and
+> `~/expri_results/gem5/btbp-fdip-smoke/20260624-1319/` for the acceptance
+> evidence.
 
 ---
 
@@ -305,6 +314,130 @@ Current recommendation:
 - treat the current stack as complete for the P0/P1 stabilization cut
 - stop at Phase 1 / 1.5 unless a new research question specifically requires
   deeper RTL-fidelity work
+
+---
+
+## SMT-FTQ ↔ FDIP Coexistence Contract (2026-06-24)
+
+Background. `trace-new` shipped an SMT-aware FTQ
+(`ftqMode`, `SMTFTQPolicy`, `smtFTQThreshold` — see
+`src/cpu/pred/btb/decoupled_bpred.{cc,hh}`) before FDIP was ported in.
+`fdip-phase2-xsdev`'s FDIP path was originally authored single-thread.
+The port reconciled the two; the executable contract below documents the
+resulting shape so future edits do not regress it.
+
+### Files
+
+- `src/cpu/o3/fetch.{cc,hh}` — all FDIP state is **per-thread**.
+- `src/cpu/pred/btb/decoupled_bpred.{cc,hh}` — FTQ accessors are
+  thread-aware; FDIP prefetch-head accessors take `ThreadID tid`.
+- `configs/example/kmhv3.py` — `args.enable_fdip` branch wires
+  per-CPU FDIP plumbing.
+
+### Required invariants
+
+| # | Invariant | Where enforced | Failure symptom |
+|---|---|---|---|
+| S1 | `Fetch::runFdip()` is the thread-iterating outer loop; per-thread issue is `Fetch::runFdip(tid)`. | `src/cpu/o3/fetch.cc` | One thread's `prefetchptr` drives another thread's FDIP issue → wrong-path counters explode on SMT runs. |
+| S2 | Every FDIP issue/cleanup site keys on `tid`: candidate ring, recent-unused suppression cache, partial-state cleanup. | `src/cpu/o3/fetch.{cc,hh}`, `src/cpu/o3/fdip_cleanup.hh` | `fdip_cleanup.test` regresses; or cross-thread squash leaks partial state. |
+| S3 | The SMT FTQ constructor guard `panic_if(ftqMode==Shared && ftqPolicy==Threshold && smtFTQThreshold > ftqEntries, ...)` and the FDIP MVP guard `fatal_if(enableFDIP && !fdipFlushPartialOnEpochChangeCfg, ...)` both stay present and **independent** (no order coupling). | `src/cpu/pred/btb/decoupled_bpred.cc` ctor body | Misconfigured SMT-FTQ or `--no-fdip-flush-partial-on-epoch-change` slips past startup. |
+| S4 | `resetPC` keeps the trace-new SMT loop over `tid`; it does not collapse to a single-thread fast path even when only `tid=0` is active. | `src/cpu/o3/fetch.cc::resetPC` | Single-thread runs OK, SMT runs hit stale PC on the second context. |
+| S5 | Trace-mode hooks (`src/cpu/o3/trace/{TraceFetch.{cc,hh},TraceReader.*,ChampSimTraceReader.*,CBP2025TraceReader.*}`) are not modified to "accommodate" FDIP. FDIP adapts to trace-mode, not the other way round. | `src/cpu/o3/trace/*` | Any diff there must be justified independently of FDIP. |
+
+### Validation
+
+- AC #1 evidence: every commit in the 7-commit FDIP stack
+  (`30f9fc3d24..bb60673446`) builds independently.
+  See `~/expri_results/gem5/btbp-fdip-smoke/20260624-1319/per-commit-build/PER_COMMIT_BUILD_REPORT.md`.
+- AC #2 evidence: FDIP-off vs pre-FDIP `trace-new` is bit-equivalent on
+  hard-perf columns (libquantum SimPoint 67297). Only diff is +1
+  cosmetic cycle on `fetch.squashCycles`. See
+  `~/expri_results/gem5/btbp-fdip-smoke/20260624-1319/REPORT.md`.
+
+---
+
+## FDIP under trace-mode (coexist-and-active)
+
+Status (2026-06-24): FDIP and `--enable-trace-mode` **coexist and remain
+active**, not coexist-but-inert as an earlier draft had suggested.
+
+### What actually happens under trace-mode + FDIP-on
+
+- The decoupled BPU still runs (predictor consumes the committed-trace
+  instructions injected by `TraceFetch`); FTQ entries are still produced.
+- FDIP candidate generation reads those FTQ entries and issues real L1I
+  prefetches.
+- L1I records the FDIP traffic: `system.cpu.icache.fdipInstalled`,
+  `fdipUsefulHits`, `fdipLate`, `fdipUnused`, `fdipProbeHit`, … all move.
+
+### Measured shape (ChampSim `ipc_client_001`, 1 M committed insts)
+
+| Stat | trace-on + FDIP-off | trace-on + FDIP-on |
+|---|---:|---:|
+| `system.cpu.fetch.fdip*` non-zero counters | 0 | 14 |
+| `system.cpu.icache.fdip*` non-zero counters | 0 | 21 |
+| `system.cpu.icache.fdipInstalled` | 0 | 888 |
+| `system.cpu.icache.fdipUsefulHits` | 0 | 118 |
+| `system.cpu.fetch.fdipIssuedLines` | 0 | 13 236 |
+| `system.cpu.fetch.fdipWrongPathIssuedLines` | 0 | 8 973 |
+| `system.cpu.numCycles` | 420 973 | 420 093 (−0.21 %) |
+| `system.cpu.ipc` | 2.375454 | 2.380435 (+0.21 %) |
+
+Source: `~/expri_results/gem5/btbp-fdip-smoke/20260624-1319/trace-mode/TRACE_MODE_REPORT.md`.
+
+### Implication for spec edits
+
+- Do **not** add a Python-layer `assert not (args.enable_fdip and
+  args.enable_trace_mode)` mutex. The PRD §Technical Notes ("降级方案")
+  is reserved for a *coexist-but-crash* future regression, not the
+  current shape.
+- Do **not** trust `system.cpu.dcache.fdip*` as a coexistence signal —
+  D-cache is unrelated to FDIP (which is an I-cache prefetcher); those
+  counters are zero in every FDIP configuration and are not a witness
+  of anything.
+- If a future change makes trace-mode + FDIP regress, the witness must
+  be a non-zero delta on `fetch.fdip*` / `icache.fdip*` between
+  trace-on-FDIP-off and trace-on-FDIP-on, not just `--enable-fdip`
+  flag-accept.
+
+---
+
+## Worktree quirk: ext/dramsim3/DRAMsim3 (2026-06-24)
+
+`ext/dramsim3/DRAMsim3/` is **not** a git submodule. It is `.gitignored`
+local source (see `.gitignore:46`, `ext/dramsim3/README`); only
+`ext/dramsim3/{README,SConscript,xiangshan_configs/}` are tracked. A
+fresh worktree created via `git worktree add` will therefore have an
+empty `ext/dramsim3/DRAMsim3/`, and `scons` will silently skip
+`dramsim3.{cc,o}` / `param_DRAMsim3.cc` / `mem/dramsim3.cc`. The
+resulting `gem5.opt` then fails to instantiate `DRAMsim3` at runtime
+("Invalid mem_type: 'DRAMsim3'", `KeyError`).
+
+### Required prep for any new worktree that needs DRAMsim3
+
+Pick one. Symlink is preferred (no disk duplication, guaranteed
+byte-identical with the main tree).
+
+```bash
+# Option A (preferred): symlink to the main tree's source
+ln -s ~/project/GEM5/ext/dramsim3/DRAMsim3 \
+      ~/project/GEM5/.worktrees/<name>/ext/dramsim3/DRAMsim3
+
+# Option B: independent copy (≈20 MiB extra disk; drift risk)
+cp -r ~/project/GEM5/ext/dramsim3/DRAMsim3 \
+      ~/project/GEM5/.worktrees/<name>/ext/dramsim3/DRAMsim3
+```
+
+Then `scons build/RISCV/gem5.opt -jN` — expect only `dramsim3.{cc,o}`
++ `param_DRAMsim3.cc.o` + `mem/dramsim3.cc.o` + `base/date.cc.o` + link
+(~3 min). If the rebuild touches >50 source files, the build cache is
+trashed, not this quirk; investigate independently.
+
+### Why a script could do this automatically (future work)
+
+A `util/setup_worktree_dramsim3.sh` that idempotently creates the
+symlink would let any `git worktree add` flow stay one command. Tracked
+out-of-scope here.
 
 ---
 
