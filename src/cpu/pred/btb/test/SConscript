@@ -41,6 +41,10 @@ GTest('folded_hist.test',
     '../folded_hist.cc',
 )
 
+GTest('fetch_coverage.test',
+    'fetch_coverage.test.cc',
+)
+
 GTest('history_manager.test',
     'history_manager.test.cc',
 )
@@ -64,6 +68,7 @@ env.Append(UNITTESTS=['uras.test',
         'tage.test',
         'mgsc.test',
         'folded_hist.test',
+        'fetch_coverage.test',
         'history_manager.test',
         'jump_ahead.test',
         'fetch_target_queue.test',

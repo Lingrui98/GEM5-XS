@@ -62,6 +62,7 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
       // uras(p.uras),
       bpDBSwitches(p.bpDBSwitches),
       enableFDIP(p.enable_fdip),
+      bpuRunaheadEntriesCfg(p.bpu_runahead_entries),
       fdipLookaheadEntriesCfg(p.fdip_lookahead_entries),
       fdipIssueBandwidthCfg(p.fdip_issue_bandwidth),
       fdipMaxOutstandingCfg(p.fdip_max_outstanding),
@@ -309,7 +310,13 @@ DecoupledBPUWithBTB::tick()
 
     // 1. Request new prediction if FSQ not full and we are idle
     if (!threads[curTid].validprediction && !ftqFull(curTid)) {
-        if (threads[curTid].blockPredictionPending) {
+        if (bpuRunaheadBlocked(curTid)) {
+            dbpBtbStats.predictionBlockedForRunahead++;
+            DPRINTF(Override,
+                    "Prediction blocked by BPU runahead window: "
+                    "distance=%u limit=%u\n",
+                    ftqFetchToAllocDistance(curTid), bpuRunaheadEntriesCfg);
+        } else if (threads[curTid].blockPredictionPending) {
             DPRINTF(Override, "Prediction blocked to prioritize resolve update\n");
             dbpBtbStats.predictionBlockedForUpdate++;
             threads[curTid].blockPredictionPending = false;
@@ -518,6 +525,15 @@ DecoupledBPUWithBTB::processNewPrediction(ThreadID tid)
     if (ftqFull(tid)) {
         dbpBtbStats.fsqFullCannotEnq++;
         DPRINTF(Override, "FSQ is full (%lu entries)\n", ftq.size(tid));
+        return;
+    }
+
+    if (bpuRunaheadBlocked(tid)) {
+        dbpBtbStats.predictionBlockedForRunahead++;
+        DPRINTF(Override,
+                "Delaying FSQ enqueue due to BPU runahead window: "
+                "distance=%u limit=%u\n",
+                ftqFetchToAllocDistance(tid), bpuRunaheadEntriesCfg);
         return;
     }
 

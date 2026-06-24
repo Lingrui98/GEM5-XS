@@ -100,6 +100,7 @@ class DecoupledBPUWithBTB : public BPredUnit
     bool enableBranchTrace{false};
     bool enablePredFSQTrace{false};
     const bool enableFDIP;
+    const unsigned bpuRunaheadEntriesCfg;
     const unsigned fdipLookaheadEntriesCfg;
     const unsigned fdipIssueBandwidthCfg;
     const unsigned fdipMaxOutstandingCfg;
@@ -164,6 +165,20 @@ class DecoupledBPUWithBTB : public BPredUnit
     unsigned logicalMaxFTQEntries(ThreadID tid) const;
     unsigned logicalFreeFTQEntries(ThreadID tid) const;
     bool ftqFull(ThreadID tid) const;
+
+    unsigned ftqFetchToAllocDistance(ThreadID tid) const
+    {
+        if (!ftq.hasTarget(ftq.fetchId(tid), tid)) {
+            return 0;
+        }
+        return ftq.backId(tid) - ftq.fetchId(tid) + 1;
+    }
+
+    bool bpuRunaheadBlocked(ThreadID tid) const
+    {
+        return fdipEnabled() && bpuRunaheadEntriesCfg > 0 &&
+               ftqFetchToAllocDistance(tid) >= bpuRunaheadEntriesCfg;
+    }
 
     ThreadID scheduleThread();
 
@@ -316,6 +331,7 @@ class DecoupledBPUWithBTB : public BPredUnit
 
         // Window blocking statistics
         statistics::Scalar predictionBlockedForUpdate;  // Times prediction was blocked for update priority
+        statistics::Scalar predictionBlockedForRunahead; // Times prediction was blocked by BPU runahead window
 
         statistics::Scalar s1PredWrongFallthrough;
         statistics::Scalar s1PredWrongUbtb;

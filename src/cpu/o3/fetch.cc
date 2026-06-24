@@ -740,11 +740,9 @@ Fetch::computeFdipLineAddrs(
         return 1;
     }
 
-    // Current demand fetch issues a fetchBufferSize window from FTQ start.
-    const unsigned span = std::max(1u, fetchBufferSize);
-    const Addr end_exclusive = target.startPC + span;
     const Addr last_line =
-        (end_exclusive - 1) - ((end_exclusive - 1) % cacheBlkSize);
+        branch_prediction::btb_pred::fetchCoverageLastLineAddr(
+            target.startPC, target.predEndPC, fetchBufferSize, cacheBlkSize);
 
     if (last_line == first_line) {
         return 1;

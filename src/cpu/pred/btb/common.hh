@@ -2,6 +2,7 @@
 #define __CPU_PRED_BTB_STREAM_STRUCT_HH__
 
 #include <algorithm>
+#include <cassert>
 #include <queue>
 #include <string>
 
@@ -18,6 +19,27 @@ namespace gem5 {
 namespace branch_prediction {
 
 namespace btb_pred {
+
+inline unsigned
+fetchCoverageSpan(Addr startPC, Addr predEndPC, unsigned capacity)
+{
+    assert(predEndPC >= startPC);
+    const Addr span = predEndPC - startPC;
+    const Addr clampedSpan = std::min<Addr>(span, capacity);
+    return static_cast<unsigned>(clampedSpan);
+}
+
+inline Addr
+fetchCoverageLastLineAddr(Addr startPC, Addr predEndPC, unsigned capacity,
+                          unsigned cacheBlkSize)
+{
+    assert(cacheBlkSize > 0);
+    const unsigned span = std::max(1u,
+        fetchCoverageSpan(startPC, predEndPC, capacity));
+    const Addr endExclusive = startPC + span;
+    const Addr lastByte = endExclusive - 1;
+    return lastByte - (lastByte % cacheBlkSize);
+}
 
 inline uint8_t
 foldAsidHash16To4(uint16_t asid)
