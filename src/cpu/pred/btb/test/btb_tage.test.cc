@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <vector>
 
@@ -98,6 +99,21 @@ void applyOutcomeHistory(boost::dynamic_bitset<>& history, int shamt, bool taken
     }
     history <<= shamt;
     history[0] = taken;
+}
+
+std::array<sway::MbtbTightSlotState, sway::NumMbtbTightSlots>
+makeMbtbSlotStates(uint8_t owner0, uint8_t owner1)
+{
+    std::array<sway::MbtbTightSlotState, sway::NumMbtbTightSlots> states{};
+    states[0].slotId = 0;
+    states[0].sourceSram = 0;
+    states[0].sourceWay = sway::MbtbTightSlotWay;
+    states[0].owner = owner0;
+    states[1].slotId = 1;
+    states[1].sourceSram = 1;
+    states[1].sourceWay = sway::MbtbTightSlotWay;
+    states[1].owner = owner1;
+    return states;
 }
 
 void specUpdateSelectedHistory(BTBTAGE* tage,
@@ -506,6 +522,102 @@ protected:
     boost::dynamic_bitset<> history;
     std::vector<FullBTBPrediction> stagePreds;
 };
+
+TEST(BTBTAGESwayBorrowedBankTest, MbtbTightSlotPredictsDoneeTable) {
+    BTBTAGE tage8(8, 2, 2048, 4, true);
+    tage8.setSwayReallocEnabled(true);
+
+    sway::DoneeTableSet donees;
+    donees.tableIds = {7};
+    auto slots = makeMbtbSlotStates(sway::tageOwner(7), sway::MbtbSram1);
+    tage8.configureSwayMbtbBorrowedSlots(slots, donees, 1024);
+
+    BTBEntry entry = createBTBEntry(0x1000, true, true, false, -1);
+    ASSERT_TRUE(tage8.insertSwayMbtbBorrowedEntryForTest(
+        0, 7, 0x1000, entry.pc, 3, 1));
+
+    boost::dynamic_bitset<> history(64, false);
+    std::vector<FullBTBPrediction> stagePreds(2);
+    EXPECT_TRUE(predictTAGE(&tage8, 0x1000, {entry}, history, stagePreds));
+
+    auto meta = std::static_pointer_cast<BTBTAGE::TageMeta>(
+        tage8.getPredictionMeta());
+    ASSERT_TRUE(meta->preds.count(entry.pc));
+    const auto &pred = meta->preds[entry.pc];
+    ASSERT_TRUE(pred.mainInfo.found);
+    EXPECT_EQ(pred.mainInfo.table, 7u);
+    EXPECT_EQ(pred.mainInfo.storageKind, BTBTAGE::TageStorageKind::MbtbBorrowed);
+    EXPECT_TRUE(pred.mainInfo.isExtra);
+    EXPECT_EQ(pred.mainInfo.borrowedSlot, 0);
+    EXPECT_EQ(tage8.swayBorrowedHitsByDoneeForTest(7), 1u);
+}
+
+TEST(BTBTAGESwayBorrowedBankTest, MbtbTightSlotRequiresConfiguredDonee) {
+    BTBTAGE tage8(8, 2, 2048, 4, true);
+    tage8.setSwayReallocEnabled(true);
+
+    sway::DoneeTableSet donees;
+    donees.tableIds = {6};
+    auto slots = makeMbtbSlotStates(sway::tageOwner(7), sway::MbtbSram1);
+    tage8.configureSwayMbtbBorrowedSlots(slots, donees, 1024);
+
+    BTBEntry entry = createBTBEntry(0x1000, true, true, false, -1);
+    EXPECT_FALSE(tage8.insertSwayMbtbBorrowedEntryForTest(
+        0, 7, 0x1000, entry.pc, 3));
+
+    boost::dynamic_bitset<> history(64, false);
+    std::vector<FullBTBPrediction> stagePreds(2);
+    EXPECT_FALSE(predictTAGE(&tage8, 0x1000, {entry}, history, stagePreds));
+    EXPECT_EQ(tage8.swayBorrowedHitsByDoneeForTest(7), 0u);
+}
+
+TEST(BTBTAGESwayBorrowedBankTest, R2bExtraTagDisambiguatesAliases) {
+    BTBTAGE tage8(8, 2, 2048, 4, true);
+    tage8.setSwayReallocEnabled(true);
+
+    sway::DoneeTableSet donees;
+    donees.tableIds = {7};
+    auto slots = makeMbtbSlotStates(sway::tageOwner(7), sway::MbtbSram1);
+    tage8.configureSwayMbtbBorrowedSlots(slots, donees, 1024);
+
+    const Addr nativeTag = 0x55;
+    EXPECT_EQ(tage8.swayBorrowedIndexForTest(0, 0x001), 0x001u);
+    EXPECT_EQ(tage8.swayBorrowedIndexForTest(0, 0x401), 0x001u);
+    EXPECT_EQ(tage8.swayBorrowedTagForTest(0, 0x001, nativeTag),
+              (nativeTag << 1) | 0u);
+    EXPECT_EQ(tage8.swayBorrowedTagForTest(0, 0x401, nativeTag),
+              (nativeTag << 1) | 1u);
+    EXPECT_NE(tage8.swayBorrowedTagForTest(0, 0x001, nativeTag),
+              tage8.swayBorrowedTagForTest(0, 0x401, nativeTag));
+}
+
+TEST(BTBTAGESwayBorrowedBankTest, IttageMidTablesPackTwoTageEntries) {
+    auto ittageShort = sway::makeBorrowedBankGeometry(
+        256, 2048, sway::IttageEntryBits, sway::TageEntryBits);
+    EXPECT_FALSE(ittageShort.legal());
+
+    auto ittageMid = sway::makeBorrowedBankGeometry(
+        512, 2048, sway::IttageEntryBits, sway::TageEntryBits);
+    EXPECT_TRUE(ittageMid.legal());
+    EXPECT_EQ(ittageMid.indexRule, sway::IndexRule::DoneeLarger);
+    EXPECT_EQ(ittageMid.extraTagBits, 2);
+    EXPECT_EQ(ittageMid.packingFactor, 2);
+}
+
+TEST(BTBTAGESwayBorrowedBankTest, BorrowedCapacityAppearsInDoneeSnapshot) {
+    BTBTAGE tage8(8, 2, 2048, 4, true);
+    tage8.setSwayReallocEnabled(true);
+
+    sway::DoneeTableSet donees;
+    donees.tableIds = {7};
+    auto slots = makeMbtbSlotStates(sway::tageOwner(7), sway::MbtbSram1);
+    tage8.configureSwayMbtbBorrowedSlots(slots, donees, 1024);
+
+    const auto snapshots = tage8.collectAndResetWayVisitCounts();
+    ASSERT_EQ(snapshots.size(), 8u);
+    EXPECT_EQ(snapshots[6].totalWays, 2048u * 2u);
+    EXPECT_EQ(snapshots[7].totalWays, 2048u * 2u + 1024u * 3u);
+}
 
 // Test basic prediction functionality
 TEST_F(BTBTAGETest, BasicPrediction) {

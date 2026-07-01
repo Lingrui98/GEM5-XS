@@ -1,6 +1,7 @@
 #ifndef __CPU_PRED_BTB_TAGE_HH__
 #define __CPU_PRED_BTB_TAGE_HH__
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -79,6 +80,13 @@ class BTBTAGE : public TimedBaseBTBPredictor
             }
     };
 
+    enum class TageStorageKind : uint8_t
+    {
+        Native = 0,
+        Extra = 1,
+        MbtbBorrowed = 2
+    };
+
     // Contains information about a TAGE table lookup
     struct TageTableInfo
     {
@@ -90,11 +98,21 @@ class BTBTAGE : public TimedBaseBTBPredictor
             Addr tag;       // Tag that was matched
             unsigned way;    // Which way this entry was found in
             bool isExtra;    // Whether the way comes from SWAY borrowed capacity
-            TageTableInfo() : found(false), table(0), index(0), tag(0), way(0), isExtra(false) {}
+            TageStorageKind storageKind;
+            uint8_t borrowedSlot;
+            TageTableInfo() : found(false), table(0), index(0), tag(0), way(0),
+                              isExtra(false),
+                              storageKind(TageStorageKind::Native),
+                              borrowedSlot(sway::InvalidIndex) {}
             TageTableInfo(bool found, TageEntry entry, unsigned table, Addr index,
-                          Addr tag, unsigned way, bool isExtra = false) :
+                          Addr tag, unsigned way,
+                          TageStorageKind storageKind =
+                              TageStorageKind::Native,
+                          uint8_t borrowedSlot = sway::InvalidIndex) :
                         found(found), entry(entry), table(table), index(index),
-                        tag(tag), way(way), isExtra(isExtra) {}
+                        tag(tag), way(way),
+                        isExtra(storageKind != TageStorageKind::Native),
+                        storageKind(storageKind), borrowedSlot(borrowedSlot) {}
             bool taken() const {
                 return entry.taken();
             }
@@ -297,8 +315,28 @@ class BTBTAGE : public TimedBaseBTBPredictor
     unsigned transferSwayWays(uint8_t donor, uint8_t donee, unsigned count);
     void addSwayBorrowedWayCounts(sway::ScopeCounts &counts) const;
     void syncSwayBorrowedWayCounts(const sway::ScopeCounts &counts);
+    void configureSwayMbtbBorrowedSlots(
+        const std::array<sway::MbtbTightSlotState,
+                         sway::NumMbtbTightSlots> &slotStates,
+        const sway::DoneeTableSet &doneeTables,
+        unsigned mbtbSets);
 
-  private:
+#ifdef UNIT_TEST
+    bool insertSwayMbtbBorrowedEntryForTest(uint8_t slotId, unsigned table,
+                                            Addr startPC, Addr branchPC,
+                                            short counter,
+                                            unsigned subEntry = 0);
+    Addr swayBorrowedIndexForTest(uint8_t slotId, Addr nativeIndex) const;
+    Addr swayBorrowedTagForTest(uint8_t slotId, Addr nativeIndex,
+                                Addr nativeTag) const;
+    uint64_t swayBorrowedHitsByDoneeForTest(unsigned table) const
+    {
+        return tageStats.swayBorrowedHitsByDonee[table];
+    }
+  public:
+#else
+  protected:
+#endif
 
     const unsigned maxBranchPositions;  // Maximum branch positions per 64-byte block
 
@@ -352,11 +390,34 @@ class BTBTAGE : public TimedBaseBTBPredictor
 
     bool enableSwayRealloc{false};
     std::vector<std::vector<uint8_t>> swayWayOwner;
+    struct SwayMbtbBorrowedSlot
+    {
+        bool active = false;
+        uint8_t slotId = sway::InvalidIndex;
+        uint8_t sourceSram = sway::InvalidIndex;
+        uint8_t sourceWay = sway::InvalidIndex;
+        uint8_t doneeTable = sway::InvalidIndex;
+        sway::BorrowedBankGeometry geometry;
+        std::vector<std::vector<TageEntry>> entries;
+        std::vector<std::vector<uint32_t>> visits;
+    };
+    std::array<SwayMbtbBorrowedSlot, sway::NumMbtbTightSlots>
+        swayMbtbBorrowedSlots;
     bool swayNativeWayVisible(unsigned table, unsigned way) const;
     unsigned swayExtraWayCount(unsigned table) const;
     void resizeSwayExtraWays(unsigned table, unsigned ways);
     void squashNativeWay(unsigned table, unsigned way);
     TageEntry &mutableTageEntry(const TageTableInfo &info);
+    Addr swayBorrowedIndex(const sway::BorrowedBankGeometry &geometry,
+                           Addr nativeIndex) const;
+    Addr swayBorrowedTag(const sway::BorrowedBankGeometry &geometry,
+                         Addr nativeIndex, Addr nativeTag) const;
+    bool swayMbtbSlotActiveForTable(const SwayMbtbBorrowedSlot &slot,
+                                    unsigned table) const;
+    void resizeSwayMbtbBorrowedSlot(SwayMbtbBorrowedSlot &slot,
+                                    const sway::BorrowedBankGeometry &geometry);
+    uint64_t resetSwayMbtbBorrowedSlot(SwayMbtbBorrowedSlot &slot);
+    uint64_t swayMbtbBorrowedCapacity(unsigned table) const;
 
     // ========== Bank Configuration ==========
     // Bank mechanism to simulate hardware bank conflicts
@@ -439,6 +500,9 @@ class BTBTAGE : public TimedBaseBTBPredictor
         Vector updateBankConflictPerBank;  // Conflicts per bank
         Vector updateAccessPerBank;        // Update accesses per bank
         Vector predAccessPerBank;          // Prediction accesses per bank
+        Vector swayBorrowedHitsByDonee;    // Borrowed MBTB-bank hits by donee TAGE table
+        Scalar swayUsefulWastedByRealloc;  // Useful borrowed entries reset by SWAY reconfiguration
+        Distribution swayUsefulWastedByReallocDist;
 
         Vector resolveProviderTable;
         Vector resolveAltTable;

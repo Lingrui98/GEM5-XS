@@ -240,6 +240,12 @@ void
 BTBTAGE::setSwayReallocEnabled(bool enabled)
 {
     enableSwayRealloc = enabled;
+    if (!enabled) {
+        for (auto &slot : swayMbtbBorrowedSlots) {
+            resetSwayMbtbBorrowedSlot(slot);
+            slot.active = false;
+        }
+    }
 }
 
 bool
@@ -268,10 +274,18 @@ BTBTAGE::resizeSwayExtraWays(unsigned table, unsigned ways)
     assert(table < swayExtraTable.size());
     for (unsigned idx = 0; idx < tableSizes[table]; ++idx) {
         const unsigned old_size = swayExtraTable[table][idx].size();
+        if (ways < old_size) {
+            for (unsigned way = ways; way < old_size; ++way) {
+                swayExtraTable[table][idx][way] = TageEntry();
+                if (way < swayExtraVisitCnt[table][idx].size()) {
+                    swayExtraVisitCnt[table][idx][way] = 0;
+                }
+            }
+        }
         swayExtraTable[table][idx].resize(ways);
         swayExtraVisitCnt[table][idx].resize(ways, 0);
         for (unsigned way = old_size; way < ways; ++way) {
-            swayExtraTable[table][idx][way].valid = false;
+            swayExtraTable[table][idx][way] = TageEntry();
         }
     }
 }
@@ -281,7 +295,7 @@ BTBTAGE::squashNativeWay(unsigned table, unsigned way)
 {
     for (unsigned idx = 0; idx < tableSizes[table]; ++idx) {
         if (way < tageTable[table][idx].size()) {
-            tageTable[table][idx][way].valid = false;
+            tageTable[table][idx][way] = TageEntry();
         }
         if (way < wayVisitCnt[table][idx].size()) {
             wayVisitCnt[table][idx][way] = 0;
@@ -292,10 +306,111 @@ BTBTAGE::squashNativeWay(unsigned table, unsigned way)
 BTBTAGE::TageEntry &
 BTBTAGE::mutableTageEntry(const TageTableInfo &info)
 {
-    if (info.isExtra) {
+    if (info.storageKind == TageStorageKind::MbtbBorrowed) {
+        assert(info.borrowedSlot < swayMbtbBorrowedSlots.size());
+        auto &slot = swayMbtbBorrowedSlots[info.borrowedSlot];
+        assert(info.index < slot.entries.size());
+        assert(info.way < slot.entries[info.index].size());
+        return slot.entries[info.index][info.way];
+    }
+    if (info.storageKind == TageStorageKind::Extra) {
         return swayExtraTable[info.table][info.index][info.way];
     }
     return tageTable[info.table][info.index][info.way];
+}
+
+Addr
+BTBTAGE::swayBorrowedIndex(const sway::BorrowedBankGeometry &geometry,
+                           Addr nativeIndex) const
+{
+    switch (geometry.indexRule) {
+      case sway::IndexRule::SameSets:
+        return nativeIndex;
+      case sway::IndexRule::DoneeLarger:
+        return sway::borrowedIndexR2b(static_cast<uint32_t>(nativeIndex),
+                                      geometry.donorSets);
+      case sway::IndexRule::DonorLarger:
+        return nativeIndex & (geometry.donorSets - 1);
+      case sway::IndexRule::Invalid:
+        break;
+    }
+    return 0;
+}
+
+Addr
+BTBTAGE::swayBorrowedTag(const sway::BorrowedBankGeometry &geometry,
+                         Addr nativeIndex, Addr nativeTag) const
+{
+    if (geometry.indexRule == sway::IndexRule::DoneeLarger &&
+        geometry.extraTagBits > 0) {
+        const Addr extra = sway::borrowedExtraTagR2b(
+            static_cast<uint32_t>(nativeIndex), geometry.donorSets);
+        return (nativeTag << geometry.extraTagBits) | extra;
+    }
+    return nativeTag;
+}
+
+bool
+BTBTAGE::swayMbtbSlotActiveForTable(const SwayMbtbBorrowedSlot &slot,
+                                    unsigned table) const
+{
+    return enableSwayRealloc && slot.active &&
+        slot.doneeTable == table && slot.geometry.legal();
+}
+
+void
+BTBTAGE::resizeSwayMbtbBorrowedSlot(
+    SwayMbtbBorrowedSlot &slot,
+    const sway::BorrowedBankGeometry &geometry)
+{
+    if (slot.geometry.donorSets == geometry.donorSets &&
+        slot.geometry.packingFactor == geometry.packingFactor &&
+        slot.entries.size() == geometry.donorSets) {
+        slot.geometry = geometry;
+        return;
+    }
+
+    resetSwayMbtbBorrowedSlot(slot);
+    slot.geometry = geometry;
+    slot.entries.assign(geometry.donorSets,
+                        std::vector<TageEntry>(geometry.packingFactor));
+    slot.visits.assign(geometry.donorSets,
+                       std::vector<uint32_t>(geometry.packingFactor, 0));
+}
+
+uint64_t
+BTBTAGE::resetSwayMbtbBorrowedSlot(SwayMbtbBorrowedSlot &slot)
+{
+    uint64_t useful_wasted = 0;
+    for (auto &set : slot.entries) {
+        for (auto &entry : set) {
+            if (entry.valid && entry.useful) {
+                ++useful_wasted;
+            }
+            entry = TageEntry();
+        }
+    }
+    for (auto &set : slot.visits) {
+        std::fill(set.begin(), set.end(), 0);
+    }
+    if (useful_wasted > 0) {
+        tageStats.swayUsefulWastedByRealloc += useful_wasted;
+        tageStats.swayUsefulWastedByReallocDist.sample(useful_wasted);
+    }
+    return useful_wasted;
+}
+
+uint64_t
+BTBTAGE::swayMbtbBorrowedCapacity(unsigned table) const
+{
+    uint64_t capacity = 0;
+    for (const auto &slot : swayMbtbBorrowedSlots) {
+        if (swayMbtbSlotActiveForTable(slot, table)) {
+            capacity += static_cast<uint64_t>(slot.geometry.donorSets) *
+                slot.geometry.packingFactor;
+        }
+    }
+    return capacity;
 }
 
 unsigned
@@ -313,26 +428,12 @@ BTBTAGE::countSwayOwnedWays(uint8_t owner) const
 unsigned
 BTBTAGE::transferSwayWays(uint8_t donor, uint8_t donee, unsigned count)
 {
-    if (!enableSwayRealloc || count == 0 || donor == donee) {
-        return 0;
-    }
-
-    unsigned moved = 0;
-    for (int table = static_cast<int>(swayWayOwner.size()) - 1;
-         table >= 0 && moved < count; --table) {
-        auto &owners = swayWayOwner[table];
-        for (int way = static_cast<int>(owners.size()) - 1;
-             way >= 0 && moved < count; --way) {
-            if (owners[way] != donor) {
-                continue;
-            }
-            squashNativeWay(static_cast<unsigned>(table),
-                            static_cast<unsigned>(way));
-            owners[way] = donee;
-            ++moved;
-        }
-    }
-    return moved;
+    (void)donor;
+    (void)donee;
+    (void)count;
+    // D6 only permits TAGE as a donee.  TAGE never donates native ways and
+    // TAGE-to-TAGE borrowing is intentionally disabled.
+    return 0;
 }
 
 void
@@ -359,6 +460,108 @@ BTBTAGE::syncSwayBorrowedWayCounts(const sway::ScopeCounts &counts)
     }
 }
 
+void
+BTBTAGE::configureSwayMbtbBorrowedSlots(
+    const std::array<sway::MbtbTightSlotState,
+                     sway::NumMbtbTightSlots> &slotStates,
+    const sway::DoneeTableSet &doneeTables,
+    unsigned mbtbSets)
+{
+    for (const auto &state : slotStates) {
+        if (state.slotId >= swayMbtbBorrowedSlots.size()) {
+            continue;
+        }
+
+        auto &slot = swayMbtbBorrowedSlots[state.slotId];
+        slot.slotId = state.slotId;
+        slot.sourceSram = state.sourceSram;
+        slot.sourceWay = state.sourceWay;
+
+        const bool legal_donee = enableSwayRealloc && state.donatedToTage() &&
+            state.doneeTable() < numPredictors &&
+            !doneeTables.empty() && doneeTables.contains(state.doneeTable());
+        if (!legal_donee) {
+            resetSwayMbtbBorrowedSlot(slot);
+            slot.active = false;
+            slot.doneeTable = sway::InvalidIndex;
+            continue;
+        }
+
+        const unsigned donee_table = state.doneeTable();
+        auto geometry = sway::makeMbtbToTageGeometry(
+            mbtbSets, tableSizes[donee_table]);
+        if (!geometry.legal()) {
+            resetSwayMbtbBorrowedSlot(slot);
+            slot.active = false;
+            slot.doneeTable = sway::InvalidIndex;
+            continue;
+        }
+
+        const bool changed_owner = !slot.active ||
+            slot.doneeTable != donee_table;
+        if (changed_owner) {
+            resetSwayMbtbBorrowedSlot(slot);
+        }
+        slot.doneeTable = static_cast<uint8_t>(donee_table);
+        resizeSwayMbtbBorrowedSlot(slot, geometry);
+        slot.active = true;
+    }
+}
+
+#ifdef UNIT_TEST
+bool
+BTBTAGE::insertSwayMbtbBorrowedEntryForTest(uint8_t slotId, unsigned table,
+                                            Addr startPC, Addr branchPC,
+                                            short counter,
+                                            unsigned subEntry)
+{
+    if (slotId >= swayMbtbBorrowedSlots.size()) {
+        return false;
+    }
+    auto &slot = swayMbtbBorrowedSlots[slotId];
+    if (!swayMbtbSlotActiveForTable(slot, table) ||
+        subEntry >= slot.geometry.packingFactor) {
+        return false;
+    }
+
+    const auto &state = historyState(0);
+    const unsigned position = getBranchIndexInBlock(branchPC, startPC);
+    const Addr nativeIndex =
+        getTageIndex(startPC, table, state.indexFoldedHist[table].get());
+    const Addr nativeTag =
+        getTageTag(startPC, table, state.tagFoldedHist[table].get(),
+                   state.altTagFoldedHist[table].get(), position);
+    const Addr borrowedIndex = swayBorrowedIndex(slot.geometry, nativeIndex);
+    const Addr borrowedTag =
+        swayBorrowedTag(slot.geometry, nativeIndex, nativeTag);
+    if (borrowedIndex >= slot.entries.size() ||
+        subEntry >= slot.entries[borrowedIndex].size()) {
+        return false;
+    }
+
+    slot.entries[borrowedIndex][subEntry] =
+        TageEntry(borrowedTag, counter, branchPC);
+    return true;
+}
+
+Addr
+BTBTAGE::swayBorrowedIndexForTest(uint8_t slotId, Addr nativeIndex) const
+{
+    assert(slotId < swayMbtbBorrowedSlots.size());
+    return swayBorrowedIndex(swayMbtbBorrowedSlots[slotId].geometry,
+                             nativeIndex);
+}
+
+Addr
+BTBTAGE::swayBorrowedTagForTest(uint8_t slotId, Addr nativeIndex,
+                                Addr nativeTag) const
+{
+    assert(slotId < swayMbtbBorrowedSlots.size());
+    return swayBorrowedTag(swayMbtbBorrowedSlots[slotId].geometry,
+                           nativeIndex, nativeTag);
+}
+#endif
+
 std::vector<BTBTAGE::WayPhaseSnapshot>
 BTBTAGE::collectAndResetWayVisitCounts()
 {
@@ -381,7 +584,7 @@ BTBTAGE::collectAndResetWayVisitCounts()
         const unsigned extraWays =
             enableSwayRealloc ? swayExtraWayCount(t) : 0;
         snap.totalWays = static_cast<uint64_t>(tableSizes[t]) *
-            (nativeWays + extraWays);
+            (nativeWays + extraWays) + swayMbtbBorrowedCapacity(t);
         snap.validWays = 0;
         snap.activeWays = 0;
         for (unsigned idx = 0; idx < tableSizes[t]; ++idx) {
@@ -412,6 +615,26 @@ BTBTAGE::collectAndResetWayVisitCounts()
                     if (w < extraCounts.size() && extraCounts[w] > 0) {
                         ++snap.activeWays;
                         extraCounts[w] = 0;
+                    }
+                }
+            }
+        }
+        if (enableSwayRealloc) {
+            for (auto &slot : swayMbtbBorrowedSlots) {
+                if (!swayMbtbSlotActiveForTable(slot, t)) {
+                    continue;
+                }
+                for (unsigned idx = 0; idx < slot.entries.size(); ++idx) {
+                    auto &entries = slot.entries[idx];
+                    auto &counts = slot.visits[idx];
+                    for (unsigned way = 0; way < entries.size(); ++way) {
+                        if (entries[way].valid) {
+                            ++snap.validWays;
+                        }
+                        if (way < counts.size() && counts[way] > 0) {
+                            ++snap.activeWays;
+                            counts[way] = 0;
+                        }
                     }
                 }
             }
@@ -522,9 +745,12 @@ BTBTAGE::generateSinglePrediction(const BTBEntry &btb_entry,
                                      state.altTagFoldedHist[i].get(), position, asidHash);
 
         bool match = false; // for each table, only one way can be matched
-        bool matching_extra = false;
+        TageStorageKind matching_storage = TageStorageKind::Native;
         TageEntry matching_entry;
         unsigned matching_way = 0;
+        Addr matching_index = index;
+        Addr matching_tag = tag;
+        uint8_t matching_borrowed_slot = sway::InvalidIndex;
 
         // Search all ways for a matching entry
         const unsigned ways = getNumWays(i);
@@ -537,8 +763,11 @@ BTBTAGE::generateSinglePrediction(const BTBEntry &btb_entry,
             if (entry.valid && tag == entry.tag) {
                 matching_entry = entry;
                 matching_way = way;
+                matching_index = index;
+                matching_tag = tag;
                 match = true;
-                matching_extra = false;
+                matching_storage = TageStorageKind::Native;
+                matching_borrowed_slot = sway::InvalidIndex;
 
                 // Do not use LRU; keep logic simple and align with CBP-style replacement
 
@@ -556,14 +785,60 @@ BTBTAGE::generateSinglePrediction(const BTBEntry &btb_entry,
         }
 
         if (!match && enableSwayRealloc) {
+            for (auto &slot : swayMbtbBorrowedSlots) {
+                if (!swayMbtbSlotActiveForTable(slot, i)) {
+                    continue;
+                }
+                const Addr borrowed_index =
+                    swayBorrowedIndex(slot.geometry, index);
+                const Addr borrowed_tag =
+                    swayBorrowedTag(slot.geometry, index, tag);
+                if (borrowed_index >= slot.entries.size()) {
+                    continue;
+                }
+                auto &borrowed_set = slot.entries[borrowed_index];
+                for (unsigned way = 0; way < borrowed_set.size(); ++way) {
+                    auto &entry = borrowed_set[way];
+                    if (entry.valid && borrowed_tag == entry.tag) {
+                        matching_entry = entry;
+                        matching_way = way;
+                        matching_index = borrowed_index;
+                        matching_tag = borrowed_tag;
+                        match = true;
+                        matching_storage = TageStorageKind::MbtbBorrowed;
+                        matching_borrowed_slot = slot.slotId;
+                        if (borrowed_index < slot.visits.size() &&
+                            way < slot.visits[borrowed_index].size()) {
+                            ++slot.visits[borrowed_index][way];
+                        }
+                        tageStats.swayBorrowedHitsByDonee[i]++;
+                        DPRINTF(TAGE, "hit SWAY borrowed MBTB slot %u "
+                                "for table %d[%lu][%u]: valid %d, tag %lu, "
+                                "ctr %d, useful %d, btb_pc %#lx, pos %u\n",
+                                slot.slotId, i, borrowed_index, way,
+                                entry.valid, entry.tag, entry.counter,
+                                entry.useful, btb_entry.pc, position);
+                        break;
+                    }
+                }
+                if (match) {
+                    break;
+                }
+            }
+        }
+
+        if (!match && enableSwayRealloc) {
             auto &extra_set = swayExtraTable[i][index];
             for (unsigned way = 0; way < extra_set.size(); ++way) {
                 auto &entry = extra_set[way];
                 if (entry.valid && tag == entry.tag) {
                     matching_entry = entry;
                     matching_way = way;
+                    matching_index = index;
+                    matching_tag = tag;
                     match = true;
-                    matching_extra = true;
+                    matching_storage = TageStorageKind::Extra;
+                    matching_borrowed_slot = sway::InvalidIndex;
                     if (i < (int)swayExtraVisitCnt.size() &&
                         index < swayExtraVisitCnt[i].size() &&
                         way < swayExtraVisitCnt[i][index].size()) {
@@ -586,13 +861,17 @@ BTBTAGE::generateSinglePrediction(const BTBEntry &btb_entry,
             }
             if (!provided) {
                 // First match becomes main prediction
-                main_info = TageTableInfo(true, matching_entry, i, index, tag,
-                                          matching_way, matching_extra);
+                main_info = TageTableInfo(true, matching_entry, i,
+                                          matching_index, matching_tag,
+                                          matching_way, matching_storage,
+                                          matching_borrowed_slot);
                 provided = true;
             } else if (!alt_provided) {
                 // Second match becomes alternative prediction
-                alt_info = TageTableInfo(true, matching_entry, i, index, tag,
-                                         matching_way, matching_extra);
+                alt_info = TageTableInfo(true, matching_entry, i,
+                                         matching_index, matching_tag,
+                                         matching_way, matching_storage,
+                                         matching_borrowed_slot);
                 alt_provided = true;
                 break;
             }
@@ -981,90 +1260,123 @@ BTBTAGE::handleNewEntryAllocation(const Addr &startPC,
 
         const unsigned ways = getNumWays(ti);
 
+        TageEntry *selected_entry = nullptr;
         int selected_way = -1;
-        bool selected_extra = false;
-        for (unsigned way = 0; way < ways; ++way) {
-            if (!swayNativeWayVisible(ti, way)) {
-                continue;
-            }
-            if (!set[way].valid) {
-                selected_way = way;
-                break;
-            }
-        }
-        if (selected_way == -1) {
-            for (unsigned way = 0; way < extra_set.size(); ++way) {
-                if (!extra_set[way].valid) {
-                    selected_way = way;
-                    selected_extra = true;
-                    break;
-                }
-            }
-        }
-
-        if (selected_way == -1) {
+        Addr selected_index = newIndex;
+        Addr selected_tag = newTag;
+        uint8_t selected_borrowed_slot = sway::InvalidIndex;
+        TageStorageKind selected_storage = TageStorageKind::Native;
+        auto select_entry = [&](TageEntry &candidate,
+                                TageStorageKind storage,
+                                Addr index, Addr tag,
+                                unsigned way, uint8_t borrowedSlot) {
+            selected_entry = &candidate;
+            selected_way = static_cast<int>(way);
+            selected_index = index;
+            selected_tag = tag;
+            selected_storage = storage;
+            selected_borrowed_slot = borrowedSlot;
+        };
+        auto weakish = [](const TageEntry &candidate) {
+            return std::abs(candidate.counter * 2 + 1) <= 3;
+        };
+        auto scan_native = [&](auto predicate) {
             for (unsigned way = 0; way < ways; ++way) {
                 if (!swayNativeWayVisible(ti, way)) {
                     continue;
                 }
                 auto &cand = set[way];
-                const bool weakish = std::abs(cand.counter * 2 + 1) <= 3;
-                if (!cand.useful && weakish) {
-                    selected_way = way;
-                    break;
+                if (predicate(cand)) {
+                    select_entry(cand, TageStorageKind::Native, newIndex,
+                                 newTag, way, sway::InvalidIndex);
+                    return true;
                 }
             }
-        }
-        if (selected_way == -1) {
+            return false;
+        };
+        auto scan_extra = [&](auto predicate) {
             for (unsigned way = 0; way < extra_set.size(); ++way) {
                 auto &cand = extra_set[way];
-                const bool weakish = std::abs(cand.counter * 2 + 1) <= 3;
-                if (!cand.useful && weakish) {
-                    selected_way = way;
-                    selected_extra = true;
-                    break;
+                if (predicate(cand)) {
+                    select_entry(cand, TageStorageKind::Extra, newIndex,
+                                 newTag, way, sway::InvalidIndex);
+                    return true;
                 }
             }
-        }
-
-        if (selected_way == -1) {
-            for (unsigned way = 0; way < ways; ++way) {
-                if (!swayNativeWayVisible(ti, way)) {
+            return false;
+        };
+        auto scan_borrowed = [&](auto predicate) {
+            if (!enableSwayRealloc) {
+                return false;
+            }
+            for (auto &slot : swayMbtbBorrowedSlots) {
+                if (!swayMbtbSlotActiveForTable(slot, ti)) {
                     continue;
                 }
-                if (!set[way].useful) {
-                    selected_way = way;
-                    break;
+                const Addr borrowed_index =
+                    swayBorrowedIndex(slot.geometry, newIndex);
+                const Addr borrowed_tag =
+                    swayBorrowedTag(slot.geometry, newIndex, newTag);
+                if (borrowed_index >= slot.entries.size()) {
+                    continue;
+                }
+                auto &borrowed_set = slot.entries[borrowed_index];
+                for (unsigned way = 0; way < borrowed_set.size(); ++way) {
+                    auto &cand = borrowed_set[way];
+                    if (predicate(cand)) {
+                        select_entry(cand, TageStorageKind::MbtbBorrowed,
+                                     borrowed_index, borrowed_tag, way,
+                                     slot.slotId);
+                        return true;
+                    }
                 }
             }
-        }
-        if (selected_way == -1) {
-            for (unsigned way = 0; way < extra_set.size(); ++way) {
-                if (!extra_set[way].useful) {
-                    selected_way = way;
-                    selected_extra = true;
-                    break;
-                }
-            }
+            return false;
+        };
+
+        if (!scan_native([](const TageEntry &cand) { return !cand.valid; }) &&
+            !scan_native([&](const TageEntry &cand) {
+                return !cand.useful && weakish(cand);
+            }) &&
+            !scan_borrowed([](const TageEntry &cand) {
+                return !cand.valid;
+            }) &&
+            !scan_extra([](const TageEntry &cand) { return !cand.valid; }) &&
+            !scan_borrowed([&](const TageEntry &cand) {
+                return !cand.useful && weakish(cand);
+            }) &&
+            !scan_extra([&](const TageEntry &cand) {
+                return !cand.useful && weakish(cand);
+            }) &&
+            !scan_native([](const TageEntry &cand) {
+                return !cand.useful;
+            }) &&
+            !scan_borrowed([](const TageEntry &cand) {
+                return !cand.useful;
+            })) {
+            scan_extra([](const TageEntry &cand) { return !cand.useful; });
         }
 
-        if (selected_way != -1) {
+        if (selected_entry != nullptr) {
             short newCounter = actual_taken ? 0 : -1;
-            auto &victim = selected_extra ? extra_set[selected_way] :
-                set[selected_way];
-            DPRINTF(TAGE, "allocating entry in table %d[%lu][%u], tag %lu (with pos %u), counter %d, pc %#lx\n",
-                    ti, newIndex, selected_way, newTag, position, newCounter, entry.pc);
+            auto &victim = *selected_entry;
+            DPRINTF(TAGE, "allocating entry in table %d[%lu][%u], tag %lu "
+                    "(with pos %u), counter %d, pc %#lx, storage %u, slot %u\n",
+                    ti, selected_index, selected_way, selected_tag, position,
+                    newCounter, entry.pc,
+                    static_cast<unsigned>(selected_storage),
+                    selected_borrowed_slot);
             allocInfo.success = true;
             allocInfo.table = ti;
-            allocInfo.index = newIndex;
+            allocInfo.index = selected_index;
             allocInfo.way = selected_way;
-            allocInfo.tag = newTag;
+            allocInfo.tag = selected_tag;
             allocInfo.victimValid = victim.valid;
             allocInfo.victimTag = victim.tag;
             allocInfo.victimCounter = victim.counter;
             allocInfo.victimUseful = victim.useful;
             allocInfo.victimPC = victim.pc;
-            victim = TageEntry(newTag, newCounter, entry.pc); // u = 0 default
+            victim = TageEntry(selected_tag, newCounter, entry.pc); // u = 0 default
             tageStats.updateAllocSuccess++;
             usefulResetCnt = usefulResetCnt <= 0 ? 0 : usefulResetCnt - 1;
             return true;
@@ -1086,6 +1398,13 @@ BTBTAGE::handleNewEntryAllocation(const Addr &startPC,
         }
         for (auto &table : swayExtraTable) {
             for (auto &set : table) {
+                for (auto &way : set) {
+                    way.useful = false;
+                }
+            }
+        }
+        for (auto &slot : swayMbtbBorrowedSlots) {
+            for (auto &set : slot.entries) {
                 for (auto &way : set) {
                     way.useful = false;
                 }
@@ -1690,6 +2009,12 @@ BTBTAGE::TageStats::TageStats(statistics::Group* parent, int numPredictors, int 
     ADD_STAT(updateBankConflictPerBank, statistics::units::Count::get(), "bank conflicts per bank"),
     ADD_STAT(updateAccessPerBank, statistics::units::Count::get(), "update accesses per bank"),
     ADD_STAT(predAccessPerBank, statistics::units::Count::get(), "prediction accesses per bank"),
+    ADD_STAT(swayBorrowedHitsByDonee, statistics::units::Count::get(),
+        "SWAY borrowed MBTB-bank hits grouped by TAGE donee table"),
+    ADD_STAT(swayUsefulWastedByRealloc, statistics::units::Count::get(),
+        "useful SWAY borrowed entries reset by reallocation or slot shrink"),
+    ADD_STAT(swayUsefulWastedByReallocDist, statistics::units::Count::get(),
+        "distribution of useful SWAY borrowed entries reset per slot event"),
     ADD_STAT(resolveProviderTable, statistics::units::Count::get(),
         "resolved conditional branches grouped by provider table"),
     ADD_STAT(resolveAltTable, statistics::units::Count::get(),
@@ -1746,6 +2071,8 @@ BTBTAGE::TageStats::init(int predictors, int banks)
     updateBankConflictPerBank.init(numBanks);
     updateAccessPerBank.init(numBanks);
     predAccessPerBank.init(numBanks);
+    swayBorrowedHitsByDonee.init(numPredictors);
+    swayUsefulWastedByReallocDist.init(0, 4096, 64);
 }
 
 // Update statistics based on TAGE prediction

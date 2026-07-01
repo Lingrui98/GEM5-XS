@@ -169,14 +169,43 @@ MBTB::setSwayReallocEnabled(bool enabled)
 }
 
 bool
+MBTB::swayIsMbtbTightSlot(int sramId, unsigned way) const
+{
+    return (sramId == 0 || sramId == 1) &&
+        way == sway::MbtbTightSlotWay && way < numWays;
+}
+
+std::vector<uint8_t> &
+MBTB::swayOwners(int sramId)
+{
+    return sramId == 0 ? swayOwner0 : swayOwner1;
+}
+
+const std::vector<uint8_t> &
+MBTB::swayOwners(int sramId) const
+{
+    return sramId == 0 ? swayOwner0 : swayOwner1;
+}
+
+bool
 MBTB::swayNativeWayVisible(int sramId, unsigned way) const
 {
     if (!enableSwayRealloc) {
         return true;
     }
-    const auto &owners = sramId == 0 ? swayOwner0 : swayOwner1;
+    const auto &owners = swayOwners(sramId);
     return way < owners.size() && owners[way] == sway::mbtbOwner(sramId);
 }
+
+#ifdef UNIT_TEST
+uint8_t
+MBTB::swayTightSlotOwnerForTest(int sramId) const
+{
+    const auto &owners = swayOwners(sramId);
+    return sway::MbtbTightSlotWay < owners.size() ?
+        owners[sway::MbtbTightSlotWay] : sway::InvalidOwner;
+}
+#endif
 
 unsigned
 MBTB::swayExtraWayCount(int sramId) const
@@ -241,18 +270,52 @@ MBTB::countSwayOwnedWays(uint8_t owner) const
     return count;
 }
 
+std::array<sway::MbtbTightSlotState, sway::NumMbtbTightSlots>
+MBTB::getSwayMbtbTightSlotStates() const
+{
+    std::array<sway::MbtbTightSlotState, sway::NumMbtbTightSlots> states{};
+    static_assert(sway::NumMbtbTightSlots == 2,
+                  "D6 currently models one tight MBTB slot per SRAM");
+
+    auto fill_state = [&](unsigned slot, unsigned sramId,
+                          const std::vector<uint8_t> &owners) {
+        auto &state = states[slot];
+        state.slotId = static_cast<uint8_t>(slot);
+        state.sourceSram = static_cast<uint8_t>(sramId);
+        state.sourceWay = sway::MbtbTightSlotWay;
+        state.owner = sway::InvalidOwner;
+        if (state.sourceWay < owners.size()) {
+            state.owner = owners[state.sourceWay];
+        }
+    };
+
+    fill_state(0, 0, swayOwner0);
+    fill_state(1, 1, swayOwner1);
+    return states;
+}
+
 unsigned
 MBTB::transferSwayWays(uint8_t donor, uint8_t donee, unsigned count)
 {
     if (!enableSwayRealloc || count == 0 || donor == donee) {
         return 0;
     }
+    const bool donate_to_tage =
+        sway::isMbtbOwner(donor) && sway::isTageOwner(donee);
+    const bool return_to_native =
+        sway::isTageOwner(donor) && sway::isMbtbOwner(donee);
+    if (!donate_to_tage && !return_to_native) {
+        return 0;
+    }
 
     unsigned moved = 0;
-    auto transfer_from = [&](int sramId, std::vector<uint8_t> &owners) {
+    auto donate_from = [&](int sramId, std::vector<uint8_t> &owners) {
         for (int way = static_cast<int>(owners.size()) - 1;
              way >= 0 && moved < count; --way) {
             if (owners[way] != donor) {
+                continue;
+            }
+            if (!swayIsMbtbTightSlot(sramId, static_cast<unsigned>(way))) {
                 continue;
             }
             squashNativeWay(sramId, static_cast<unsigned>(way));
@@ -261,8 +324,27 @@ MBTB::transferSwayWays(uint8_t donor, uint8_t donee, unsigned count)
         }
     };
 
-    transfer_from(0, swayOwner0);
-    transfer_from(1, swayOwner1);
+    auto return_to = [&](int sramId, std::vector<uint8_t> &owners) {
+        if (sway::mbtbOwner(sramId) != donee ||
+            sway::MbtbTightSlotWay >= owners.size()) {
+            return;
+        }
+        auto &owner = owners[sway::MbtbTightSlotWay];
+        if (owner != donor || moved >= count) {
+            return;
+        }
+        squashNativeWay(sramId, sway::MbtbTightSlotWay);
+        owner = donee;
+        ++moved;
+    };
+
+    if (donate_to_tage) {
+        donate_from(0, swayOwner0);
+        donate_from(1, swayOwner1);
+    } else {
+        return_to(0, swayOwner0);
+        return_to(1, swayOwner1);
+    }
     if (moved > 0) {
         for (auto &entry : victimCache) {
             entry.valid = false;
@@ -274,16 +356,10 @@ MBTB::transferSwayWays(uint8_t donor, uint8_t donee, unsigned count)
 void
 MBTB::addSwayBorrowedWayCounts(sway::ScopeCounts &counts) const
 {
-    for (auto owner : swayOwner0) {
-        if (owner < sway::NumScopes && owner != sway::MbtbSram0) {
-            ++counts[owner];
-        }
-    }
-    for (auto owner : swayOwner1) {
-        if (owner < sway::NumScopes && owner != sway::MbtbSram1) {
-            ++counts[owner];
-        }
-    }
+    (void)counts;
+    // D6 models MBTB tight slots as conserved donor storage, not as synthetic
+    // sidecar ways in the donee. TAGE borrowed lookup consumes these donor
+    // slots directly, so MBTB does not request extra ways from another owner.
 }
 
 void
@@ -292,8 +368,9 @@ MBTB::syncSwayBorrowedWayCounts(const sway::ScopeCounts &counts)
     if (!enableSwayRealloc) {
         return;
     }
-    resizeSwayExtraWays(0, counts[sway::MbtbSram0]);
-    resizeSwayExtraWays(1, counts[sway::MbtbSram1]);
+    (void)counts;
+    resizeSwayExtraWays(0, 0);
+    resizeSwayExtraWays(1, 0);
 }
 
 #ifndef UNIT_TEST
