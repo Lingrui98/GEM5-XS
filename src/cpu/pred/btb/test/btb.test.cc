@@ -192,6 +192,74 @@ TEST_F(BTBTest, Initialization) {
     SUCCEED();
 }
 
+TEST_F(BTBTest, SwaySourceSemanticsGeometry) {
+    auto mbtb_to_tage = sway::makeMbtbToTageGeometry(1024, 2048);
+    EXPECT_TRUE(mbtb_to_tage.legal());
+    EXPECT_EQ(mbtb_to_tage.indexRule, sway::IndexRule::DoneeLarger);
+    EXPECT_EQ(mbtb_to_tage.extraTagBits, 1);
+    EXPECT_EQ(mbtb_to_tage.packingFactor, 3);
+
+    auto ittage_short_to_tage = sway::makeBorrowedBankGeometry(
+        256, 2048, sway::IttageEntryBits, sway::TageEntryBits);
+    EXPECT_FALSE(ittage_short_to_tage.legal());
+    EXPECT_EQ(ittage_short_to_tage.indexRule, sway::IndexRule::Invalid);
+
+    auto ittage_mid_to_tage = sway::makeBorrowedBankGeometry(
+        512, 2048, sway::IttageEntryBits, sway::TageEntryBits);
+    EXPECT_TRUE(ittage_mid_to_tage.legal());
+    EXPECT_EQ(ittage_mid_to_tage.indexRule, sway::IndexRule::DoneeLarger);
+    EXPECT_EQ(ittage_mid_to_tage.extraTagBits, 2);
+    EXPECT_EQ(ittage_mid_to_tage.packingFactor, 2);
+
+    EXPECT_EQ(sway::borrowedIndexR2b(1536, 1024), 512);
+    EXPECT_EQ(sway::borrowedExtraTagR2b(1536, 1024), 1);
+
+    EXPECT_DOUBLE_EQ(sway::TightHysteresisMargin, 0.10);
+    EXPECT_DOUBLE_EQ(sway::RelaxedHysteresisMargin, 0.20);
+    EXPECT_EQ(sway::tageDoneeCooldownPhases(3), 8);
+    EXPECT_EQ(sway::tageDoneeCooldownPhases(7), 20);
+    EXPECT_EQ(sway::ittageDoneeCooldownPhases(2), 6);
+    EXPECT_EQ(sway::ittageDoneeCooldownPhases(7), 20);
+}
+
+TEST_F(BTBTest, SwayMbtbTightSlotTransfer) {
+    MBTB testBtb(16, 8, 4, 1);
+    testBtb.setSwayReallocEnabled(true);
+
+    EXPECT_EQ(testBtb.numSetsForTest(), 2);
+    EXPECT_TRUE(testBtb.swayNativeWayVisibleForTest(0, 0));
+    EXPECT_TRUE(testBtb.swayNativeWayVisibleForTest(0, sway::MbtbTightSlotWay));
+
+    const uint8_t donee = sway::tageOwner(7);
+    EXPECT_EQ(testBtb.transferSwayWays(sway::MbtbSram0, donee, 2), 1);
+    EXPECT_FALSE(testBtb.swayNativeWayVisibleForTest(0, sway::MbtbTightSlotWay));
+    EXPECT_TRUE(testBtb.swayNativeWayVisibleForTest(0, 0));
+    EXPECT_EQ(testBtb.swayTightSlotOwnerForTest(0), donee);
+
+    EXPECT_EQ(testBtb.transferSwayWays(sway::MbtbSram0,
+                                       sway::tageOwner(6), 1), 0);
+    EXPECT_EQ(testBtb.transferSwayWays(sway::MbtbSram1, donee, 1), 1);
+    EXPECT_FALSE(testBtb.swayNativeWayVisibleForTest(1, sway::MbtbTightSlotWay));
+
+    EXPECT_EQ(testBtb.transferSwayWays(donee, sway::tageOwner(6), 1), 0);
+
+    EXPECT_EQ(testBtb.transferSwayWays(donee, sway::MbtbSram0, 1), 1);
+    EXPECT_TRUE(testBtb.swayNativeWayVisibleForTest(0, sway::MbtbTightSlotWay));
+    EXPECT_EQ(testBtb.swayTightSlotOwnerForTest(0), sway::MbtbSram0);
+    EXPECT_EQ(testBtb.transferSwayWays(donee, sway::MbtbSram0, 1), 0);
+    EXPECT_EQ(testBtb.transferSwayWays(donee, sway::MbtbSram1, 1), 1);
+    EXPECT_TRUE(testBtb.swayNativeWayVisibleForTest(1, sway::MbtbTightSlotWay));
+    EXPECT_EQ(testBtb.swayTightSlotOwnerForTest(1), sway::MbtbSram1);
+
+    sway::ScopeCounts counts{};
+    counts.fill(0);
+    testBtb.addSwayBorrowedWayCounts(counts);
+    EXPECT_EQ(counts[donee], 0);
+    testBtb.syncSwayBorrowedWayCounts(counts);
+    EXPECT_EQ(testBtb.swayExtraWayCountForTest(0), 0);
+    EXPECT_EQ(testBtb.swayExtraWayCountForTest(1), 0);
+}
+
 // Test basic prediction with empty BTB
 TEST_F(BTBTest, EmptyPrediction) {
     Addr startAddr = 0x1000;

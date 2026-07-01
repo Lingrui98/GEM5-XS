@@ -40,6 +40,7 @@
 #ifndef __CPU_PRED_BTB_MBTB_HH__
 #define __CPU_PRED_BTB_MBTB_HH__
 
+#include <array>
 #include <queue>
 
 #include "base/types.hh"
@@ -410,6 +411,21 @@ class MBTB : public TimedBaseBTBPredictor
     unsigned transferSwayWays(uint8_t donor, uint8_t donee, unsigned count);
     void addSwayBorrowedWayCounts(sway::ScopeCounts &counts) const;
     void syncSwayBorrowedWayCounts(const sway::ScopeCounts &counts);
+    unsigned swayNumSets() const { return numSets; }
+    std::array<sway::MbtbTightSlotState, sway::NumMbtbTightSlots>
+    getSwayMbtbTightSlotStates() const;
+#ifdef UNIT_TEST
+    unsigned numSetsForTest() const { return numSets; }
+    bool swayNativeWayVisibleForTest(int sramId, unsigned way) const
+    {
+        return swayNativeWayVisible(sramId, way);
+    }
+    uint8_t swayTightSlotOwnerForTest(int sramId) const;
+    unsigned swayExtraWayCountForTest(int sramId) const
+    {
+        return swayExtraWayCount(sramId);
+    }
+#endif
 
   private:
     /** SRAM selection helper function */
@@ -438,6 +454,9 @@ class MBTB : public TimedBaseBTBPredictor
     std::vector<BTBSet> swayExtra0, swayExtra1;
     std::vector<std::vector<uint32_t>> swayExtraVisit0, swayExtraVisit1;
 
+    bool swayIsMbtbTightSlot(int sramId, unsigned way) const;
+    std::vector<uint8_t> &swayOwners(int sramId);
+    const std::vector<uint8_t> &swayOwners(int sramId) const;
     bool swayNativeWayVisible(int sramId, unsigned way) const;
     unsigned swayExtraWayCount(int sramId) const;
     void resizeSwayExtraWays(int sramId, unsigned ways);
