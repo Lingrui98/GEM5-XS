@@ -100,6 +100,17 @@ BTBITTAGE::tickStart()
 void
 BTBITTAGE::tick() {}
 
+#ifndef UNIT_TEST
+void
+BTBITTAGE::preDumpStats()
+{
+    statistics::Group::preDumpStats();
+    for (unsigned table = 0; table < numPredictors; ++table) {
+        ittageStats.totalEntriesByTable[table] = tableSizes[table];
+    }
+}
+#endif
+
 void
 BTBITTAGE::lookupHelper(Addr startAddr, const std::vector<BTBEntry> &btbEntries,
                         IndirectTargets& results, ThreadID tid, uint8_t asidHash)
@@ -305,11 +316,22 @@ BTBITTAGE::update(const FetchTarget &stream)
 
         bool &used_alt = pred.useAlt;
         auto &alt_info = pred.altInfo;
+        const bool use_provider = main_found && !used_alt;
+        if (use_provider) {
+            ittageStats.useProviderTable[main_info.table]++;
+        }
+        if (mispred && use_provider) {
+            ittageStats.mispredictUseProviderTable[main_info.table]++;
+        }
         // update provider
         if (main_found) {
             DPRINTF(ITTAGE, "prediction provided by table %d, idx %d, updating corresponding entry\n",
                 main_info.table, main_info.index);
             auto &way = tageTable[main_info.table][main_info.index];
+            if (use_provider && !way.active) {
+                way.active = true;
+                ittageStats.activeEntriesByTable[main_info.table]++;
+            }
             updateCounter(exe_target == main_target, 2, way.counter); // need modify
             if (way.counter == 0) {
                 way.target = exe_target;
@@ -414,6 +436,11 @@ BTBITTAGE::update(const FetchTarget &stream)
                     if (allocate[ti - startTable]) {
                         DPRINTF(ITTAGE, "found allocatable entry, table %d, index %d, tag %d, counter %d\n",
                             ti, newIndex, newTag, 2);
+                        if (!newEntry.valid) {
+                            ittageStats.validEntriesByTable[ti]++;
+                        } else if (newEntry.active) {
+                            ittageStats.activeEntriesByTable[ti]--;
+                        }
                         newEntry = TageEntry(newTag, exe_target, 2, btb_entry.pc);
                         ittageStats.updateAllocSuccess++;
                         break; // allocate only 1 entry
@@ -699,6 +726,16 @@ BTBITTAGE::IttageStats::IttageStats(statistics::Group* parent, int numPredictors
     ADD_STAT(updateAllocFailure, statistics::units::Count::get(), "allocation failure when update"),
     ADD_STAT(updateResetU, statistics::units::Count::get(), "reset useful bits when update"),
     ADD_STAT(updateUseAltCorrect, statistics::units::Count::get(), "use alternative prediction and correct on update"),
+    ADD_STAT(useProviderTable, statistics::units::Count::get(),
+        "resolved indirect branches that use the ITTAGE provider table, grouped by table"),
+    ADD_STAT(mispredictUseProviderTable, statistics::units::Count::get(),
+        "mispredicted indirect branches that use the ITTAGE provider table, grouped by table"),
+    ADD_STAT(activeEntriesByTable, statistics::units::Count::get(),
+        "ITTAGE entries that served as provider at least once and are still resident, grouped by table"),
+    ADD_STAT(validEntriesByTable, statistics::units::Count::get(),
+        "valid ITTAGE entries at stats dump time, grouped by table"),
+    ADD_STAT(totalEntriesByTable, statistics::units::Count::get(),
+        "total ITTAGE entries, grouped by table"),
     ADD_STAT(predTableHits, statistics::units::Count::get(), "hit of each tage table on prediction"),
     ADD_STAT(updateTableHits, statistics::units::Count::get(), "hit of each tage table on update"),
 
@@ -715,6 +752,19 @@ BTBITTAGE::IttageStats::IttageStats(statistics::Group* parent, int numPredictors
     ADD_STAT(callPredWrong, statistics::units::Count::get(), "number of call commits with wrong predictions in ITTAGE"),
     ADD_STAT(otherPredWrong, statistics::units::Count::get(), "number of other (except call) commits with wrong predictions in ITTAGE")
 {
+    useProviderTable.init(numPredictors);
+    mispredictUseProviderTable.init(numPredictors);
+    activeEntriesByTable.init(numPredictors);
+    validEntriesByTable.init(numPredictors);
+    totalEntriesByTable.init(numPredictors);
+    for (int table = 0; table < numPredictors; ++table) {
+        const std::string name = "ittage_t" + std::to_string(table);
+        useProviderTable.subname(table, name);
+        mispredictUseProviderTable.subname(table, name);
+        activeEntriesByTable.subname(table, name);
+        validEntriesByTable.subname(table, name);
+        totalEntriesByTable.subname(table, name);
+    }
     predTableHits.init(0, numPredictors-1, 1);
     updateTableHits.init(0, numPredictors-1, 1);
 }

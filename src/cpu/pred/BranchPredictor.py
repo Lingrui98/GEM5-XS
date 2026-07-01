@@ -1232,4 +1232,12 @@ class DecoupledBPUWithBTB(BranchPredictor):
     swayReallocHysteresis = Param.Float(0.0,
         "Minimum utility gap required before SWAY transfers a way")
     swayReallocTageDoneeHysteresis = Param.Float(0.0,
-        "Minimum utility gap required when SWAY transfers a way to TAGE")
+        "Deprecated: accepted for compatibility but ignored by D6 SWAY")
+    swayDoneeTableSet = Param.String("",
+        "Comma-separated TAGE donee table ids for D6 SWAY, e.g. '3,7'")
+    swayExtraBitSourcePerPair = Param.String("",
+        "Design-time fixed D6 SWAY extra-bit source mapping")
+    swayEnableITTAGEDonor = Param.Bool(False,
+        "Enable D6 SWAY ITTAGE table-level donor slots after PENDING-17")
+    swayEnableRelaxedSlot = Param.Bool(False,
+        "Enable D6 SWAY relaxed donor-slot redirect path")

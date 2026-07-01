@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <sstream>
 #include <tuple>
@@ -70,38 +71,122 @@ DecoupledBPUWithBTB::SwayController::chooseReallocation(
         return decision;
     }
 
-    const SwayUtilityRow *donor = nullptr;
-    const SwayUtilityRow *donee = nullptr;
+    struct ComponentAggregate
+    {
+        uint64_t totalWays{0};
+        uint64_t activeWays{0};
+
+        void add(const SwayUtilityRow &row)
+        {
+            totalWays += row.totalWays;
+            activeWays += row.activeWays;
+        }
+
+        double utility() const
+        {
+            return totalWays == 0 ? 0.0 :
+                static_cast<double>(activeWays) /
+                static_cast<double>(totalWays);
+        }
+    };
+
+    ComponentAggregate mbtbUtility;
+    ComponentAggregate tageUtility;
+    const SwayUtilityRow *mbtbDonor = nullptr;
+    const SwayUtilityRow *mbtbDonee = nullptr;
+    std::array<const SwayUtilityRow *, sway::NumTageTables> tageRows{};
     for (const auto &row : phaseRows) {
         const uint8_t owner = sway::ownerFromScope(row.scope);
         if (owner == sway::InvalidOwner || row.totalWays == 0) {
             continue;
         }
-        if (!donor || row.utility < donor->utility) {
-            donor = &row;
-        }
-        if (!donee || row.utility > donee->utility) {
-            donee = &row;
+        if (sway::isMbtbOwner(owner)) {
+            mbtbUtility.add(row);
+            if (!mbtbDonor || row.utility < mbtbDonor->utility) {
+                mbtbDonor = &row;
+            }
+            if (!mbtbDonee || row.utility > mbtbDonee->utility) {
+                mbtbDonee = &row;
+            }
+        } else if (sway::isTageOwner(owner)) {
+            tageUtility.add(row);
+            const unsigned table = sway::tageTable(owner);
+            if (table < tageRows.size()) {
+                tageRows[table] = &row;
+            }
         }
     }
 
-    if (!donor || !donee || donor->scope == donee->scope) {
+    if (!mbtbDonor || mbtbUtility.totalWays == 0 ||
+        tageUtility.totalWays == 0 || doneeTables.empty()) {
         return decision;
     }
 
-    const uint8_t doneeOwner = sway::ownerFromScope(donee->scope);
-    const double requiredGap = sway::isTageOwner(doneeOwner) ?
-        std::max(hysteresisMargin, tageDoneeHysteresisMargin) :
-        hysteresisMargin;
-    if ((donee->utility - donor->utility) <= requiredGap) {
+    const double donorComponentUtility = mbtbUtility.utility();
+    const double doneeComponentUtility = tageUtility.utility();
+    if ((donorComponentUtility - doneeComponentUtility) >
+        tightHysteresisMargin) {
+        const SwayUtilityRow *tageReturnDonor = nullptr;
+        for (auto table : doneeTables.tableIds) {
+            if (table >= tageRows.size() || !tageRows[table]) {
+                continue;
+            }
+            if (!tageReturnDonor ||
+                tageRows[table]->utility < tageReturnDonor->utility) {
+                tageReturnDonor = tageRows[table];
+            }
+        }
+        if (tageReturnDonor && mbtbDonee) {
+            decision.valid = true;
+            decision.action = sway::ControllerAction::ReturnMbtbTight;
+            decision.donor = sway::ownerFromScope(tageReturnDonor->scope);
+            decision.donee = sway::ownerFromScope(mbtbDonee->scope);
+            decision.donorUtility = tageReturnDonor->utility;
+            decision.doneeUtility = mbtbDonee->utility;
+            decision.donorComponentUtility = doneeComponentUtility;
+            decision.doneeComponentUtility = donorComponentUtility;
+            return decision;
+        }
+    }
+
+    const SwayUtilityRow *tageDonee = nullptr;
+    uint8_t cooldownBlockedTable = sway::InvalidOwner;
+    for (auto table : doneeTables.tableIds) {
+        if (table >= tageRows.size() || !tageRows[table]) {
+            continue;
+        }
+        if (doneeCooldownRemaining[table] > 0) {
+            if (cooldownBlockedTable == sway::InvalidOwner) {
+                cooldownBlockedTable = table;
+            }
+            continue;
+        }
+        if (!tageDonee || tageRows[table]->utility > tageDonee->utility) {
+            tageDonee = tageRows[table];
+        }
+    }
+
+    if (!tageDonee) {
+        if (cooldownBlockedTable != sway::InvalidOwner) {
+            decision.blockedByCooldown = true;
+            decision.blockedDonee = cooldownBlockedTable;
+        }
+        return decision;
+    }
+
+    if ((doneeComponentUtility - donorComponentUtility) <=
+        tightHysteresisMargin) {
         return decision;
     }
 
     decision.valid = true;
-    decision.donor = sway::ownerFromScope(donor->scope);
-    decision.donee = doneeOwner;
-    decision.donorUtility = donor->utility;
-    decision.doneeUtility = donee->utility;
+    decision.action = sway::ControllerAction::MbtbToTageTight;
+    decision.donor = sway::ownerFromScope(mbtbDonor->scope);
+    decision.donee = sway::ownerFromScope(tageDonee->scope);
+    decision.donorUtility = mbtbDonor->utility;
+    decision.doneeUtility = tageDonee->utility;
+    decision.donorComponentUtility = donorComponentUtility;
+    decision.doneeComponentUtility = doneeComponentUtility;
     return decision;
 }
 
@@ -148,6 +233,11 @@ DecoupledBPUWithBTB::syncSwayBorrowedWayCounts()
     }
     if (tage) {
         tage->syncSwayBorrowedWayCounts(borrowed);
+        if (mbtb) {
+            tage->configureSwayMbtbBorrowedSlots(
+                mbtb->getSwayMbtbTightSlotStates(), swayDoneeTables,
+                mbtb->swayNumSets());
+        }
     }
 }
 
@@ -155,8 +245,13 @@ void
 DecoupledBPUWithBTB::trySwayReallocForPhase(
     const std::vector<SwayUtilityRow>& phaseRows)
 {
+    swayController.beginPhase();
     auto decision = swayController.chooseReallocation(phaseRows);
     if (!decision.valid) {
+        if (decision.blockedByCooldown &&
+            decision.blockedDonee < sway::NumTageTables) {
+            swayStats.coolDownBlockedByDonee[decision.blockedDonee]++;
+        }
         return;
     }
 
@@ -180,6 +275,14 @@ DecoupledBPUWithBTB::trySwayReallocForPhase(
     syncSwayBorrowedWayCounts();
     swayStats.reallocCount++;
     swayStats.ownerOverrides[decision.donee] += moved;
+    if (decision.action == sway::ControllerAction::MbtbToTageTight &&
+        sway::isMbtbOwner(decision.donor)) {
+        swayStats.slotOwnerTransitionsPerSlot[sway::mbtbSram(decision.donor)]++;
+    } else if (decision.action == sway::ControllerAction::ReturnMbtbTight &&
+               sway::isMbtbOwner(decision.donee)) {
+        swayStats.slotOwnerTransitionsPerSlot[sway::mbtbSram(decision.donee)]++;
+    }
+    swayController.armCooldown(decision);
     swayController.startQuiesce();
 }
 
@@ -715,11 +818,33 @@ DecoupledBPUWithBTB::SwayStats::SwayStats(statistics::Group* parent):
     ADD_STAT(reallocBlockedQuiesce, statistics::units::Count::get(),
              "cycles where SWAY quiesce blocks prediction after reallocation"),
     ADD_STAT(ownerOverrides, statistics::units::Count::get(),
-             "SWAY transferred ways received by logical owner scope")
+             "SWAY transferred ways received by logical owner scope"),
+    ADD_STAT(slotOwnerTransitionsPerSlot, statistics::units::Count::get(),
+             "SWAY owner transitions grouped by D6 donor slot"),
+    ADD_STAT(relaxedRedirectsTriggered, statistics::units::Count::get(),
+             "SWAY relaxed-slot redirect events triggered by borrowed hits"),
+    ADD_STAT(coolDownBlockedByDonee, statistics::units::Count::get(),
+             "SWAY phase decisions blocked by donee table cooldown"),
+    ADD_STAT(tableDonationActiveCycles, statistics::units::Count::get(),
+             "cycles where each SWAY ITTAGE table-level donor slot is active")
 {
     ownerOverrides.init(sway::NumScopes);
     for (uint8_t owner = 0; owner < sway::NumScopes; ++owner) {
         ownerOverrides.subname(owner, sway::scopeName(owner));
+    }
+    slotOwnerTransitionsPerSlot.init(sway::NumDonorSlots);
+    slotOwnerTransitionsPerSlot.subname(0, "mbtb_sram0_way3");
+    slotOwnerTransitionsPerSlot.subname(1, "mbtb_sram1_way3");
+    slotOwnerTransitionsPerSlot.subname(2, "ittage_t2");
+    slotOwnerTransitionsPerSlot.subname(3, "ittage_t3");
+    coolDownBlockedByDonee.init(sway::NumTageTables);
+    for (uint8_t table = 0; table < sway::NumTageTables; ++table) {
+        coolDownBlockedByDonee.subname(table, "tage_t" + std::to_string(table));
+    }
+    tableDonationActiveCycles.init(sway::NumIttageTables);
+    for (uint8_t table = 0; table < sway::NumIttageTables; ++table) {
+        tableDonationActiveCycles.subname(table,
+            "ittage_t" + std::to_string(table));
     }
 }
 

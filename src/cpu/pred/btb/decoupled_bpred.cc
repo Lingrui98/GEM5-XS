@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
+#include <cstdlib>
+#include <sstream>
 
 #include "arch/riscv/regs/misc.hh"
 #include "base/debug_helper.hh"
@@ -24,6 +27,40 @@ namespace branch_prediction
 {
 namespace btb_pred
 {
+
+namespace
+{
+
+sway::DoneeTableSet
+parseSwayDoneeTableSet(const std::string &text)
+{
+    sway::DoneeTableSet config;
+    std::stringstream input(text);
+    std::string token;
+    while (std::getline(input, token, ',')) {
+        token.erase(std::remove_if(token.begin(), token.end(),
+                    [](unsigned char c) { return std::isspace(c); }),
+                    token.end());
+        if (token.empty()) {
+            continue;
+        }
+        char *end = nullptr;
+        const unsigned long value = std::strtoul(token.c_str(), &end, 0);
+        panic_if(end == token.c_str() || *end != '\0',
+                 "Invalid SWAY donee table id '%s'", token.c_str());
+        panic_if(!sway::isTageTableId(value),
+                 "SWAY donee table id %lu exceeds TAGE table count %u",
+                 value, sway::NumTageTables);
+        const auto id = static_cast<uint8_t>(value);
+        if (std::find(config.tableIds.begin(), config.tableIds.end(), id) ==
+            config.tableIds.end()) {
+            config.tableIds.push_back(id);
+        }
+    }
+    return config;
+}
+
+} // anonymous namespace
 
 uint8_t
 DecoupledBPUWithBTB::getThreadAsidHash(ThreadID tid) const
@@ -79,9 +116,18 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     swayReallocWays = p.swayReallocWays;
     swayReallocHysteresis = p.swayReallocHysteresis;
     swayReallocTageDoneeHysteresis = p.swayReallocTageDoneeHysteresis;
+    swayDoneeTableSetParam = p.swayDoneeTableSet;
+    swayExtraBitSourcePerPair = p.swayExtraBitSourcePerPair;
+    swayEnableITTAGEDonor = p.swayEnableITTAGEDonor;
+    swayEnableRelaxedSlot = p.swayEnableRelaxedSlot;
+    swayDoneeTables = parseSwayDoneeTableSet(swayDoneeTableSetParam);
+    if (swayReallocTageDoneeHysteresis != 0.0) {
+        warn_once("swayReallocTageDoneeHysteresis is deprecated in D6 SWAY; "
+                  "the parameter is accepted for compatibility but ignored");
+    }
     swayController.configure(enableSwayRealloc, swayReallocWays,
-                             swayReallocHysteresis,
-                             swayReallocTageDoneeHysteresis);
+                             swayReallocHysteresis, 0.0, swayDoneeTables,
+                             swayEnableITTAGEDonor, swayEnableRelaxedSlot);
     if (mbtb) {
         mbtb->setSwayReallocEnabled(enableSwayRealloc);
     }
