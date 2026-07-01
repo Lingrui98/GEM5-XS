@@ -1,0 +1,96 @@
+{
+  "id": "sway-d6-poc-rework",
+  "name": "sway-d6-poc-rework",
+  "title": "SWAY Phase 1 Task C: D6 heterogeneous-substrate PoC rework",
+  "description": "Rework the SWAY PoC under the locked physical-implementability design captured in docs/SWAY_MECHANISM_SPEC_v2.md: component-level ownership (P1), donee-history-scaled cool-down (P2), TAGE-only-donee (P3'), D6 4-slot heterogeneous substrate (MBTB tight ×2 + ITTAGE table-level relaxed ×2), R1-R5 index/packing rules with parameterized design-time-fixed extra-bit source, parameterized donee_set sweep, Fix 1/2/3 useful-bit lifecycle, and the over-provisioning upper-bound comparison against the archived 06-XX-sway-realloc-controller-poc PoC.",
+  "status": "completed",
+  "dev_type": "impl",
+  "scope": "src+eval+paper",
+  "package": "gem5-sway",
+  "priority": "P0",
+  "creator": "glr",
+  "assignee": "codex",
+  "createdAt": "2026-06-30",
+  "completedAt": "2026-07-01",
+  "branch": "sway/d6-substrate-rework",
+  "base_branch": "sway/phase-stranded-probe",
+  "worktree_path": "/nfs/home/goulingrui/project/GEM5-sway",
+  "current_phase": 7,
+  "next_action": [
+    {
+      "phase": "D0-prep",
+      "action": "done: read docs/SWAY_MECHANISM_SPEC_v2.md and PoC PRD; confirmed BTBTAGE numWays=2 / tableSizes=2048 / 8 tables; confirmed MBTB numEntries=8192 numWays=4; confirmed BTBITTAGE 5 tables [256,256,512,512,512] from gcc_pp_O2_1869 config.json"
+    },
+    {
+      "phase": "D1",
+      "action": "done: refactored sway_realloc.hh to NumComponents=3; added donor-slot, donee-table-set, extra-bit-source, and default-off SimObject params; gem5.opt -j32 build passed"
+    },
+    {
+      "phase": "D2",
+      "action": "done: MBTB tight slots limited to the two designated donor ways; source-semantics R2b geometry recorded for MBTB-to-TAGE; BTB 21/21, TAGE 28/28, gem5.opt build, and gcc_pp_O2 5M baseline-off smoke passed"
+    },
+    {
+      "phase": "D3",
+      "action": "done: implemented TAGE borrowed-bank lookup/allocation over MBTB tight donor slots for configured donee table(s), R2b + R4 packing helpers, useful-bit lifecycle resets, and borrowed-hit/useful-waste stats; BTBTAGE 33/33 and BTB 21/21 pass; gem5.opt serial build pass; gcc_pp_O2 5M SWAY T7 smoke exits cleanly but does not trigger controller transfer"
+    },
+    {
+      "phase": "D4",
+      "action": "done: rewrote SwayController around MBTB/TAGE component utility, 5-action enum, configured TAGE donee set, default tight/relaxed margins 0.10/0.20, TAGE donee cooldown, MBTB tight donate/return, quiesce preservation, and coolDownBlockedByDonee stats; BTB 21/21, TAGE 33/33, gem5.opt -j32 retry, and gcc_pp_O2 1M SWAY T7 smoke passed"
+    },
+    {
+      "phase": "D5",
+      "action": "done: ITTAGE useProviderTable/mispredictUseProviderTable/activeEntriesByTable/validEntriesByTable/totalEntriesByTable stats wired; gcc_pp_O2 1M smoke passed; 10-workload Phase 0 heatmap completed under runs/phase0_ittage_heatmap/main_W100K; PENDING-17 resolved to ITTAGE T2 + T3 donor slots"
+    },
+    {
+      "phase": "D6",
+      "action": "done: 50 final runs completed under runs/eval_sway_W100K_d6; figure4_ipc_uplift and figure5_donee_set_sweep regenerated; PENDING-16 resolved nominally to {T3,T7}, but all swept donee sets tied at +0.253835% geomean with total_reallocCount=0"
+    },
+    {
+      "phase": "D7",
+      "action": "done: archived PoC a48d6355f1 K=1 tageh045 reran under the identical 10-workload W=100K 5M config; 10/10 completed under runs/over_provisioning_bracket/archive_k1_tageh045_rerun_a48d6355f1; PENDING-18 resolved with archived sidecar geomean +0.773573%, D6 nominal {T3,T7} +0.253835%, gap +0.519738%; PENDING-19 deprecated 0.45 hysteresis; PENDING-20 not used because active D6 pairs are R2b extra-tag mappings; ITTAGE relaxed runtime not landed because D6 no-active-transfer result does not motivate it"
+    }
+  ],
+  "commit": "aedcb84d0f,9faf270f99,closeout-commit",
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "/nfs/home/goulingrui/project/papers/sway-paper/docs/SWAY_MECHANISM_SPEC_v2.md",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/sway_realloc.hh",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/decoupled_bpred.hh",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/decoupled_bpred.cc",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/decoupled_bpred_stats.cc",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/mbtb.hh",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/mbtb.cc",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/btb_tage.hh",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/btb_tage.cc",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/btb_ittage.hh",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/btb/btb_ittage.cc",
+    "/nfs/home/goulingrui/project/GEM5-sway/src/cpu/pred/BranchPredictor.py",
+    "/nfs/home/goulingrui/project/papers/sway-paper/PLAN.md",
+    "/nfs/home/goulingrui/project/papers/sway-paper/INSIGHT.yaml",
+    "/nfs/home/goulingrui/project/papers/sway-paper/PENDING.md",
+    "/nfs/home/goulingrui/project/papers/sway-paper/figures/figure4_ipc_uplift.py"
+  ],
+  "notes": "PENDING start 2026-06-30. Supersedes archived 06-XX-sway-realloc-controller-poc, whose 10-scope per-table owner + sidecar PoC will be retained as strawman ablation + over-provisioning upper bound (PENDING-18). Locked design: P1 component owner, P2 cool-down ∝ donee history, P3' TAGE-only-donee, D6 4-slot heterogeneous substrate (MBTB tight ×2 + ITTAGE table-level relaxed ×2), R1/R2a/R2b/R3/R4/R5 index-packing rules with design-time-fixed extra-bit source. glr confirmed source/runtime set-count semantics as ground truth on 2026-07-01: MBTB-to-TAGE is R2b extra_tag=1, ITTAGE T0/T1 are R3-excluded, and ITTAGE T2/T3/T4 are R2b extra_tag=2. D3 completed on 2026-07-01 for the MBTB-tight borrowed-bank TAGE view. D4 completed on 2026-07-01 for executable MBTB-tight controller donate/return plus component utility and cooldown; gcc_pp_O2 smoke did not trigger donation because MBTB utility was higher than TAGE. D5 completed on 2026-07-01: Phase 0 ITTAGE heatmap selected ITTAGE T2 + T3 as relaxed table-level donor slots; T4 remains native. D6 completed on 2026-07-01: all swept donee sets tied with total_reallocCount=0; {T3,T7} recorded as nominal main result by prior preference, not by active transfer benefit. D7 completed on 2026-07-01: archived sidecar PoC reran 10/10 under over_provisioning_bracket; sidecar over-provisioning bracket is +0.773573% vs D6 nominal +0.253835% geomean, gap +0.519738%; relaxed ITTAGE runtime remains default-off/not landed because the D6 cohort had total_reallocCount=0. Branch hygiene completed with source commits aedcb84d0f and 9faf270f99 plus the Trellis closeout commit.",
+  "meta": {
+    "owning_project": "/nfs/home/goulingrui/project/papers/sway-paper",
+    "phase": "Phase 1 Task C",
+    "supersedes": "06-XX-sway-realloc-controller-poc",
+    "spec_authority": "/nfs/home/goulingrui/project/papers/sway-paper/docs/SWAY_MECHANISM_SPEC_v2.md",
+    "control_components": "MBTB, ITTAGE, TAGE",
+    "donor_slots": "MBTB×2 (tight) + ITTAGE×2 (relaxed, table-level)",
+    "donee_table_candidates": "[T7], [T6,T7], [T3,T7], [T4,T7], [T3,T5,T7]",
+    "donee_table_main_result_choice": "{T3,T7} nominal (PENDING-16 resolved by D6 tie; all swept sets total_reallocCount=0)",
+    "ittage_donor_candidate": "ITTAGE T2 + T3 (PENDING-17 resolved by Phase 0 A20 heatmap on 2026-07-01)",
+    "extra_bit_source": "not used by active D6 pairs; MBTB->TAGE and ITTAGE T2/T3->TAGE are R2b extra-tag mappings from donee native index high bits",
+    "useful_bit_fixes": "Fix1 squash full reset; Fix2 sidecar shrink cold-reset; Fix3 reallocation-induced useful-loss stat",
+    "default_enable_sway_realloc": false,
+    "estimated_engineering_days": "5-7 (D1-D7)",
+    "data_risk_branch_a8": "情形 A/B/C 三条退路 in SPEC §8.3; 情形 C 走退路 1 (旧 PoC 作 over-provisioning upper bound)",
+    "over_provisioning_bracket": "archive a48d6355f1 K=1 tageh045 rerun: +0.773573% geomean; D6 nominal {T3,T7}: +0.253835%; gap +0.519738%",
+    "relaxed_ittage_runtime": "not landed in D7 because D6 no-active-transfer result provides no exercised benefit; stats remain visible and zero-valued",
+    "branch_hygiene": "split into three commits: substrate/tests; controller/stats; Trellis closeout"
+  }
+}
