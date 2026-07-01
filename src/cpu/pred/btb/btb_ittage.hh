@@ -44,12 +44,15 @@ class BTBITTAGE : public TimedBaseBTBPredictor
             Addr target;
             short counter;
             bool useful;
+            bool active;
             Addr pc; // TODO: should use lowest bits only
 
-            TageEntry() : valid(false), tag(0), target(0), counter(0), useful(false), pc(0) {}
+            TageEntry() : valid(false), tag(0), target(0), counter(0),
+                          useful(false), active(false), pc(0) {}
 
             TageEntry(Addr tag, Addr target, short counter, Addr pc) :
-                        valid(true), tag(tag), target(target), counter(counter), useful(false), pc(pc) {}
+                        valid(true), tag(tag), target(target), counter(counter),
+                        useful(false), active(false), pc(pc) {}
             bool taken() {
                 return counter >= 2;
             }
@@ -121,6 +124,10 @@ class BTBITTAGE : public TimedBaseBTBPredictor
     // check folded hists after speculative update and recover
     void checkFoldedHist(const bitset &history, const char *when);
     void checkFoldedHist(const bitset &history, ThreadID tid, const char *when);
+
+#ifndef UNIT_TEST
+    void preDumpStats() override;
+#endif
 
   private:
 
@@ -201,6 +208,7 @@ class BTBITTAGE : public TimedBaseBTBPredictor
     typedef uint64_t Scalar;
 #else
     typedef statistics::Scalar Scalar;
+    typedef statistics::Vector Vector;
 #endif
 
     // Statistics for ITTAGE predictor
@@ -224,6 +232,11 @@ class BTBITTAGE : public TimedBaseBTBPredictor
         Scalar updateUseAltCorrect;
 
 #ifndef UNIT_TEST
+        Vector useProviderTable;
+        Vector mispredictUseProviderTable;
+        Vector activeEntriesByTable;
+        Vector validEntriesByTable;
+        Vector totalEntriesByTable;
         statistics::Distribution predTableHits;
         statistics::Distribution updateTableHits;
 

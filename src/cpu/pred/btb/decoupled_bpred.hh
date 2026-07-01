@@ -384,6 +384,10 @@ class DecoupledBPUWithBTB : public BPredUnit
         statistics::Scalar reallocCount;
         statistics::Scalar reallocBlockedQuiesce;
         statistics::Vector ownerOverrides;
+        statistics::Vector slotOwnerTransitionsPerSlot;
+        statistics::Scalar relaxedRedirectsTriggered;
+        statistics::Vector coolDownBlockedByDonee;
+        statistics::Vector tableDonationActiveCycles;
 
         SwayStats(statistics::Group* parent);
     } swayStats;
@@ -769,19 +773,33 @@ class DecoupledBPUWithBTB : public BPredUnit
         struct Decision
         {
             bool valid{false};
+            bool blockedByCooldown{false};
+            sway::ControllerAction action{sway::ControllerAction::None};
             uint8_t donor{sway::InvalidOwner};
             uint8_t donee{sway::InvalidOwner};
+            uint8_t blockedDonee{sway::InvalidOwner};
             double donorUtility{0.0};
             double doneeUtility{0.0};
+            double donorComponentUtility{0.0};
+            double doneeComponentUtility{0.0};
         };
 
         void configure(bool enable, unsigned ways, double hysteresis,
-                       double tageDoneeHysteresis)
+                       double tageDoneeHysteresis,
+                       const sway::DoneeTableSet& doneeTables,
+                       bool enableIttageDonor,
+                       bool enableRelaxedSlot)
         {
             enabled = enable;
             transferWays = ways == 0 ? 1 : ways;
-            hysteresisMargin = hysteresis;
-            tageDoneeHysteresisMargin = tageDoneeHysteresis;
+            tightHysteresisMargin = hysteresis > 0.0 ?
+                hysteresis : sway::TightHysteresisMargin;
+            relaxedHysteresisMargin = sway::RelaxedHysteresisMargin;
+            (void)tageDoneeHysteresis;
+            this->doneeTables = doneeTables;
+            this->enableIttageDonor = enableIttageDonor;
+            this->enableRelaxedSlot = enableRelaxedSlot;
+            doneeCooldownRemaining.fill(0);
         }
 
         bool isEnabled() const { return enabled; }
@@ -804,6 +822,38 @@ class DecoupledBPUWithBTB : public BPredUnit
         void startQuiesce()
         {
             quiesceCyclesRemaining = 1;
+        }
+
+        void beginPhase()
+        {
+            for (auto &remaining : doneeCooldownRemaining) {
+                if (remaining > 0) {
+                    --remaining;
+                }
+            }
+        }
+
+        void armCooldown(const Decision &decision)
+        {
+            if (!sway::isTageOwner(decision.donee)) {
+                return;
+            }
+            const unsigned doneeTable = sway::tageTable(decision.donee);
+            if (doneeTable >= doneeCooldownRemaining.size()) {
+                return;
+            }
+            switch (decision.action) {
+              case sway::ControllerAction::MbtbToTageTight:
+                doneeCooldownRemaining[doneeTable] =
+                    sway::tageDoneeCooldownPhases(doneeTable);
+                break;
+              case sway::ControllerAction::IttageToTageRelaxed:
+                doneeCooldownRemaining[doneeTable] =
+                    sway::ittageDoneeCooldownPhases(doneeTable);
+                break;
+              default:
+                break;
+            }
         }
 
         void collectPhaseScope(int phaseID, const std::string& scope,
@@ -832,9 +882,13 @@ class DecoupledBPUWithBTB : public BPredUnit
 
         bool enabled{false};
         unsigned transferWays{1};
-        double hysteresisMargin{0.0};
-        double tageDoneeHysteresisMargin{0.0};
+        double tightHysteresisMargin{sway::TightHysteresisMargin};
+        double relaxedHysteresisMargin{sway::RelaxedHysteresisMargin};
+        sway::DoneeTableSet doneeTables;
+        bool enableIttageDonor{false};
+        bool enableRelaxedSlot{false};
         unsigned quiesceCyclesRemaining{0};
+        std::array<unsigned, sway::NumTageTables> doneeCooldownRemaining{};
         std::vector<SwayUtilityRow> utilityByPhase;
     };
     SwayController swayController;
@@ -867,6 +921,11 @@ class DecoupledBPUWithBTB : public BPredUnit
     unsigned swayReallocWays{1};
     double swayReallocHysteresis{0.0};
     double swayReallocTageDoneeHysteresis{0.0};
+    std::string swayDoneeTableSetParam;
+    std::string swayExtraBitSourcePerPair;
+    sway::DoneeTableSet swayDoneeTables;
+    bool swayEnableITTAGEDonor{false};
+    bool swayEnableRelaxedSlot{false};
 
     /**
      * @brief Next sub-phase ID to dump statistics for
