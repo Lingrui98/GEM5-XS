@@ -760,6 +760,60 @@ class DecoupledBPUWithBTB : public BPredUnit
         double utility;
     };
 
+    struct SwayF1Counters
+    {
+        uint64_t mbtbPredMiss{0};
+        uint64_t mbtbPredHit{0};
+        uint64_t mbtbCondMiss{0};
+        uint64_t mbtbCondHit{0};
+        uint64_t ittagePredMiss{0};
+        uint64_t ittagePredHit{0};
+        uint64_t tageUpdateMispred{0};
+        uint64_t tageUpdateFilteredEntries{0};
+        std::array<uint64_t, sway::NumTageTables> tageTableMispreds{};
+    };
+
+    struct SwayF1UtilitySnapshot
+    {
+        double mbtb{0.0};
+        double mbtbCond{0.0};
+        double ittage{0.0};
+        double tage{0.0};
+        std::array<double, sway::NumTageTables> tageTable{};
+    };
+
+    struct SwayPhaseDiagRow
+    {
+        int phaseID;
+        uint64_t mbtbTotalWays;
+        uint64_t mbtbActiveWays;
+        double mbtbUtility;
+        uint64_t ittageTotalWays;
+        uint64_t ittageActiveWays;
+        double ittageUtility;
+        uint64_t tageTotalWays;
+        uint64_t tageActiveWays;
+        double tageUtility;
+        SwayF1UtilitySnapshot f1Utility;
+        std::array<double, sway::NumTageTables> tageTableUtility;
+        std::array<uint64_t, sway::NumMbtbTightSlots> mbtbSlotTotalWays;
+        std::array<uint64_t, sway::NumMbtbTightSlots> mbtbSlotActiveWays;
+        std::array<double, sway::NumMbtbTightSlots> mbtbSlotUtility;
+        std::array<uint8_t, sway::NumMbtbTightSlots> mbtbSlotOwner;
+        double tightHysteresisMargin;
+        std::string decision;
+        std::string execution;
+        uint8_t donor;
+        uint8_t donee;
+        double donorUtility;
+        double doneeUtility;
+        double donorComponentUtility;
+        double doneeComponentUtility;
+        unsigned movedWays;
+        uint64_t reallocCount;
+    };
+    std::vector<SwayPhaseDiagRow> swayPhaseDiagRows;
+
     /**
      * @brief SWAY measurement-only utility probe.
      *
@@ -774,6 +828,7 @@ class DecoupledBPUWithBTB : public BPredUnit
         {
             bool valid{false};
             bool blockedByCooldown{false};
+            bool renewCooldown{false};
             sway::ControllerAction action{sway::ControllerAction::None};
             uint8_t donor{sway::InvalidOwner};
             uint8_t donee{sway::InvalidOwner};
@@ -782,6 +837,7 @@ class DecoupledBPUWithBTB : public BPredUnit
             double doneeUtility{0.0};
             double donorComponentUtility{0.0};
             double doneeComponentUtility{0.0};
+            SwayF1UtilitySnapshot f1Utility;
         };
 
         void configure(bool enable, unsigned ways, double hysteresis,
@@ -800,6 +856,7 @@ class DecoupledBPUWithBTB : public BPredUnit
             this->enableIttageDonor = enableIttageDonor;
             this->enableRelaxedSlot = enableRelaxedSlot;
             doneeCooldownRemaining.fill(0);
+            previousF1Counters = {};
         }
 
         bool isEnabled() const { return enabled; }
@@ -826,23 +883,29 @@ class DecoupledBPUWithBTB : public BPredUnit
 
         void beginPhase()
         {
-            for (auto &remaining : doneeCooldownRemaining) {
+            doneeCooldownExpired.fill(false);
+            for (size_t table = 0; table < doneeCooldownRemaining.size();
+                 ++table) {
+                auto &remaining = doneeCooldownRemaining[table];
                 if (remaining > 0) {
                     --remaining;
+                    if (remaining == 0) {
+                        doneeCooldownExpired[table] = true;
+                    }
                 }
             }
         }
 
-        void armCooldown(const Decision &decision)
+        void armCooldown(uint8_t donee, sway::ControllerAction action)
         {
-            if (!sway::isTageOwner(decision.donee)) {
+            if (!sway::isTageOwner(donee)) {
                 return;
             }
-            const unsigned doneeTable = sway::tageTable(decision.donee);
+            const unsigned doneeTable = sway::tageTable(donee);
             if (doneeTable >= doneeCooldownRemaining.size()) {
                 return;
             }
-            switch (decision.action) {
+            switch (action) {
               case sway::ControllerAction::MbtbToTageTight:
                 doneeCooldownRemaining[doneeTable] =
                     sway::tageDoneeCooldownPhases(doneeTable);
@@ -854,6 +917,23 @@ class DecoupledBPUWithBTB : public BPredUnit
               default:
                 break;
             }
+        }
+
+        void armCooldown(const Decision &decision)
+        {
+            armCooldown(decision.donee, decision.action);
+        }
+
+        bool doneeCoolingDown(unsigned table) const
+        {
+            return table < doneeCooldownRemaining.size() &&
+                doneeCooldownRemaining[table] > 0;
+        }
+
+        bool doneeCooldownJustExpired(unsigned table) const
+        {
+            return table < doneeCooldownExpired.size() &&
+                doneeCooldownExpired[table];
         }
 
         void collectPhaseScope(int phaseID, const std::string& scope,
@@ -870,7 +950,12 @@ class DecoupledBPUWithBTB : public BPredUnit
         }
 
         Decision chooseReallocation(
-            const std::vector<SwayUtilityRow>& phaseRows) const;
+            const std::vector<SwayUtilityRow>& phaseRows,
+            const std::array<sway::MbtbTightSlotState,
+                             sway::NumMbtbTightSlots>& mbtbSlots,
+            const std::array<MBTB::TightSlotPhaseSnapshot,
+                             sway::NumMbtbTightSlots>& mbtbSlotRows,
+            const SwayF1Counters& f1Counters);
 
       private:
         static double computeUtility(uint64_t totalWays, uint64_t activeWays)
@@ -879,6 +964,9 @@ class DecoupledBPUWithBTB : public BPredUnit
                 static_cast<double>(activeWays) /
                 static_cast<double>(totalWays);
         }
+
+        SwayF1UtilitySnapshot computeF1Utility(
+            const SwayF1Counters& counters);
 
         bool enabled{false};
         unsigned transferWays{1};
@@ -889,7 +977,9 @@ class DecoupledBPUWithBTB : public BPredUnit
         bool enableRelaxedSlot{false};
         unsigned quiesceCyclesRemaining{0};
         std::array<unsigned, sway::NumTageTables> doneeCooldownRemaining{};
+        std::array<bool, sway::NumTageTables> doneeCooldownExpired{};
         std::vector<SwayUtilityRow> utilityByPhase;
+        SwayF1Counters previousF1Counters;
     };
     SwayController swayController;
 
@@ -898,7 +988,20 @@ class DecoupledBPUWithBTB : public BPredUnit
      */
     void collectSwayWayVisitForPhase(int phaseID);
     void trySwayReallocForPhase(
-        const std::vector<SwayUtilityRow>& phaseRows);
+        const std::vector<SwayUtilityRow>& phaseRows,
+        const std::vector<SwayUtilityRow>& ittagePhaseRows,
+        const std::array<MBTB::TightSlotPhaseSnapshot,
+                         sway::NumMbtbTightSlots>& mbtbSlotRows);
+    void recordSwayPhaseDiag(
+        int phaseID,
+        const std::vector<SwayUtilityRow>& phaseRows,
+        const std::vector<SwayUtilityRow>& ittagePhaseRows,
+        const std::array<MBTB::TightSlotPhaseSnapshot,
+                         sway::NumMbtbTightSlots>& mbtbSlotRows,
+        const SwayController::Decision& decision,
+        const std::string& execution,
+        unsigned movedWays);
+    SwayF1Counters collectSwayF1Counters() const;
     unsigned countSwayOwnedWays(uint8_t owner) const;
     unsigned transferSwayWays(uint8_t donor, uint8_t donee, unsigned ways);
     void syncSwayBorrowedWayCounts();
