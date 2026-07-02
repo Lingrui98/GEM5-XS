@@ -351,23 +351,6 @@ class DecoupledBPUWithBTB : public BPredUnit
         statistics::Scalar resolveUpdateBlocked;
         statistics::Scalar resolveUpdateComponentUpdates;
 
-        // Trace-mode TAGE update diagnostics.
-        statistics::Scalar commitCallsTotal;
-        statistics::Scalar commitWithDoneFtqId;
-        statistics::Scalar updatePredictorComponentsTotal;
-        statistics::Scalar updatePredictorComponentsHitTaken;
-        statistics::Scalar prepareResolveUpdateEntriesTotal;
-        statistics::Scalar prepareResolveUpdateEntriesHitTaken;
-        statistics::Scalar prepareResolveUpdateEntriesBTBEntries;
-        statistics::Scalar markCFIResolvedCalls;
-        statistics::Scalar markCFIResolvedMatchedEntries;
-        statistics::Scalar resolveUpdateTotal;
-        statistics::Scalar resolveUpdateMissingTarget;
-        statistics::Scalar resolveUpdateSkippedNoHitTaken;
-        statistics::Scalar resolveUpdateHitTaken;
-        statistics::Scalar resolveUpdateBlocked;
-        statistics::Scalar resolveUpdateComponentUpdates;
-
         statistics::Scalar s1PredWrongFallthrough;
         statistics::Scalar s1PredWrongUbtb;
         statistics::Scalar s1PredWrongAbtb;

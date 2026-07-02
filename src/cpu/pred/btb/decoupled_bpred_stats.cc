@@ -622,15 +622,11 @@ DecoupledBPUWithBTB::collectSwayWayVisitForPhase(int phaseID)
                    snap.activeWays);
         }
     }
-    if (microtage) {
-        for (const auto& snap : microtage->collectAndResetWayVisitCounts()) {
-            append(snap.scope, snap.totalWays, snap.validWays,
-                   snap.activeWays);
-        }
-    }
-    // NOTE: MicroTAGE is included above for stranded profiling only;
-    // it is intentionally excluded from SWAY's reallocation scope —
-    // see memory:sway-scope-exclusions.
+    // NOTE: MicroTAGE (and other fast predictors) are intentionally out of
+    // SWAY's reallocation scope — see memory:sway-scope-exclusions. After the
+    // 2026-06 xs-dev merge, MicroTAGE no longer inherits from BTBTAGE and
+    // therefore does not expose collectAndResetWayVisitCounts(); we skip it
+    // here to keep the probe focused on MBTB + BTBTAGE.
     if (enableSwayRealloc) {
         trySwayReallocForPhase(phaseRows, ittagePhaseRows, mbtbSlotRows);
     }
