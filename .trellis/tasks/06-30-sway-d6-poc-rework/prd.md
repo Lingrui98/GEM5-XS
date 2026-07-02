@@ -164,6 +164,38 @@ Add or extend (preserving existing `sway.reallocCount`,
 
 ## Acceptance criteria
 
+- [x] **v4 F1' cond-aligned rewrite**:
+      MBTB donor pressure consumed by the controller now uses
+      `delta(condMisses) / max(1, delta(condHits) + delta(condMisses))`;
+      broad `new_utility_mbtb` remains in `sway_phase_a_diag.csv` for audit,
+      and `new_utility_mbtb_cond` was added immediately after it. Evidence:
+      `git diff --check` passed; `scons build/RISCV/gem5.opt --gold-linker -j32`
+      passed; `btb.test.opt` passed 21/21; `tage.test.opt` passed 33/33.
+- [x] **v4 gcc F1' smoke + Case C STOP**:
+      `gcc_pp_O2_1869` ran 5M instructions under
+      `runs/phase_b_rev_f1p_gcc_pp_O2/` with F1' utility and
+      `swayDoneeTableSet="3,7"`. The run completed with `reallocCount=0`.
+      Whole-run MBTB cond F1' was `0.341738`, TAGE F1 was `0.116286`,
+      and the per-phase mean gap was `-0.223284`; this is v4 Case C.
+      Evidence: `notes/2026-07-02-f1p-smoke-gcc.md` and
+      `notes/2026-07-02-f1p-verdict.md`.
+- [x] **v3 Phase B-rev Step 1 F1 wiring**:
+      F1 miss/mispredict-rate utility implemented as phase-delta snapshots;
+      controller transfer predicate now uses MBTB miss-rate versus aggregate
+      TAGE mispredict-rate; old `active_ways / total_ways` utility remains in
+      `sway_phase_a_diag.csv` and new `new_utility_*` columns were added for
+      audit. Evidence: `notes/2026-07-02-f1-step1.md`;
+      `scons build/RISCV/gem5.opt --gold-linker -j32` passed;
+      `btb.test.opt` passed 21/21; `tage.test.opt` passed 33/33.
+- [x] **v3 Phase B-rev Step 2 gcc smoke + STOP**:
+      `gcc_pp_O2_1869` ran 5M instructions under
+      `runs/phase_b_rev_f1_gcc_pp_O2/` with F1 utility and
+      `swayDoneeTableSet="3,7"`. The run completed, but `reallocCount=0`.
+      F1 TAGE utility was lower than MBTB utility
+      (whole-run `0.116286` vs `0.231488`, per-phase mean `0.117407` vs
+      `0.211704`), hitting the v3 hard STOP. Evidence:
+      `notes/2026-07-02-f1-smoke-gcc.md` and
+      `notes/2026-07-02-f1-verdict.md`.
 - [x] **D0 prep**: SPEC v2 read and PoC plan locked. BTBTAGE / MBTB / BTBITTAGE
       shapes confirmed against `runs/eval_baseline_W100K/main_W100K/<wl>/config.json`.
       Evidence: `docs/exec-plans/active/sway-d6-substrate-rework.md` records

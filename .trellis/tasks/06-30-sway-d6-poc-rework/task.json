@@ -3,7 +3,7 @@
   "name": "sway-d6-poc-rework",
   "title": "SWAY Phase 1 Task C: D6 heterogeneous-substrate PoC rework",
   "description": "Rework the SWAY PoC under the locked physical-implementability design captured in docs/SWAY_MECHANISM_SPEC_v2.md: component-level ownership (P1), donee-history-scaled cool-down (P2), TAGE-only-donee (P3'), D6 4-slot heterogeneous substrate (MBTB tight ×2 + ITTAGE table-level relaxed ×2), R1-R5 index/packing rules with parameterized design-time-fixed extra-bit source, parameterized donee_set sweep, Fix 1/2/3 useful-bit lifecycle, and the over-provisioning upper-bound comparison against the archived 06-XX-sway-realloc-controller-poc PoC.",
-  "status": "completed",
+  "status": "blocked",
   "dev_type": "impl",
   "scope": "src+eval+paper",
   "package": "gem5-sway",
@@ -11,11 +11,11 @@
   "creator": "glr",
   "assignee": "codex",
   "createdAt": "2026-06-30",
-  "completedAt": "2026-07-01",
+  "completedAt": null,
   "branch": "sway/d6-substrate-rework",
   "base_branch": "sway/phase-stranded-probe",
   "worktree_path": "/nfs/home/goulingrui/project/GEM5-sway",
-  "current_phase": 7,
+  "current_phase": "v4 F1' Case C STOP after gcc smoke",
   "next_action": [
     {
       "phase": "D0-prep",
@@ -48,6 +48,50 @@
     {
       "phase": "D7",
       "action": "done: archived PoC a48d6355f1 K=1 tageh045 reran under the identical 10-workload W=100K 5M config; 10/10 completed under runs/over_provisioning_bracket/archive_k1_tageh045_rerun_a48d6355f1; PENDING-18 resolved with archived sidecar geomean +0.773573%, D6 nominal {T3,T7} +0.253835%, gap +0.519738%; PENDING-19 deprecated 0.45 hysteresis; PENDING-20 not used because active D6 pairs are R2b extra-tag mappings; ITTAGE relaxed runtime not landed because D6 no-active-transfer result does not motivate it"
+    },
+    {
+      "phase": "Phase A Step 2",
+      "action": "done: added sway_phase_a_diag.csv instrumentation; ran gcc_pp_O2_1869 5M with donee set {T3,T7}; 49/49 phases were hold/not_valid; reallocCount=0; copied trace to runs/phase_a_diag/gcc_pp_O2_utility_trace.csv; wrote utility-trace analysis note"
+    },
+    {
+      "phase": "Phase B Direction X",
+      "action": "done: switched donor utility to MBTB tight-slot active/total and kept donee utility as aggregate TAGE component utility; rebuilt gem5.opt; reran gcc_pp_O2_1869 5M; result still 49/49 hold/not_valid and reallocCount=0"
+    },
+    {
+      "phase": "STOP",
+      "action": "blocked by v2 prompt hard gate: Phase A/B could not get reallocCount > 0 on gcc_pp_O2 smoke; do not launch Phase C/D/E until glr chooses outcome-aware utility, fallback narrative, or explicit override; see notes/2026-07-02-v2-stop-audit.md"
+    },
+    {
+      "phase": "Phase B-rev Step 1",
+      "action": "done: implemented F1 miss/mispredict-rate utility snapshots, switched controller predicate to F1 MBTB-vs-TAGE pressure, extended sway_phase_a_diag.csv with old/new utility columns, rebuilt gem5.opt, and passed BTB 21/21 plus TAGE 33/33; see notes/2026-07-02-f1-step1.md"
+    },
+    {
+      "phase": "Phase B-rev Step 2",
+      "action": "started from v3 prompt after Step 1; completed result recorded in the following Phase B-rev Step 2 entry"
+    },
+    {
+      "phase": "Phase B-rev Step 2",
+      "action": "done: ran gcc_pp_O2_1869 5M under runs/phase_b_rev_f1_gcc_pp_O2/; reallocCount=0; F1 TAGE utility was lower than MBTB utility (whole-run 0.116286 vs 0.231488; per-phase mean 0.117407 vs 0.211704); wrote notes/2026-07-02-f1-smoke-gcc.md"
+    },
+    {
+      "phase": "v3 STOP",
+      "action": "blocked by v3 hard gate: gcc_pp_O2 shows TAGE mispredict rate lower than MBTB miss rate, so do not run mcf Step 3 or Phase C/D/E until glr chooses revised F1, F2 ATD, or Q-U4/P3 review; see notes/2026-07-02-f1-verdict.md"
+    },
+    {
+      "phase": "Phase B-rev F1' code",
+      "action": "done: switched controller-consumed MBTB donor pressure to cond-aligned F1' using condMisses/(condHits+condMisses), kept broad new_utility_mbtb as CSV audit, added new_utility_mbtb_cond, and added narrow MBTB cond hit/miss getters"
+    },
+    {
+      "phase": "Phase B-rev F1' validation",
+      "action": "done: git diff --check passed; scons build/RISCV/gem5.opt --gold-linker -j32 passed; btb.test.opt passed 21/21; tage.test.opt passed 33/33"
+    },
+    {
+      "phase": "Phase B-rev F1' gcc smoke",
+      "action": "done: ran gcc_pp_O2_1869 5M under runs/phase_b_rev_f1p_gcc_pp_O2/; reallocCount=0; whole-run MBTB cond F1'=0.341738, TAGE F1=0.116286, gap=-0.225453; per-phase mean gap=-0.223284; 0/49 phases TAGE>MBTB_cond; wrote notes/2026-07-02-f1p-smoke-gcc.md"
+    },
+    {
+      "phase": "v4 Case C STOP",
+      "action": "blocked by v4 Case C: gcc mean F1' gap remains below -0.05, so do not run mcf or Phase C/D/E; recommend F2 ATD escalation; see notes/2026-07-02-f1p-verdict.md"
     }
   ],
   "commit": "aedcb84d0f,9faf270f99,closeout-commit",
@@ -73,7 +117,7 @@
     "/nfs/home/goulingrui/project/papers/sway-paper/PENDING.md",
     "/nfs/home/goulingrui/project/papers/sway-paper/figures/figure4_ipc_uplift.py"
   ],
-  "notes": "PENDING start 2026-06-30. Supersedes archived 06-XX-sway-realloc-controller-poc, whose 10-scope per-table owner + sidecar PoC will be retained as strawman ablation + over-provisioning upper bound (PENDING-18). Locked design: P1 component owner, P2 cool-down ∝ donee history, P3' TAGE-only-donee, D6 4-slot heterogeneous substrate (MBTB tight ×2 + ITTAGE table-level relaxed ×2), R1/R2a/R2b/R3/R4/R5 index-packing rules with design-time-fixed extra-bit source. glr confirmed source/runtime set-count semantics as ground truth on 2026-07-01: MBTB-to-TAGE is R2b extra_tag=1, ITTAGE T0/T1 are R3-excluded, and ITTAGE T2/T3/T4 are R2b extra_tag=2. D3 completed on 2026-07-01 for the MBTB-tight borrowed-bank TAGE view. D4 completed on 2026-07-01 for executable MBTB-tight controller donate/return plus component utility and cooldown; gcc_pp_O2 smoke did not trigger donation because MBTB utility was higher than TAGE. D5 completed on 2026-07-01: Phase 0 ITTAGE heatmap selected ITTAGE T2 + T3 as relaxed table-level donor slots; T4 remains native. D6 completed on 2026-07-01: all swept donee sets tied with total_reallocCount=0; {T3,T7} recorded as nominal main result by prior preference, not by active transfer benefit. D7 completed on 2026-07-01: archived sidecar PoC reran 10/10 under over_provisioning_bracket; sidecar over-provisioning bracket is +0.773573% vs D6 nominal +0.253835% geomean, gap +0.519738%; relaxed ITTAGE runtime remains default-off/not landed because the D6 cohort had total_reallocCount=0. Branch hygiene completed with source commits aedcb84d0f and 9faf270f99 plus the Trellis closeout commit.",
+  "notes": "PENDING start 2026-06-30. Supersedes archived 06-XX-sway-realloc-controller-poc, whose 10-scope per-table owner + sidecar PoC will be retained as strawman ablation + over-provisioning upper bound (PENDING-18). Locked design: P1 component owner, P2 cool-down ∝ donee history, P3' TAGE-only-donee, D6 4-slot heterogeneous substrate (MBTB tight ×2 + ITTAGE table-level relaxed ×2), R1/R2a/R2b/R3/R4/R5 index-packing rules with design-time-fixed extra-bit source. glr confirmed source/runtime set-count semantics as ground truth on 2026-07-01: MBTB-to-TAGE is R2b extra_tag=1, ITTAGE T0/T1 are R3-excluded, and ITTAGE T2/T3/T4 are R2b extra_tag=2. D3 completed on 2026-07-01 for the MBTB-tight borrowed-bank TAGE view. D4 completed on 2026-07-01 for executable MBTB-tight controller donate/return plus component utility and cooldown; gcc_pp_O2 smoke did not trigger donation because MBTB utility was higher than TAGE. D5 completed on 2026-07-01: Phase 0 ITTAGE heatmap selected ITTAGE T2 + T3 as relaxed table-level donor slots; T4 remains native. D6 completed on 2026-07-01: all swept donee sets tied with total_reallocCount=0; {T3,T7} recorded as nominal main result by prior preference, not by active transfer benefit. D7 completed on 2026-07-01: archived sidecar PoC reran 10/10 under over_provisioning_bracket; sidecar over-provisioning bracket is +0.773573% vs D6 nominal +0.253835% geomean, gap +0.519738%; relaxed ITTAGE runtime remains default-off/not landed because the D6 cohort had total_reallocCount=0. Branch hygiene completed with source commits aedcb84d0f and 9faf270f99 plus the Trellis closeout commit. v2 prompt reopened the task on 2026-07-02: Phase A Step 2 utility trace reproduced reallocCount=0 with 49/49 hold/not_valid rows; Phase B Direction X switched donor utility to MBTB tight-slot utility but still produced reallocCount=0. v3 prompt superseded v2 Phase B only and reopened the task on 2026-07-02 for F1 miss/mispredict-rate utility. Phase B-rev Step 1 implemented F1 snapshots and controller wiring, extended sway_phase_a_diag.csv with old/new utility columns, rebuilt gem5.opt, and passed BTB 21/21 plus TAGE 33/33. Phase B-rev Step 2 ran gcc_pp_O2_1869 5M and stopped: F1 produced reallocCount=0, and TAGE F1 utility was lower than MBTB F1 utility, hitting the v3 hard gate. See notes/2026-07-02-f1-smoke-gcc.md and notes/2026-07-02-f1-verdict.md. v4 prompt reopened F1 as cond-aligned F1'. The code now uses MBTB condMisses/(condHits+condMisses) for controller donor pressure while retaining broad MBTB F1 as CSV audit. The required gcc_pp_O2_1869 F1' smoke completed under runs/phase_b_rev_f1p_gcc_pp_O2/ and stopped as Case C: reallocCount=0, whole-run MBTB cond F1'=0.341738, TAGE F1=0.116286, per-phase mean gap=-0.223284, 0/49 positive phases. See notes/2026-07-02-f1p-smoke-gcc.md and notes/2026-07-02-f1p-verdict.md.",
   "meta": {
     "owning_project": "/nfs/home/goulingrui/project/papers/sway-paper",
     "phase": "Phase 1 Task C",
@@ -91,6 +135,14 @@
     "data_risk_branch_a8": "情形 A/B/C 三条退路 in SPEC §8.3; 情形 C 走退路 1 (旧 PoC 作 over-provisioning upper bound)",
     "over_provisioning_bracket": "archive a48d6355f1 K=1 tageh045 rerun: +0.773573% geomean; D6 nominal {T3,T7}: +0.253835%; gap +0.519738%",
     "relaxed_ittage_runtime": "not landed in D7 because D6 no-active-transfer result provides no exercised benefit; stats remain visible and zero-valued",
-    "branch_hygiene": "split into three commits: substrate/tests; controller/stats; Trellis closeout"
+    "branch_hygiene": "split into three commits: substrate/tests; controller/stats; Trellis closeout",
+    "v2_prompt_status": "superseded by v3 Phase B-rev",
+    "v2_stop_reason": "gcc_pp_O2 smoke still had reallocCount=0 after Phase A/B; 49/49 Direction-X rows were hold/not_valid and no phase had TAGE_component - coldest_MBTB_slot > 0",
+    "v3_prompt_status": "blocked after Phase B-rev Step 2",
+    "v3_utility_formula": "F1 miss/mispredict-rate phase deltas",
+    "v3_stop_reason": "gcc_pp_O2 F1 smoke produced reallocCount=0 and TAGE mispredict-rate lower than MBTB miss-rate; whole-run 0.116286 vs 0.231488",
+    "v4_prompt_status": "blocked after F1' gcc smoke",
+    "v4_utility_formula": "MBTB cond F1': condMisses/(condHits+condMisses); TAGE F1 unchanged",
+    "v4_stop_reason": "gcc_pp_O2 F1' smoke produced reallocCount=0 and mean TAGE-MBTB_cond gap -0.223284; whole-run 0.116286 vs 0.341738"
   }
 }
