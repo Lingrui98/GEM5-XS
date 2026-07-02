@@ -33,6 +33,7 @@ ittageStats(this, p.numPredictors)
 {
     DPRINTF(ITTAGE, "BTBITTAGE constructor numBr=%d\n", numBr);
     tageTable.resize(numPredictors);
+    phaseVisitCnt.resize(numPredictors);
     tableIndexBits.resize(numPredictors);
     tableIndexMasks.resize(numPredictors);
     tableTagBits.resize(numPredictors);
@@ -43,6 +44,7 @@ ittageStats(this, p.numPredictors)
         //initialize ittage predictor
         assert(tableSizes.size() >= numPredictors);
         tageTable[i].resize(tableSizes[i]);
+        phaseVisitCnt[i].assign(tableSizes[i], 0);
 
         tableIndexBits[i] = ceilLog2(tableSizes[i]);
         tableIndexMasks[i].resize(tableIndexBits[i], true);
@@ -134,6 +136,10 @@ BTBITTAGE::lookupHelper(Addr startAddr, const std::vector<BTBEntry> &btbEntries,
                     match, i, lookupIndices[i], lookupTags[i], way.tag, way.useful, btb_entry.pc, way.pc);
 
                 if (match) {
+                    if (i < phaseVisitCnt.size() &&
+                        lookupIndices[i] < phaseVisitCnt[i].size()) {
+                        ++phaseVisitCnt[i][lookupIndices[i]];
+                    }
                     if (!provided) {
                         main_info = TageTableInfo(true, way, i, lookupIndices[i], lookupTags[i]);
                         provided = true;
@@ -194,6 +200,56 @@ BTBITTAGE::lookupHelper(Addr startAddr, const std::vector<BTBEntry> &btbEntries,
             threadMeta[tid]->preds[btb_entry.pc] = pred;
         }
     }
+}
+
+std::vector<BTBITTAGE::TablePhaseSnapshot>
+BTBITTAGE::collectAndResetTableVisitCounts()
+{
+    std::vector<TablePhaseSnapshot> out;
+    out.reserve(numPredictors);
+    for (unsigned table = 0; table < numPredictors; ++table) {
+        TablePhaseSnapshot snap;
+        snap.scope = "ittage_t" + std::to_string(table);
+        snap.totalWays = table < tableSizes.size() ? tableSizes[table] : 0;
+        snap.validWays = 0;
+        snap.activeWays = 0;
+        if (table >= tageTable.size()) {
+            out.push_back(snap);
+            continue;
+        }
+        for (unsigned idx = 0; idx < tageTable[table].size(); ++idx) {
+            if (tageTable[table][idx].valid) {
+                ++snap.validWays;
+            }
+            if (table < phaseVisitCnt.size() && idx < phaseVisitCnt[table].size() &&
+                phaseVisitCnt[table][idx] > 0) {
+                ++snap.activeWays;
+                phaseVisitCnt[table][idx] = 0;
+            }
+        }
+        out.push_back(snap);
+    }
+    return out;
+}
+
+uint64_t
+BTBITTAGE::swayCommitMissCount() const
+{
+#ifdef UNIT_TEST
+    return ittageStats.commitMisses;
+#else
+    return ittageStats.commitMisses.value();
+#endif
+}
+
+uint64_t
+BTBITTAGE::swayCommitHitCount() const
+{
+#ifdef UNIT_TEST
+    return ittageStats.commitHits;
+#else
+    return ittageStats.commitHits.value();
+#endif
 }
 
 void

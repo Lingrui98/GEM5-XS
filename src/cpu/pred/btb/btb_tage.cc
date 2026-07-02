@@ -644,6 +644,39 @@ BTBTAGE::collectAndResetWayVisitCounts()
     return out;
 }
 
+uint64_t
+BTBTAGE::swayUpdateMispredCount() const
+{
+#ifdef UNIT_TEST
+    return tageStats.updateMispred;
+#else
+    return tageStats.updateMispred.value();
+#endif
+}
+
+uint64_t
+BTBTAGE::swayUpdateFilteredEntriesCount() const
+{
+#ifdef UNIT_TEST
+    return tageStats.updateFilteredEntries;
+#else
+    return tageStats.updateFilteredEntries.value();
+#endif
+}
+
+uint64_t
+BTBTAGE::swayUpdateTableMispredCount(unsigned table)
+{
+    if (table >= numPredictors) {
+        return 0;
+    }
+#ifdef UNIT_TEST
+    return tageStats.updateTableMispreds[table];
+#else
+    return tageStats.updateTableMispreds[table].value();
+#endif
+}
+
 // Set up tracing for debugging
 void
 BTBTAGE::setTrace()
@@ -1334,27 +1367,21 @@ BTBTAGE::handleNewEntryAllocation(const Addr &startPC,
             return false;
         };
 
-        if (!scan_native([](const TageEntry &cand) { return !cand.valid; }) &&
-            !scan_native([&](const TageEntry &cand) {
-                return !cand.useful && weakish(cand);
-            }) &&
-            !scan_borrowed([](const TageEntry &cand) {
+        auto scan_all_storage = [&](auto predicate) {
+            return scan_native(predicate) ||
+                scan_borrowed(predicate) ||
+                scan_extra(predicate);
+        };
+
+        if (!scan_all_storage([](const TageEntry &cand) {
                 return !cand.valid;
             }) &&
-            !scan_extra([](const TageEntry &cand) { return !cand.valid; }) &&
-            !scan_borrowed([&](const TageEntry &cand) {
+            !scan_all_storage([&](const TageEntry &cand) {
                 return !cand.useful && weakish(cand);
-            }) &&
-            !scan_extra([&](const TageEntry &cand) {
-                return !cand.useful && weakish(cand);
-            }) &&
-            !scan_native([](const TageEntry &cand) {
-                return !cand.useful;
-            }) &&
-            !scan_borrowed([](const TageEntry &cand) {
-                return !cand.useful;
             })) {
-            scan_extra([](const TageEntry &cand) { return !cand.useful; });
+            scan_all_storage([](const TageEntry &cand) {
+                return !cand.useful;
+            });
         }
 
         if (selected_entry != nullptr) {

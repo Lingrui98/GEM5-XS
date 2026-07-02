@@ -320,6 +320,10 @@ class BTBTAGE : public TimedBaseBTBPredictor
                          sway::NumMbtbTightSlots> &slotStates,
         const sway::DoneeTableSet &doneeTables,
         unsigned mbtbSets);
+    uint64_t swayUpdateMispredCount() const;
+    uint64_t swayUpdateFilteredEntriesCount() const;
+    uint64_t swayUpdateTableMispredCount(unsigned table);
+    unsigned swayNumPredictorTables() const { return numPredictors; }
 
 #ifdef UNIT_TEST
     bool insertSwayMbtbBorrowedEntryForTest(uint8_t slotId, unsigned table,

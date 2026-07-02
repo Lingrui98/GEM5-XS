@@ -294,6 +294,86 @@ MBTB::getSwayMbtbTightSlotStates() const
     return states;
 }
 
+std::array<MBTB::TightSlotPhaseSnapshot, sway::NumMbtbTightSlots>
+MBTB::collectSwayMbtbTightSlotVisitCounts() const
+{
+    std::array<TightSlotPhaseSnapshot, sway::NumMbtbTightSlots> out{};
+
+    auto fill = [&](unsigned slot, unsigned sramId,
+                    const std::vector<BTBSet> &sram,
+                    const std::vector<uint8_t> &owners,
+                    const std::vector<std::vector<uint32_t>> &visit) {
+        auto &snap = out[slot];
+        snap.slotId = static_cast<uint8_t>(slot);
+        snap.sourceSram = static_cast<uint8_t>(sramId);
+        snap.sourceWay = sway::MbtbTightSlotWay;
+        snap.owner = sway::InvalidOwner;
+        if (snap.sourceWay < owners.size()) {
+            snap.owner = owners[snap.sourceWay];
+        }
+        if (snap.sourceWay >= numWays) {
+            return;
+        }
+        snap.totalWays = numSets;
+        for (unsigned set = 0; set < numSets; ++set) {
+            if (set >= sram.size() || snap.sourceWay >= sram[set].size()) {
+                continue;
+            }
+            if (sram[set][snap.sourceWay].valid) {
+                ++snap.validWays;
+            }
+            if (set < visit.size() && snap.sourceWay < visit[set].size() &&
+                visit[set][snap.sourceWay] > 0) {
+                ++snap.activeWays;
+            }
+        }
+    };
+
+    fill(0, 0, sram0, swayOwner0, wayVisit0);
+    fill(1, 1, sram1, swayOwner1, wayVisit1);
+    return out;
+}
+
+uint64_t
+MBTB::swayPredMissCount() const
+{
+#ifdef UNIT_TEST
+    return btbStats.predMiss;
+#else
+    return btbStats.predMiss.value();
+#endif
+}
+
+uint64_t
+MBTB::swayPredHitCount() const
+{
+#ifdef UNIT_TEST
+    return btbStats.predHit;
+#else
+    return btbStats.predHit.value();
+#endif
+}
+
+uint64_t
+MBTB::swayCondMissCount() const
+{
+#ifdef UNIT_TEST
+    return btbStats.condMisses;
+#else
+    return btbStats.condMisses.value();
+#endif
+}
+
+uint64_t
+MBTB::swayCondHitCount() const
+{
+#ifdef UNIT_TEST
+    return btbStats.condHits;
+#else
+    return btbStats.condHits.value();
+#endif
+}
+
 unsigned
 MBTB::transferSwayWays(uint8_t donor, uint8_t donee, unsigned count)
 {

@@ -4,6 +4,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -129,6 +130,17 @@ class BTBITTAGE : public TimedBaseBTBPredictor
     void preDumpStats() override;
 #endif
 
+    struct TablePhaseSnapshot
+    {
+        std::string scope;
+        uint64_t totalWays;
+        uint64_t validWays;
+        uint64_t activeWays;
+    };
+    std::vector<TablePhaseSnapshot> collectAndResetTableVisitCounts();
+    uint64_t swayCommitMissCount() const;
+    uint64_t swayCommitHitCount() const;
+
   private:
 
     // return provided
@@ -180,6 +192,7 @@ class BTBITTAGE : public TimedBaseBTBPredictor
     unsigned maxHistLen;
 
     std::vector<std::vector<TageEntry>> tageTable;
+    std::vector<std::vector<uint32_t>> phaseVisitCnt;
 
     std::vector<TageEntry> lookupEntries;
     std::vector<Addr> lookupIndices, lookupTags;

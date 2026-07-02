@@ -406,6 +406,23 @@ class MBTB : public TimedBaseBTBPredictor
     };
     std::vector<WayPhaseSnapshot> collectAndResetWayVisitCounts();
 
+    struct TightSlotPhaseSnapshot
+    {
+        uint8_t slotId;
+        uint8_t sourceSram;
+        uint8_t sourceWay;
+        uint8_t owner;
+        uint64_t totalWays;
+        uint64_t validWays;
+        uint64_t activeWays;
+    };
+    std::array<TightSlotPhaseSnapshot, sway::NumMbtbTightSlots>
+    collectSwayMbtbTightSlotVisitCounts() const;
+    uint64_t swayPredMissCount() const;
+    uint64_t swayPredHitCount() const;
+    uint64_t swayCondMissCount() const;
+    uint64_t swayCondHitCount() const;
+
     void setSwayReallocEnabled(bool enabled);
     unsigned countSwayOwnedWays(uint8_t owner) const;
     unsigned transferSwayWays(uint8_t donor, uint8_t donee, unsigned count);
