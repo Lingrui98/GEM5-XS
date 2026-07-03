@@ -34,6 +34,7 @@
 // Include the type formats
 ##include "standard.isa"
 ##include "mem.isa"
+##include "cache_block.isa"
 ##include "fp.isa"
 ##include "amo.isa"
 ##include "matrix_conf.isa"
