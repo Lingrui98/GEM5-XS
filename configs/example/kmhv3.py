@@ -30,6 +30,27 @@ def setPtwLevelLimitParams(args, tlb):
     tlb.walker.ptw_level3_limit = args.ptw_level3_limit
     tlb.walker.ptw_miss_queue_size = args.ptw_miss_queue_size
 
+def extract_btbp_trace_out(argv):
+    trace_out = None
+    filtered = [argv[0]]
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--btbp-trace-out":
+            if i + 1 >= len(argv):
+                fatal("--btbp-trace-out requires a path")
+            trace_out = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--btbp-trace-out="):
+            trace_out = arg.split("=", 1)[1]
+            i += 1
+            continue
+        filtered.append(arg)
+        i += 1
+    return trace_out, filtered
+
+
 def setKmhV3Params(args, system):
     for cpu in system.cpu:
 
@@ -208,7 +229,9 @@ def setKmhV3Params(args, system):
 if __name__ == '__m5_main__':
     FutureClass = None
 
+    btbp_trace_out, sys.argv = extract_btbp_trace_out(sys.argv)
     args = xiangshan_system_init()
+    args.btbp_trace_out = btbp_trace_out
 
     assert not args.external_memory_system
 
@@ -231,6 +254,12 @@ if __name__ == '__m5_main__':
         configure_xiangshan_linux_workload(test_sys, args)
     # Set ideal parameters here with the highest priority, over command-line arguments
     setKmhV3Params(args, test_sys)
+    if args.btbp_trace_out:
+        if len(test_sys.cpu) != 1:
+            fatal("--btbp-trace-out currently supports one CPU per trace file")
+        test_sys.cpu[0].btbpTracer = BtbpTracer(
+            manager=test_sys.cpu[0],
+            output_file=args.btbp_trace_out)
 
     root = Root(full_system=True, system=test_sys)
     if maybe_handle_solver_runtime(root, args):
