@@ -249,11 +249,11 @@ class UBTB : public TimedBaseBTBPredictor
      * @param newPrediction The new prediction to store
      */
     void replaceOldEntry(UBTBIter oldEntryIter, const BTBEntry &newTakenEntry,
-                         Addr startAddr, uint8_t asidHash);
+                         Addr startAddr, uint8_t asidHash, ThreadID tid);
 
     //using the FB final taken branch to update uBTB
     void updateNewEntry(UBTBIter oldEntryIter, const BTBEntry &takenEntry,
-                        const Addr startAddr, uint8_t asidHash);
+                        const Addr startAddr, uint8_t asidHash, ThreadID tid);
 
 
     /** The uBTB structure:

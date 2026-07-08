@@ -714,6 +714,28 @@ Decode::decodeInsts(ThreadID tid)
             break;
         }
 
+        if (inst->isDirectCtrl() && !inst->isIndirectCtrl() &&
+            !inst->isReturn()) {
+            branch_prediction::btb_pred::BtbpTraceEvent branch_event;
+            branch_event.tick = curTick();
+            branch_event.eventType =
+                branch_prediction::btb_pred::BtbpTraceEvent::DecodeBranch;
+            branch_event.threadId = tid;
+            branch_event.branchPc = inst->getPC();
+            if (cpu->isTraceMode() && inst->hasTraceBranchInfo()) {
+                branch_event.target = inst->traceBranchNextPC();
+                branch_event.takenHint = inst->traceBranchTaken();
+            } else {
+                std::unique_ptr<PCStateBase> target = inst->branchTarget();
+                branch_event.target =
+                    target->as<RiscvISA::PCState>().instAddr();
+                branch_event.takenHint =
+                    inst->isUncondCtrl() || inst->readPredTaken();
+            }
+            branch_event.wasInBtbAtLookup = inst->readPredTaken();
+            cpu->notifyBtbpTrace(branch_event);
+        }
+
         // Ensure that if it was predicted as a branch, it really is a
         // branch.
         if (inst->readPredTaken() && !inst->isControl()) {

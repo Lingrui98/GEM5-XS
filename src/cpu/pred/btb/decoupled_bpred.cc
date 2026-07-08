@@ -161,6 +161,19 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     });
 }
 
+void
+DecoupledBPUWithBTB::setCpu(CPU *_cpu)
+{
+    cpu = _cpu;
+    for (auto *component : components) {
+        component->setBtbpTraceNotify([this](const BtbpTraceEvent &event) {
+            if (cpu) {
+                cpu->notifyBtbpTrace(event);
+            }
+        });
+    }
+}
+
 bool
 DecoupledBPUWithBTB::ftqPeek(ThreadID tid, int offset,
                              const FetchTarget *&out) const
