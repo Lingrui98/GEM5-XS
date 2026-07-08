@@ -334,11 +334,71 @@ CPU::regProbePoints()
     ppDataAccessComplete = new ProbePointArg<
         std::pair<DynInstPtr, PacketPtr>>(
                 getProbeManager(), "DataAccessComplete");
+    ppBtbpTraceBtbLookup =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceBtbLookup");
+    ppBtbpTraceBtbFill =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceBtbFill");
+    ppBtbpTraceIPrefetchIssue =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceIPrefetchIssue");
+    ppBtbpTraceIPrefetchFill =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceIPrefetchFill");
+    ppBtbpTraceIcacheDemandFill =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceIcacheDemandFill");
+    ppBtbpTraceDecodeBranch =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceDecodeBranch");
 
     fetch.regProbePoints();
     rename.regProbePoints();
     iew.regProbePoints();
     commit.regProbePoints();
+}
+
+void
+CPU::notifyBtbpTrace(
+    const branch_prediction::btb_pred::BtbpTraceEvent &event)
+{
+    using Event = branch_prediction::btb_pred::BtbpTraceEvent;
+
+    switch (event.eventType) {
+      case Event::BtbLookup:
+        if (ppBtbpTraceBtbLookup) {
+            ppBtbpTraceBtbLookup->notify(event);
+        }
+        break;
+      case Event::BtbFill:
+        if (ppBtbpTraceBtbFill) {
+            ppBtbpTraceBtbFill->notify(event);
+        }
+        break;
+      case Event::IPrefetchIssue:
+        if (ppBtbpTraceIPrefetchIssue) {
+            ppBtbpTraceIPrefetchIssue->notify(event);
+        }
+        break;
+      case Event::IPrefetchFill:
+        if (ppBtbpTraceIPrefetchFill) {
+            ppBtbpTraceIPrefetchFill->notify(event);
+        }
+        break;
+      case Event::IcacheDemandFill:
+        if (ppBtbpTraceIcacheDemandFill) {
+            ppBtbpTraceIcacheDemandFill->notify(event);
+        }
+        break;
+      case Event::DecodeBranch:
+        if (ppBtbpTraceDecodeBranch) {
+            ppBtbpTraceDecodeBranch->notify(event);
+        }
+        break;
+      default:
+        break;
+    }
 }
 
 CPU::CPUStats::CPUStats(CPU *cpu)
