@@ -383,7 +383,7 @@ class DecoupledBPUWithBTB : public BPredUnit
         panic("Squashing decoupled BP with tightly coupled API\n");
     }
 
-    void setCpu(CPU *_cpu) { cpu = _cpu; }
+    void setCpu(CPU *_cpu);
     uint8_t getThreadAsidHash(ThreadID tid) const;
 
     void consumeFetchTarget(unsigned fetched_inst_num, ThreadID tid);

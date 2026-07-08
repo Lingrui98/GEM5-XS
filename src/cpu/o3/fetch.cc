@@ -891,6 +891,16 @@ Fetch::issueFdipReadyLine(ThreadID tid, unsigned lineIndex,
     ++fetchStats.fdipIssuedLines;
     noteFdipIssuedLine(tid, state.ftqId, line.physLineAddr);
     ++fdipOutstandingLines;
+
+    branch_prediction::btb_pred::BtbpTraceEvent issue_event;
+    issue_event.tick = curTick();
+    issue_event.eventType =
+        branch_prediction::btb_pred::BtbpTraceEvent::IPrefetchIssue;
+    issue_event.threadId = tid;
+    issue_event.lineAddr = line.physLineAddr;
+    issue_event.triggerPc = state.startPC;
+    cpu->notifyBtbpTrace(issue_event);
+
     if (fdipOutstandingLines > fetchStats.fdipOutstandingMax.value()) {
         fetchStats.fdipOutstandingMax = fdipOutstandingLines;
     }

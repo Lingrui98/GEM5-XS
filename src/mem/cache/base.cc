@@ -2471,6 +2471,43 @@ BaseCache::handleFill(PacketPtr pkt, CacheBlk *blk, PacketList &writebacks,
     if (isL1I() && isFdipSource(pkt->req->getPFSource())) {
         stats.fdipInstalled++;
     }
+    if (isL1I() && pkt->req && pkt->req->isInstFetch()) {
+        ContextID context_id = pkt->req->contextId();
+        o3::CPU *cpu = nullptr;
+        ThreadID tid = 0;
+        if (context_id >= 0 && context_id < system->threads.size()) {
+            ThreadContext *thread_context = system->threads[context_id];
+            if (thread_context) {
+                cpu = dynamic_cast<o3::CPU *>(thread_context->getCpuPtr());
+                if (cpu) {
+                    tid = cpu->contextToThread(context_id);
+                }
+            }
+        }
+
+        if (cpu) {
+            branch_prediction::btb_pred::BtbpTraceEvent fill_event;
+            fill_event.tick = curTick();
+            fill_event.threadId = tid;
+            fill_event.lineAddr = addr;
+            if (isFdipSource(pkt->req->getPFSource())) {
+                fill_event.eventType = branch_prediction::btb_pred::
+                    BtbpTraceEvent::IPrefetchFill;
+                if (pkt->req->hasXsMetadata()) {
+                    fill_event.triggerPc =
+                        pkt->req->getXsMetadata().fdipStartPC;
+                }
+            } else if (!pkt->req->isPrefetch()) {
+                fill_event.eventType = branch_prediction::btb_pred::
+                    BtbpTraceEvent::IcacheDemandFill;
+                fill_event.triggerPc = pkt->req->getPC();
+            }
+
+            if (fill_event.eventType != 0) {
+                cpu->notifyBtbpTrace(fill_event);
+            }
+        }
+    }
     DPRINTF(Cache, "%s: Mark blk as prefetched by source %i, form req %p\n", __func__,
             pkt->req->getPFSource(), pkt->req);
 
