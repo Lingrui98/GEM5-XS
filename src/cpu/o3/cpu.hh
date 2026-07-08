@@ -69,6 +69,7 @@
 #include "cpu/o3/rob.hh"
 #include "cpu/o3/scoreboard.hh"
 #include "cpu/o3/thread_state.hh"
+#include "cpu/pred/btb/probe/btbp_trace_event.hh"
 #include "cpu/simple_thread.hh"
 #include "cpu/timebuf.hh"
 #include "cpu/valuepred/valuepred_unit.hh"
@@ -193,9 +194,24 @@ class CPU : public BaseCPU
 
     ProbePointArg<PacketPtr> *ppInstAccessComplete;
     ProbePointArg<std::pair<DynInstPtr, PacketPtr> > *ppDataAccessComplete;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceBtbLookup = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceBtbFill = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceIPrefetchIssue = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceIPrefetchFill = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceIcacheDemandFill = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceDecodeBranch = nullptr;
 
     /** Register probe points. */
     void regProbePoints() override;
+
+    void notifyBtbpTrace(
+        const branch_prediction::btb_pred::BtbpTraceEvent &event);
 
     void
     demapPage(Addr vaddr, uint64_t asn)

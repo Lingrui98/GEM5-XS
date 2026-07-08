@@ -1,0 +1,28 @@
+syntax = "proto2";
+
+package ProtoMessage;
+
+// Event type:
+// 1=btb_lookup, 2=btb_fill, 3=iprefetch_issue, 4=iprefetch_fill,
+// 5=icache_demand_fill, 6=decode_branch
+//
+// BTB level:
+// 0=uBTB, 1=AheadBTB, 2=mBTB
+//
+// Fill source:
+// 0=decode_writeback, 1=oracle_scan, 2=prefetch_scan, 3=exec_writeback,
+// 4=coherence_evict
+message BtbpTraceEntry {
+  required uint64 tick = 1;
+  required uint32 event_type = 2;
+  optional uint32 thread_id = 3;
+  optional uint64 branch_pc = 4;
+  optional uint32 btb_level = 5;
+  optional bool hit = 6;
+  optional uint64 target = 7;
+  optional uint32 fill_source = 8;
+  optional uint64 line_addr = 9;
+  optional uint64 trigger_pc = 10;
+  optional bool taken_hint = 11;
+  optional bool was_in_btb_at_lookup = 12;
+}
