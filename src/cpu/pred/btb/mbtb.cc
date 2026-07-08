@@ -107,7 +107,7 @@ MBTB::MBTB(const Params &p)
     sram1.resize(numSets);
     mru0.resize(numSets);
     mru1.resize(numSets);
-    
+
     // Initialize SRAM0
     for (unsigned i = 0; i < numSets; ++i) {
         auto &set = sram0[i];
@@ -119,7 +119,7 @@ MBTB::MBTB(const Params &p)
         }
         std::make_heap(mru0[i].begin(), mru0[i].end(), older());
     }
-    
+
     // Initialize SRAM1
     for (unsigned i = 0; i < numSets; ++i) {
         auto &set = sram1[i];
@@ -195,13 +195,13 @@ std::vector<MBTB::TickedBTBEntry>
 MBTB::processEntries(const std::vector<TickedBTBEntry>& entries, Addr startAddr)
 {
     auto processed_entries = entries;
-    
+
     // Sort by instruction order
-    std::sort(processed_entries.begin(), processed_entries.end(), 
+    std::sort(processed_entries.begin(), processed_entries.end(),
              [](const BTBEntry &a, const BTBEntry &b) {
                  return a.pc < b.pc;
              });
-    
+
     // Remove entries before the start PC
     auto it = std::remove_if(processed_entries.begin(), processed_entries.end(),
                            [startAddr](const BTBEntry &e) {
@@ -383,7 +383,7 @@ MBTB::putPCHistory(Addr startAddr,
 
     // Fill predictions for each pipeline stage
     fillStagePredictions(processed_entries, stagePreds);
-    
+
     // Update metadata for later stages
     updatePredictionMeta(processed_entries, stagePreds);
 }
@@ -453,7 +453,7 @@ MBTB::lookupSingleBlock(Addr block_pc, ThreadID tid, uint8_t asidHash)
     Addr current_tag = getTag(block_pc, asidHash);
     DPRINTF(BTB, "BTB: Doing tag comparison for SRAM%d index 0x%lx tag %#lx\n",
         sram_id, btb_idx, current_tag);
-        
+
     for (auto &way : btb_set) {
         if (way.valid && way.tag == current_tag) {
             res.push_back(way);
@@ -607,7 +607,7 @@ MBTB::updateBTBEntry(
     int sram_id = getSRAMId(alignedPC);
     auto& target_sram = (sram_id == 0) ? sram0 : sram1;
     auto& target_mru = (sram_id == 0) ? mru0 : mru1;
-    
+
     // Calculate index and tag for this entry
     Addr btb_idx = getIndex(entry.pc, stream.asidHash, stream.tid);
 
@@ -643,16 +643,39 @@ MBTB::updateBTBEntry(
         entry, actual_taken, actual_target, existing_ptr, stream);
     auto ticked_entry = TickedBTBEntry(entry_to_write, curTick());
 
+#ifndef UNIT_TEST
+    auto notify_fill = [&]() {
+        BtbpTraceEvent fill_event;
+        fill_event.tick = curTick();
+        fill_event.eventType = BtbpTraceEvent::BtbFill;
+        fill_event.threadId = stream.tid;
+        fill_event.branchPc = ticked_entry.pc;
+        fill_event.btbLevel = BtbpTraceEvent::MBTB;
+        fill_event.target = ticked_entry.target;
+        fill_event.fillSource = BtbpTraceEvent::ExecWriteback;
+        notifyBtbpTrace(fill_event);
+    };
+#endif
+
     if (found) {
         // Update in-place in SRAM set
         updateExistingInSRAMSet(btb_idx, target_mru[btb_idx], it, ticked_entry);
+#ifndef UNIT_TEST
+        notify_fill();
+#endif
     } else if (found_in_vc) {
         // In-place update in victim cache to avoid ping-ponging between MBTB and VC
         commitToVictimCache(vc_idx, ticked_entry);
+#ifndef UNIT_TEST
+        notify_fill();
+#endif
         return;
     } else {
         // Not found anywhere, replace oldest in SRAM set
         replaceOldestInSRAMSet(sram_id, btb_idx, target_mru[btb_idx], ticked_entry);
+#ifndef UNIT_TEST
+        notify_fill();
+#endif
     }
 }
 

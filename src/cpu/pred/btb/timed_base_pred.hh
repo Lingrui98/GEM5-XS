@@ -1,6 +1,8 @@
 #ifndef __CPU_PRED_BTB_TIMED_BASE_PRED_HH__
 #define __CPU_PRED_BTB_TIMED_BASE_PRED_HH__
 
+#include <functional>
+#include <utility>
 
 #include <boost/dynamic_bitset.hpp>
 

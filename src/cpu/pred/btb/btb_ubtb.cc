@@ -196,6 +196,16 @@ UBTB::putPCHistory(Addr startAddr, const boost::dynamic_bitset<> &history, std::
 
     PredStatistics(entry, startAddr);
 
+    BtbpTraceEvent lookup_event;
+    lookup_event.tick = curTick();
+    lookup_event.eventType = BtbpTraceEvent::BtbLookup;
+    lookup_event.threadId = stagePreds.empty() ? 0 : stagePreds.front().tid;
+    lookup_event.branchPc = entry.valid ? entry.pc : startAddr;
+    lookup_event.btbLevel = BtbpTraceEvent::UBTB;
+    lookup_event.hit = entry.valid;
+    lookup_event.target = entry.valid ? entry.target : 0;
+    notifyBtbpTrace(lookup_event);
+
     // Fill predictions for each pipeline stage
     fillStagePredictions(entry, stagePreds);
 
@@ -282,7 +292,7 @@ UBTB::lookupNoSideEffect(Addr startAddr, ThreadID tid,
 
 void
 UBTB::replaceOldEntry(UBTBIter oldEntryIter, const BTBEntry &newTakenEntry,
-                      Addr startAddr, uint8_t asidHash)
+                      Addr startAddr, uint8_t asidHash, ThreadID tid)
 {
     assert(newTakenEntry.valid);
     TickedUBTBEntry newEntry = TickedUBTBEntry(newTakenEntry, curTick());
@@ -292,6 +302,16 @@ UBTB::replaceOldEntry(UBTBIter oldEntryIter, const BTBEntry &newTakenEntry,
     // important: update tag (mbtb and ubtb have different tags, even diffferent tag length)
     newEntry.tag = getTag(startAddr, asidHash);
     *oldEntryIter = newEntry;
+
+    BtbpTraceEvent fill_event;
+    fill_event.tick = curTick();
+    fill_event.eventType = BtbpTraceEvent::BtbFill;
+    fill_event.threadId = tid;
+    fill_event.branchPc = newEntry.pc;
+    fill_event.btbLevel = BtbpTraceEvent::UBTB;
+    fill_event.target = newEntry.target;
+    fill_event.fillSource = BtbpTraceEvent::ExecWriteback;
+    notifyBtbpTrace(fill_event);
 }
 
 
@@ -365,7 +385,8 @@ void UBTB::updateNewEntry(UBTBIter oldEntryIter, const BTBEntry &takenEntry,
             }
 
             // Replace the entry with the new prediction
-            replaceOldEntry(toBeReplacedIter, takenEntry, startAddr, asidHash);
+            replaceOldEntry(toBeReplacedIter, takenEntry, startAddr, asidHash,
+                            tid);
 
         } else if (oldEntryIter != ubtb.end() && takenEntry.valid) {
             ubtbStats.s1Hits3Taken++;
@@ -375,7 +396,8 @@ void UBTB::updateNewEntry(UBTBIter oldEntryIter, const BTBEntry &takenEntry,
                 updateUCtr(oldEntryIter->uctr, false);
                 if (oldEntryIter->uctr == 0) {
                     // replace the old entry with the new one
-                    replaceOldEntry(oldEntryIter, takenEntry, startAddr, asidHash);
+                    replaceOldEntry(oldEntryIter, takenEntry, startAddr,
+                                    asidHash, tid);
                 }
             } else {
                 // S0 and S3 predict the same (brpc and target)

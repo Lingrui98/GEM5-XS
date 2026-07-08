@@ -606,11 +606,13 @@ void
 DecoupledBPUWithBTB::setCpu(CPU *_cpu)
 {
     cpu = _cpu;
-    mbtb->setBtbpTraceNotify([this](const BtbpTraceEvent &event) {
-        if (cpu) {
-            cpu->notifyBtbpTrace(event);
-        }
-    });
+    for (auto *component : components) {
+        component->setBtbpTraceNotify([this](const BtbpTraceEvent &event) {
+            if (cpu) {
+                cpu->notifyBtbpTrace(event);
+            }
+        });
+    }
 }
 
 void
