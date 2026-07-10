@@ -81,6 +81,13 @@ buildKey(Addr vpn, uint16_t asid, uint8_t translateMode)
            ((vpn >> PGSHFT) & (((uint64_t)1 << 46) - 1));
 }
 
+static unsigned
+l2SpPrefixWidth(int level)
+{
+    return TlbEntryTrie::MaxBits -
+           (PageShift + level * LEVEL_BITS) + PGSHFT;
+}
+
 TLB::TLB(const Params &p) :
     BaseTLB(p), is_dtlb(p.is_dtlb),is_L1tlb(p.is_L1tlb),isStage2(p.is_stage2),
     isTheSharedL2(p.is_the_sharedL2),size(p.size),sizeBack(32),
@@ -556,7 +563,9 @@ TLB::lookupL2TLB(Addr vpn, uint16_t asid, BaseMMU::Mode mode, bool hidden, int f
     }
     if (f_level == L_L2sp3) {
         DPRINTF(TLB, "look up l2tlb in l2sp3\n");
-        TlbEntry *entry_l2sp3 = trieL2sp.lookup(buildKey(f_vpnl2l3, asid, translateMode));
+        TlbEntry *entry_l2sp3 = trieL2sp.lookupExact(
+            buildKey(f_vpnl2l3, asid, translateMode),
+            l2SpPrefixWidth(L2L3CheckLevel));
         entry_l2 = entry_l2sp3;
         step = 0x1ll << (PageShift + 3 * LEVEL_BITS);
         if (entry_l2sp3) {
@@ -574,7 +583,9 @@ TLB::lookupL2TLB(Addr vpn, uint16_t asid, BaseMMU::Mode mode, bool hidden, int f
     }
     if (f_level == L_L2sp2) {
         DPRINTF(TLB, "look up l2tlb in l2sp2\n");
-        TlbEntry *entry_l2sp2 = trieL2sp.lookup(buildKey(f_vpnl2l2, asid, translateMode));
+        TlbEntry *entry_l2sp2 = trieL2sp.lookupExact(
+            buildKey(f_vpnl2l2, asid, translateMode),
+            l2SpPrefixWidth(L2L2CheckLevel));
         entry_l2 = entry_l2sp2;
         step = 0x1ll << (PageShift + 2 * LEVEL_BITS);
         if (entry_l2sp2) {
@@ -592,7 +603,9 @@ TLB::lookupL2TLB(Addr vpn, uint16_t asid, BaseMMU::Mode mode, bool hidden, int f
     }
     if (f_level == L_L2sp1) {
         DPRINTF(TLB, "look up l2tlb in l2sp1\n");
-        TlbEntry *entry_l2sp1 = trieL2sp.lookup(buildKey(f_vpnl2l1, asid, translateMode));
+        TlbEntry *entry_l2sp1 = trieL2sp.lookupExact(
+            buildKey(f_vpnl2l1, asid, translateMode),
+            l2SpPrefixWidth(L2L1CheckLevel));
         entry_l2 = entry_l2sp1;
         step = 0x1ll << (PageShift + LEVEL_BITS);
         if (entry_l2sp1) {
