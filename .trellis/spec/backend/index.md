@@ -29,6 +29,7 @@ of:
 | [Control-PC Contracts](./control-pc-contracts.md) | Executable contracts for decoder/fetch/predictor PC semantics and inherited predictor params | Ready |
 | [FDIP Guidelines](./fdip-guidelines.md) | Executable contracts for the current FTQ-directed ICache prefetch model, parameters, stats, and cleanup semantics | Ready |
 | [Trace Mode Contracts](./trace-mode-contracts.md) | Executable contracts for synthetic instructions vs trace-aware control-flow/BPU training semantics | Ready |
+| [SWAY Phase-Stream Contracts](./sway-phase-stream-contract.md) | Executable contracts for baseline-safe phase counters, warmup/reset segmentation, validation, and open-loop beta replay | Ready |
 | [Error Handling](./error-handling.md) | Runtime checks, fatal paths, warnings, and assertions | Ready |
 | [Quality Guidelines](./quality-guidelines.md) | Build/test expectations, hooks, and review checklist | Ready |
 | [Logging Guidelines](./logging-guidelines.md) | Debug flags, `warn`/`inform`, and what to emit | Ready |
@@ -49,6 +50,9 @@ Read these before changing code:
 - Read [Trace Mode Contracts](./trace-mode-contracts.md) before changing
   trace-driven branch metadata, synthetic instruction generation, trace-mode
   squash/redirect behavior, or trace-mode BPU update/classification paths.
+- Read [SWAY Phase-Stream Contracts](./sway-phase-stream-contract.md) before
+  changing SWAY phase counters, warmup/reset segmentation, the raw CSV schema,
+  Stage 3 runners/validators, or open-loop beta replay.
 - Read [FDIP Guidelines](./fdip-guidelines.md) before changing FDIP knobs,
   fetch-side FDIP lifecycle/state, old-path refill drop, recent-unused
   suppression, or FDIP-related stats.
