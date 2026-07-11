@@ -154,6 +154,7 @@ class BTBTAGE : public TimedBaseBTBPredictor
 
 #ifndef UNIT_TEST
     BTBTAGE(const Params& p);
+    void preDumpStats() override;
 #endif
     ~BTBTAGE();
 
@@ -323,6 +324,7 @@ class BTBTAGE : public TimedBaseBTBPredictor
     uint64_t swayUpdateMispredCount() const;
     uint64_t swayUpdateFilteredEntriesCount() const;
     uint64_t swayUpdateTableMispredCount(unsigned table);
+    void sampleStage2OccupancyStats();
     unsigned swayNumPredictorTables() const { return numPredictors; }
 
 #ifdef UNIT_TEST
@@ -519,6 +521,11 @@ class BTBTAGE : public TimedBaseBTBPredictor
         Distribution updateTableHits;
 
         Vector updateTableMispreds;
+        Vector perTableUpdates;
+        Vector perTableAllocSuccess;
+        Vector perTableEvicts;
+        Vector activeEntriesPerTable;
+        Vector totalEntriesPerTable;
         Vector predFinalSourceTable;
         Vector updateFinalSourceTableCorrect;
         Vector updateFinalSourceTableWrong;

@@ -107,9 +107,18 @@ class MBTB : public TimedBaseBTBPredictor
     typedef struct TickedBTBEntry : public BTBEntry
     {
         uint64_t tick;  // timestamp for MRU replacement
+        uint8_t sourceSram;
+        uint8_t sourceWay;
         TickedBTBEntry(const BTBEntry &entry, uint64_t tick)
-            : BTBEntry(entry), tick(tick) {}
-        TickedBTBEntry() : tick(0) {}
+            : BTBEntry(entry), tick(tick),
+              sourceSram(sway::InvalidIndex), sourceWay(sway::InvalidIndex) {}
+        TickedBTBEntry(const BTBEntry &entry, uint64_t tick,
+                       uint8_t sourceSram, uint8_t sourceWay)
+            : BTBEntry(entry), tick(tick),
+              sourceSram(sourceSram), sourceWay(sourceWay) {}
+        TickedBTBEntry() : tick(0),
+                           sourceSram(sway::InvalidIndex),
+                           sourceWay(sway::InvalidIndex) {}
     }TickedBTBEntry;
 
     // A BTB set is a vector of entries (ways)
@@ -124,6 +133,8 @@ class MBTB : public TimedBaseBTBPredictor
     uint64_t curTick() { return tick++; }
 #else
     // Production methods
+    void preDumpStats() override;
+
     void tickStart() override;
 
     void tick() override;
@@ -418,10 +429,13 @@ class MBTB : public TimedBaseBTBPredictor
     };
     std::array<TightSlotPhaseSnapshot, sway::NumMbtbTightSlots>
     collectSwayMbtbTightSlotVisitCounts() const;
+    void sampleStage2OccupancyStats();
     uint64_t swayPredMissCount() const;
     uint64_t swayPredHitCount() const;
     uint64_t swayCondMissCount() const;
     uint64_t swayCondHitCount() const;
+    uint64_t getPredHitsPerWay(unsigned bank, unsigned way);
+    uint64_t getPredMissesPerWay(unsigned bank, unsigned way);
 
     void setSwayReallocEnabled(bool enabled);
     unsigned countSwayOwnedWays(uint8_t owner) const;
@@ -487,6 +501,7 @@ class MBTB : public TimedBaseBTBPredictor
     };
 
     using Scalar = test_stats::Scalar;
+    using Vector = test_stats::Vector;
     using Distribution = test_stats::Distribution;
 
 #ifdef UNIT_TEST
@@ -502,6 +517,11 @@ public:
         Scalar predMiss;
         Scalar predHit;
         Scalar predHitNum;
+        Vector predHitsPerWay;
+        Vector predMissesPerWay;
+        Vector predEvictsPerWay;
+        Vector activeEntriesPerWay;
+        Scalar totalEntriesPerBank;
         Scalar updateMiss;
         Scalar updateHit;
         Scalar updateExisting;
@@ -551,6 +571,13 @@ public:
 #endif
         void init(int numWays);
     } btbStats;
+
+    unsigned stage2WayStatIndex(unsigned bank, unsigned way) const
+    {
+        return bank * numWays + way;
+    }
+    void recordPredHitPerWay(const TickedBTBEntry &entry);
+    void recordPredEvictPerWay(unsigned bank, unsigned way);
 
 };
 

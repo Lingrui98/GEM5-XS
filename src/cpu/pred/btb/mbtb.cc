@@ -162,6 +162,15 @@ MBTB::MBTB(const Params &p)
 #endif
 }
 
+#ifndef UNIT_TEST
+void
+MBTB::preDumpStats()
+{
+    statistics::Group::preDumpStats();
+    sampleStage2OccupancyStats();
+}
+#endif
+
 void
 MBTB::setSwayReallocEnabled(bool enabled)
 {
@@ -334,6 +343,49 @@ MBTB::collectSwayMbtbTightSlotVisitCounts() const
     return out;
 }
 
+void
+MBTB::sampleStage2OccupancyStats()
+{
+    btbStats.totalEntriesPerBank =
+        static_cast<uint64_t>(numSets) * numWays;
+
+    auto sampleBank = [&](unsigned bank, const std::vector<BTBSet> &sram) {
+        for (unsigned way = 0; way < numWays; ++way) {
+            uint64_t validEntries = 0;
+            for (unsigned set = 0; set < numSets; ++set) {
+                if (set < sram.size() && way < sram[set].size() &&
+                    sram[set][way].valid) {
+                    ++validEntries;
+                }
+            }
+            btbStats.activeEntriesPerWay[stage2WayStatIndex(bank, way)] =
+                validEntries;
+        }
+    };
+
+    sampleBank(0, sram0);
+    sampleBank(1, sram1);
+}
+
+void
+MBTB::recordPredHitPerWay(const TickedBTBEntry &entry)
+{
+    if (entry.sourceSram >= 2 || entry.sourceWay >= numWays) {
+        return;
+    }
+    btbStats.predHitsPerWay[stage2WayStatIndex(entry.sourceSram,
+                                               entry.sourceWay)]++;
+}
+
+void
+MBTB::recordPredEvictPerWay(unsigned bank, unsigned way)
+{
+    if (bank >= 2 || way >= numWays) {
+        return;
+    }
+    btbStats.predEvictsPerWay[stage2WayStatIndex(bank, way)]++;
+}
+
 uint64_t
 MBTB::swayPredMissCount() const
 {
@@ -371,6 +423,32 @@ MBTB::swayCondHitCount() const
     return btbStats.condHits;
 #else
     return btbStats.condHits.value();
+#endif
+}
+
+uint64_t
+MBTB::getPredHitsPerWay(unsigned bank, unsigned way)
+{
+    if (bank >= 2 || way >= numWays) {
+        return 0;
+    }
+#ifdef UNIT_TEST
+    return btbStats.predHitsPerWay[stage2WayStatIndex(bank, way)];
+#else
+    return btbStats.predHitsPerWay[stage2WayStatIndex(bank, way)].value();
+#endif
+}
+
+uint64_t
+MBTB::getPredMissesPerWay(unsigned bank, unsigned way)
+{
+    if (bank >= 2 || way >= numWays) {
+        return 0;
+    }
+#ifdef UNIT_TEST
+    return btbStats.predMissesPerWay[stage2WayStatIndex(bank, way)];
+#else
+    return btbStats.predMissesPerWay[stage2WayStatIndex(bank, way)].value();
 #endif
 }
 
@@ -521,6 +599,7 @@ MBTB::processEntries(const std::vector<TickedBTBEntry>& entries, Addr startAddr)
         btbStats.predHitNum += hitNum;
         btbStats.predHitCount.sample(hitNum);
         for (auto &entry: processed_entries) {
+            recordPredHitPerWay(entry);
             printTickedBTBEntry(entry);
         }
     } else {
@@ -653,7 +732,8 @@ MBTB::lookupSingleBlock(Addr block_pc, uint8_t asidHash)
             continue;
         }
         if (way.valid && way.tag == current_tag) {
-            res.push_back(way);
+            res.emplace_back(way, way.tick, static_cast<uint8_t>(sram_id),
+                             static_cast<uint8_t>(way_idx));
             way.tick = curTick(); // Update timestamp for MRU
             std::make_heap(target_mru[btb_idx].begin(), target_mru[btb_idx].end(), older());
             // SWAY: record per-way demand inside this phase.
@@ -669,7 +749,7 @@ MBTB::lookupSingleBlock(Addr block_pc, uint8_t asidHash)
         for (unsigned way = 0; way < extra_set.size(); ++way) {
             auto &entry = extra_set[way];
             if (entry.valid && entry.tag == current_tag) {
-                res.push_back(entry);
+                res.emplace_back(entry, entry.tick);
                 entry.tick = curTick();
                 if (btb_idx < extra_visit.size() &&
                     way < extra_visit[btb_idx].size()) {
@@ -885,6 +965,7 @@ MBTB::updateBTBEntrySway(const BTBEntry& entry, const FetchTarget &stream)
         auto &victim = target_sram[btb_idx][victim_way];
         if (victim.valid) {
             btbStats.updateReplaceValidOne++;
+            recordPredEvictPerWay(static_cast<unsigned>(sram_id), victim_way);
             insertVictimCache(victim);
         }
         victim = ticked_entry;
@@ -1162,6 +1243,9 @@ MBTB::replaceOldestInSRAMSet(int sram_id,
     // put the oldest entry in this set to the back of heap
     std::pop_heap(heap.begin(), heap.end(), older());
     const auto& entry_in_btb_now = heap.back();
+    auto &target_set = (sram_id == 0 ? sram0 : sram1)[btb_idx];
+    const unsigned victim_way =
+        static_cast<unsigned>(entry_in_btb_now - target_set.begin());
 #ifndef UNIT_TEST
     if (enableDB) {
         BTBTrace rec;
@@ -1174,6 +1258,7 @@ MBTB::replaceOldestInSRAMSet(int sram_id,
         // if all ways are really occupied, we need to replace valid entry
         // means 32B block is more than 4ways/ 4 branches
         btbStats.updateReplaceValidOne++;
+        recordPredEvictPerWay(static_cast<unsigned>(sram_id), victim_way);
 
         // Insert evicted entry into victim cache
         insertVictimCache(*entry_in_btb_now);
@@ -1450,6 +1535,16 @@ MBTB::BTBStats::BTBStats(statistics::Group* parent, int numWays) :
     ADD_STAT(predMiss, statistics::units::Count::get(), "misses encountered on prediction"),
     ADD_STAT(predHit, statistics::units::Count::get(), "hits encountered on prediction"),
     ADD_STAT(predHitNum, statistics::units::Count::get(), "number of hits encountered on prediction"),
+    ADD_STAT(predHitsPerWay, statistics::units::Count::get(),
+        "prediction hits grouped by MBTB bank and way"),
+    ADD_STAT(predMissesPerWay, statistics::units::Count::get(),
+        "reserved per-way miss counter; MBTB misses have no defined way"),
+    ADD_STAT(predEvictsPerWay, statistics::units::Count::get(),
+        "valid native MBTB entries evicted, grouped by bank and way"),
+    ADD_STAT(activeEntriesPerWay, statistics::units::Count::get(),
+        "valid native MBTB entries in each bank and way at the latest phase sample"),
+    ADD_STAT(totalEntriesPerBank, statistics::units::Count::get(),
+        "total native MBTB entries per bank"),
     ADD_STAT(updateMiss, statistics::units::Count::get(), "misses encountered on update"),
     ADD_STAT(updateHit, statistics::units::Count::get(), "hits encountered on update"),
     ADD_STAT(updateExisting, statistics::units::Count::get(), "existing entries updated"),
@@ -1495,6 +1590,24 @@ void
 MBTB::BTBStats::init(int numWays)
 {
     predHitCount.init(0, numWays * 2, 1);
+    const int entries = numWays * 2;
+    predHitsPerWay.init(entries);
+    predMissesPerWay.init(entries);
+    predEvictsPerWay.init(entries);
+    activeEntriesPerWay.init(entries);
+#ifndef UNIT_TEST
+    for (int bank = 0; bank < 2; ++bank) {
+        for (int way = 0; way < numWays; ++way) {
+            const int idx = bank * numWays + way;
+            const std::string name = "bank" + std::to_string(bank) +
+                "_way" + std::to_string(way);
+            predHitsPerWay.subname(idx, name);
+            predMissesPerWay.subname(idx, name);
+            predEvictsPerWay.subname(idx, name);
+            activeEntriesPerWay.subname(idx, name);
+        }
+    }
+#endif
 }
 
 // Close conditional namespace wrapper for testing
