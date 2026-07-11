@@ -150,6 +150,8 @@ MBTB::MBTB(const Params &p)
     // SWAY per-way visit counters, mirror sram0/sram1 shape.
     wayVisit0.assign(numSets, std::vector<uint32_t>(numWays, 0));
     wayVisit1.assign(numSets, std::vector<uint32_t>(numWays, 0));
+    swayPhaseHitsPerWay.assign(2 * numWays, 0);
+    swayPhaseEvictsPerWay.assign(2 * numWays, 0);
     swayOwner0.assign(numWays, sway::MbtbSram0);
     swayOwner1.assign(numWays, sway::MbtbSram1);
     swayExtra0.resize(numSets);
@@ -372,6 +374,61 @@ MBTB::sampleStage2OccupancyStats()
     sampleBank(1, sram1);
 }
 
+std::vector<sway::PhaseCounterSnapshot>
+MBTB::collectAndResetSwayPhaseCounters()
+{
+    std::vector<sway::PhaseCounterSnapshot> out;
+    out.reserve(2 * numWays + 1);
+
+    uint64_t totalResident = 0;
+    uint64_t totalEvicts = 0;
+    auto appendBank = [&](unsigned bank, const std::vector<BTBSet> &sram) {
+        for (unsigned way = 0; way < numWays; ++way) {
+            const unsigned counterIndex = stage2WayStatIndex(bank, way);
+            uint64_t resident = 0;
+            for (unsigned set = 0; set < numSets; ++set) {
+                resident += sram[set][way].valid;
+            }
+            out.push_back({
+                "MBTB",
+                "mbtb_bank" + std::to_string(bank) + "_way" +
+                    std::to_string(way),
+                "way",
+                swayPhaseHitsPerWay[counterIndex],
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                swayPhaseEvictsPerWay[counterIndex],
+                resident,
+                numSets,
+            });
+            totalResident += resident;
+            totalEvicts += swayPhaseEvictsPerWay[counterIndex];
+        }
+    };
+
+    appendBank(0, sram0);
+    appendBank(1, sram1);
+    out.push_back({
+        "MBTB",
+        "mbtb_all",
+        "component",
+        swayPhasePredHits,
+        swayPhasePredMisses,
+        std::nullopt,
+        std::nullopt,
+        totalEvicts,
+        totalResident,
+        static_cast<uint64_t>(2) * numSets * numWays,
+    });
+
+    std::fill(swayPhaseHitsPerWay.begin(), swayPhaseHitsPerWay.end(), 0);
+    std::fill(swayPhaseEvictsPerWay.begin(), swayPhaseEvictsPerWay.end(), 0);
+    swayPhasePredHits = 0;
+    swayPhasePredMisses = 0;
+    return out;
+}
+
 void
 MBTB::recordPredHitPerWay(const TickedBTBEntry &entry)
 {
@@ -380,6 +437,8 @@ MBTB::recordPredHitPerWay(const TickedBTBEntry &entry)
     }
     btbStats.predHitsPerWay[stage2WayStatIndex(entry.sourceSram,
                                                entry.sourceWay)]++;
+    swayPhaseHitsPerWay[stage2WayStatIndex(entry.sourceSram,
+                                           entry.sourceWay)]++;
 }
 
 void
@@ -389,6 +448,7 @@ MBTB::recordPredEvictPerWay(unsigned bank, unsigned way)
         return;
     }
     btbStats.predEvictsPerWay[stage2WayStatIndex(bank, way)]++;
+    swayPhaseEvictsPerWay[stage2WayStatIndex(bank, way)]++;
 }
 
 uint64_t
@@ -601,6 +661,7 @@ MBTB::processEntries(const std::vector<TickedBTBEntry>& entries, Addr startAddr)
     if (hit) {
         DPRINTF(BTB, "BTB: lookup hit, dumping hit entry\n");
         btbStats.predHit++;
+        swayPhasePredHits++;
         btbStats.predHitNum += hitNum;
         btbStats.predHitCount.sample(hitNum);
         for (auto &entry: processed_entries) {
@@ -609,6 +670,7 @@ MBTB::processEntries(const std::vector<TickedBTBEntry>& entries, Addr startAddr)
         }
     } else {
         btbStats.predMiss++;
+        swayPhasePredMisses++;
         DPRINTF(BTB, "BTB: lookup miss\n");
     }
     return processed_entries;

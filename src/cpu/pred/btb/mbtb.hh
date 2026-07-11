@@ -455,6 +455,8 @@ class MBTB : public TimedBaseBTBPredictor
     };
     std::array<TightSlotPhaseSnapshot, sway::NumMbtbTightSlots>
     collectSwayMbtbTightSlotVisitCounts() const;
+    std::vector<sway::PhaseCounterSnapshot>
+    collectAndResetSwayPhaseCounters();
     void sampleStage2OccupancyStats();
     uint64_t swayPredMissCount() const;
     uint64_t swayPredHitCount() const;
@@ -510,6 +512,10 @@ class MBTB : public TimedBaseBTBPredictor
     std::vector<uint8_t> swayOwner0, swayOwner1;
     std::vector<BTBSet> swayExtra0, swayExtra1;
     std::vector<std::vector<uint32_t>> swayExtraVisit0, swayExtraVisit1;
+    std::vector<uint64_t> swayPhaseHitsPerWay;
+    std::vector<uint64_t> swayPhaseEvictsPerWay;
+    uint64_t swayPhasePredHits{0};
+    uint64_t swayPhasePredMisses{0};
 
     bool swayIsMbtbTightSlot(int sramId, unsigned way) const;
     std::vector<uint8_t> &swayOwners(int sramId);

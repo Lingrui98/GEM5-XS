@@ -16,6 +16,7 @@
 #include "cpu/o3/limits.hh"
 #include "cpu/pred/btb/common.hh"
 #include "cpu/pred/btb/folded_hist.hh"
+#include "cpu/pred/btb/sway_realloc.hh"
 #include "cpu/pred/btb/timed_base_pred.hh"
 #include "debug/DecoupleBP.hh"
 #include "params/BTBITTAGE.hh"
@@ -144,6 +145,8 @@ class BTBITTAGE : public TimedBaseBTBPredictor
         uint64_t activeWays;
     };
     std::vector<TablePhaseSnapshot> collectAndResetTableVisitCounts();
+    std::vector<sway::PhaseCounterSnapshot>
+    collectAndResetSwayPhaseCounters();
     void sampleStage2OccupancyStats();
     uint64_t swayCommitMissCount() const;
     uint64_t swayCommitHitCount() const;
@@ -202,6 +205,11 @@ class BTBITTAGE : public TimedBaseBTBPredictor
 
     std::vector<std::vector<TageEntry>> tageTable;
     std::vector<std::vector<uint32_t>> phaseVisitCnt;
+    std::vector<uint64_t> swayPhaseUpdates;
+    std::vector<uint64_t> swayPhaseAllocSuccess;
+    std::vector<uint64_t> swayPhaseEvicts;
+    uint64_t swayPhaseCommitHits{0};
+    uint64_t swayPhaseCommitMisses{0};
 
     std::vector<TageEntry> lookupEntries;
     std::vector<Addr> lookupIndices, lookupTags;

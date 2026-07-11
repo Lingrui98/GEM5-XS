@@ -216,6 +216,45 @@ TEST_F(BTBTest, Initialization) {
     SUCCEED();
 }
 
+TEST_F(BTBTest, SwayPhaseSegmentSemantics) {
+    EXPECT_EQ(sway::phaseSegment(0, 100, 200, 0, 0), "warmup");
+    EXPECT_EQ(sway::phaseSegment(100, 200, 200, 0, 0), "warmup");
+    EXPECT_EQ(sway::phaseSegment(200, 300, 200, 1, 1), "sample");
+    EXPECT_EQ(sway::phaseSegment(0, 100, 0, 0, 0), "sample");
+    EXPECT_EQ(sway::phaseSegment(100, 200, 150, 0, 1), "transition");
+    EXPECT_EQ(sway::phaseSegment(100, 200, 150, 0, 0), "transition");
+}
+
+TEST_F(BTBTest, SwayPhaseCountersAreLocalAndReset) {
+    auto branch = createBranchInfo(0x1004, 0x2000, true);
+    predictUpdateCycle(mbtb_small, 0x1000, branch, true);
+
+    const auto first = mbtb_small->collectAndResetSwayPhaseCounters();
+    ASSERT_EQ(first.size(), 9u);
+    EXPECT_EQ(first.back().component, "MBTB");
+    EXPECT_EQ(first.back().scope, "mbtb_all");
+    ASSERT_TRUE(first.back().hits.has_value());
+    ASSERT_TRUE(first.back().misses.has_value());
+    EXPECT_GT(*first.back().hits, 0u);
+    EXPECT_GT(*first.back().misses, 0u);
+    EXPECT_EQ(first.back().capacityEntries, 16u);
+
+    uint64_t wayHits = 0;
+    for (auto it = first.begin(); it != first.end() - 1; ++it) {
+        ASSERT_TRUE(it->hits.has_value());
+        wayHits += *it->hits;
+        EXPECT_FALSE(it->misses.has_value());
+    }
+    EXPECT_EQ(wayHits, *first.back().hits);
+
+    const auto second = mbtb_small->collectAndResetSwayPhaseCounters();
+    ASSERT_EQ(second.size(), 9u);
+    EXPECT_EQ(*second.back().hits, 0u);
+    EXPECT_EQ(*second.back().misses, 0u);
+    EXPECT_EQ(second.back().residentEntries,
+              first.back().residentEntries);
+}
+
 TEST_F(BTBTest, SwaySourceSemanticsGeometry) {
     auto mbtb_to_tage = sway::makeMbtbToTageGeometry(1024, 2048);
     EXPECT_TRUE(mbtb_to_tage.legal());

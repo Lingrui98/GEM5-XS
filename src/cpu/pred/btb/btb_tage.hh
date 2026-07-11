@@ -318,6 +318,9 @@ class BTBTAGE : public TimedBaseBTBPredictor
     std::vector<std::vector<std::vector<uint32_t>>> wayVisitCnt;
     std::vector<std::vector<std::vector<TageEntry>>> swayExtraTable;
     std::vector<std::vector<std::vector<uint32_t>>> swayExtraVisitCnt;
+    std::vector<uint64_t> swayPhaseUpdates;
+    std::vector<uint64_t> swayPhaseAllocSuccess;
+    std::vector<uint64_t> swayPhaseEvicts;
 
     struct WayPhaseSnapshot
     {
@@ -343,6 +346,8 @@ class BTBTAGE : public TimedBaseBTBPredictor
     uint64_t swayUpdateFilteredEntriesCount() const;
     uint64_t swayUpdateTableMispredCount(unsigned table);
     void sampleStage2OccupancyStats();
+    std::vector<sway::PhaseCounterSnapshot>
+    collectAndResetSwayPhaseCounters();
     unsigned swayNumPredictorTables() const { return numPredictors; }
 
 #ifdef UNIT_TEST
