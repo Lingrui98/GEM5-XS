@@ -144,6 +144,7 @@ class BTBITTAGE : public TimedBaseBTBPredictor
         uint64_t activeWays;
     };
     std::vector<TablePhaseSnapshot> collectAndResetTableVisitCounts();
+    void sampleStage2OccupancyStats();
     uint64_t swayCommitMissCount() const;
     uint64_t swayCommitHitCount() const;
 
@@ -256,6 +257,11 @@ class BTBITTAGE : public TimedBaseBTBPredictor
 #ifndef UNIT_TEST
         Vector useProviderTable;
         Vector mispredictUseProviderTable;
+        Vector perTableUpdates;
+        Vector perTableAllocSuccess;
+        Vector perTableEvicts;
+        Vector activeEntriesPerTable;
+        Vector totalEntriesPerTable;
         Vector activeEntriesByTable;
         Vector validEntriesByTable;
         Vector totalEntriesByTable;

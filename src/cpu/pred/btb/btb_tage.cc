@@ -217,6 +217,15 @@ BTBTAGE::~BTBTAGE()
 {
 }
 
+#ifndef UNIT_TEST
+void
+BTBTAGE::preDumpStats()
+{
+    statistics::Group::preDumpStats();
+    sampleStage2OccupancyStats();
+}
+#endif
+
 ThreadID
 BTBTAGE::predictorTid(const std::vector<FullBTBPrediction> &stagePreds) const
 {
@@ -644,6 +653,26 @@ BTBTAGE::collectAndResetWayVisitCounts()
         out.push_back(snap);
     }
     return out;
+}
+
+void
+BTBTAGE::sampleStage2OccupancyStats()
+{
+    for (unsigned table = 0; table < numPredictors; ++table) {
+        const unsigned ways = getNumWays(table);
+        uint64_t validEntries = 0;
+        for (unsigned idx = 0; idx < tableSizes[table]; ++idx) {
+            for (unsigned way = 0; way < ways; ++way) {
+                if (way < tageTable[table][idx].size() &&
+                    tageTable[table][idx][way].valid) {
+                    ++validEntries;
+                }
+            }
+        }
+        tageStats.activeEntriesPerTable[table] = validEntries;
+        tageStats.totalEntriesPerTable[table] =
+            static_cast<uint64_t>(tableSizes[table]) * ways;
+    }
 }
 
 uint64_t
@@ -1185,6 +1214,7 @@ BTBTAGE::updatePredictorStateAndCheckAllocation(const BTBEntry &entry,
     if (main_info.found) {
         DPRINTF(TAGE, "prediction provided by table %d, idx %lu, way %u, updating corresponding entry\n",
             main_info.table, main_info.index, main_info.way);
+        tageStats.perTableUpdates[main_info.table]++;
 
         auto &way = mutableTageEntry(main_info);
 
@@ -1205,6 +1235,7 @@ BTBTAGE::updatePredictorStateAndCheckAllocation(const BTBEntry &entry,
 
     // Update alternative prediction provider
     if (used_alt && alt_info.found) {
+        tageStats.perTableUpdates[alt_info.table]++;
         auto &way = mutableTageEntry(alt_info);
         updateCounter(actual_taken, 3, way.counter);
         // No LRU maintenance
@@ -1432,6 +1463,10 @@ BTBTAGE::handleNewEntryAllocation(const Addr &startPC,
             allocInfo.victimCounter = victim.counter;
             allocInfo.victimUseful = victim.useful;
             allocInfo.victimPC = victim.pc;
+            tageStats.perTableAllocSuccess[ti]++;
+            if (victim.valid) {
+                tageStats.perTableEvicts[ti]++;
+            }
             victim = TageEntry(selected_tag, newCounter, entry.pc); // u = 0 default
             tageStats.updateAllocSuccess++;
             resetCnt = resetCnt <= 0 ? 0 : resetCnt - 1;
@@ -2090,9 +2125,22 @@ BTBTAGE::TageStats::TageStats(statistics::Group* parent, int numPredictors, int 
     ADD_STAT(predTableHits, statistics::units::Count::get(), "hit of each tage table on prediction"),
     ADD_STAT(updateTableHits, statistics::units::Count::get(), "hit of each tage table on update"),
     ADD_STAT(updateTableMispreds, statistics::units::Count::get(), "mispreds of each table when update"),
-    ADD_STAT(predFinalSourceTable, statistics::units::Count::get(), "predictions whose final source is a TAGE table"),
-    ADD_STAT(updateFinalSourceTableCorrect, statistics::units::Count::get(), "correct predictions grouped by final-source table"),
-    ADD_STAT(updateFinalSourceTableWrong, statistics::units::Count::get(), "wrong predictions grouped by final-source table"),
+    ADD_STAT(perTableUpdates, statistics::units::Count::get(),
+        "TAGE entry updates grouped by table"),
+    ADD_STAT(perTableAllocSuccess, statistics::units::Count::get(),
+        "successful TAGE allocations grouped by table"),
+    ADD_STAT(perTableEvicts, statistics::units::Count::get(),
+        "valid TAGE entries evicted by allocation, grouped by table"),
+    ADD_STAT(activeEntriesPerTable, statistics::units::Count::get(),
+        "valid TAGE entries per table at the latest phase sample"),
+    ADD_STAT(totalEntriesPerTable, statistics::units::Count::get(),
+        "total native TAGE entries per table"),
+    ADD_STAT(predFinalSourceTable, statistics::units::Count::get(),
+        "predictions whose final source is a TAGE table"),
+    ADD_STAT(updateFinalSourceTableCorrect, statistics::units::Count::get(),
+        "correct predictions grouped by final-source table"),
+    ADD_STAT(updateFinalSourceTableWrong, statistics::units::Count::get(),
+        "wrong predictions grouped by final-source table"),
 
     ADD_STAT(condPredwrong, statistics::units::Count::get(), "number of conditional branch mispredictions committed"),
     ADD_STAT(condMissTakens, statistics::units::Count::get(), "number of conditional branch mispredictions committed with no prediction"),
@@ -2115,6 +2163,11 @@ BTBTAGE::TageStats::init(int predictors, int banks)
     predTableHits.init(0, numPredictors - 1, 1);
     updateTableHits.init(0, numPredictors - 1, 1);
     updateTableMispreds.init(numPredictors);
+    perTableUpdates.init(numPredictors);
+    perTableAllocSuccess.init(numPredictors);
+    perTableEvicts.init(numPredictors);
+    activeEntriesPerTable.init(numPredictors);
+    totalEntriesPerTable.init(numPredictors);
     predFinalSourceTable.init(numPredictors);
     updateFinalSourceTableCorrect.init(numPredictors);
     updateFinalSourceTableWrong.init(numPredictors);
@@ -2130,6 +2183,16 @@ BTBTAGE::TageStats::init(int predictors, int banks)
     predAccessPerBank.init(numBanks);
     swayBorrowedHitsByDonee.init(numPredictors);
     swayUsefulWastedByReallocDist.init(0, 4096, 64);
+#ifndef UNIT_TEST
+    for (int table = 0; table < numPredictors; ++table) {
+        const std::string name = "tage_t" + std::to_string(table);
+        perTableUpdates.subname(table, name);
+        perTableAllocSuccess.subname(table, name);
+        perTableEvicts.subname(table, name);
+        activeEntriesPerTable.subname(table, name);
+        totalEntriesPerTable.subname(table, name);
+    }
+#endif
 }
 
 // Update statistics based on TAGE prediction

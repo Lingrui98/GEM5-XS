@@ -107,6 +107,7 @@ void
 BTBITTAGE::preDumpStats()
 {
     statistics::Group::preDumpStats();
+    sampleStage2OccupancyStats();
     for (unsigned table = 0; table < numPredictors; ++table) {
         ittageStats.totalEntriesByTable[table] = tableSizes[table];
     }
@@ -230,6 +231,22 @@ BTBITTAGE::collectAndResetTableVisitCounts()
         out.push_back(snap);
     }
     return out;
+}
+
+void
+BTBITTAGE::sampleStage2OccupancyStats()
+{
+    for (unsigned table = 0; table < numPredictors; ++table) {
+        uint64_t validEntries = 0;
+        if (table < tageTable.size()) {
+            for (const auto &entry : tageTable[table]) {
+                validEntries += entry.valid;
+            }
+        }
+        ittageStats.activeEntriesPerTable[table] = validEntries;
+        ittageStats.totalEntriesPerTable[table] =
+            table < tableSizes.size() ? tableSizes[table] : 0;
+    }
 }
 
 uint64_t
@@ -440,6 +457,7 @@ BTBITTAGE::update(
         if (main_found) {
             DPRINTF(ITTAGE, "prediction provided by table %d, idx %d, updating corresponding entry\n",
                 main_info.table, main_info.index);
+            ittageStats.perTableUpdates[main_info.table]++;
             auto &way = tageTable[main_info.table][main_info.index];
             if (use_provider && !way.active) {
                 way.active = true;
@@ -463,6 +481,7 @@ BTBITTAGE::update(
 
             if (used_alt && mispred) {
                 auto &alt_way = tageTable[pred.altInfo.table][pred.altInfo.index];
+                ittageStats.perTableUpdates[pred.altInfo.table]++;
                 updateCounter(false, 2, alt_way.counter);
                 if (alt_way.counter == 0) {
                     alt_way.target = exe_target;
@@ -555,10 +574,14 @@ BTBITTAGE::update(
                     if (allocate[ti - startTable]) {
                         DPRINTF(ITTAGE, "found allocatable entry, table %d, index %d, tag %d, counter %d\n",
                             ti, newIndex, newTag, 2);
+                        ittageStats.perTableAllocSuccess[ti]++;
                         if (!newEntry.valid) {
                             ittageStats.validEntriesByTable[ti]++;
-                        } else if (newEntry.active) {
-                            ittageStats.activeEntriesByTable[ti]--;
+                        } else {
+                            ittageStats.perTableEvicts[ti]++;
+                            if (newEntry.active) {
+                                ittageStats.activeEntriesByTable[ti]--;
+                            }
                         }
                         newEntry = TageEntry(newTag, exe_target, 2, btb_entry.pc);
                         ittageStats.updateAllocSuccess++;
@@ -861,6 +884,16 @@ BTBITTAGE::IttageStats::IttageStats(statistics::Group* parent, int numPredictors
         "resolved indirect branches that use the ITTAGE provider table, grouped by table"),
     ADD_STAT(mispredictUseProviderTable, statistics::units::Count::get(),
         "mispredicted indirect branches that use the ITTAGE provider table, grouped by table"),
+    ADD_STAT(perTableUpdates, statistics::units::Count::get(),
+        "ITTAGE entry updates grouped by table"),
+    ADD_STAT(perTableAllocSuccess, statistics::units::Count::get(),
+        "successful ITTAGE allocations grouped by table"),
+    ADD_STAT(perTableEvicts, statistics::units::Count::get(),
+        "valid ITTAGE entries evicted by allocation, grouped by table"),
+    ADD_STAT(activeEntriesPerTable, statistics::units::Count::get(),
+        "valid ITTAGE entries per table at the latest phase sample"),
+    ADD_STAT(totalEntriesPerTable, statistics::units::Count::get(),
+        "total ITTAGE entries per table"),
     ADD_STAT(activeEntriesByTable, statistics::units::Count::get(),
         "ITTAGE entries that served as provider at least once and are still resident, grouped by table"),
     ADD_STAT(validEntriesByTable, statistics::units::Count::get(),
@@ -885,6 +918,11 @@ BTBITTAGE::IttageStats::IttageStats(statistics::Group* parent, int numPredictors
 {
     useProviderTable.init(numPredictors);
     mispredictUseProviderTable.init(numPredictors);
+    perTableUpdates.init(numPredictors);
+    perTableAllocSuccess.init(numPredictors);
+    perTableEvicts.init(numPredictors);
+    activeEntriesPerTable.init(numPredictors);
+    totalEntriesPerTable.init(numPredictors);
     activeEntriesByTable.init(numPredictors);
     validEntriesByTable.init(numPredictors);
     totalEntriesByTable.init(numPredictors);
@@ -892,6 +930,11 @@ BTBITTAGE::IttageStats::IttageStats(statistics::Group* parent, int numPredictors
         const std::string name = "ittage_t" + std::to_string(table);
         useProviderTable.subname(table, name);
         mispredictUseProviderTable.subname(table, name);
+        perTableUpdates.subname(table, name);
+        perTableAllocSuccess.subname(table, name);
+        perTableEvicts.subname(table, name);
+        activeEntriesPerTable.subname(table, name);
+        totalEntriesPerTable.subname(table, name);
         activeEntriesByTable.subname(table, name);
         validEntriesByTable.subname(table, name);
         totalEntriesByTable.subname(table, name);

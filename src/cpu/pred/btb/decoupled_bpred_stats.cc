@@ -636,6 +636,7 @@ DecoupledBPUWithBTB::collectSwayWayVisitForPhase(int phaseID)
     };
 
     if (mbtb) {
+        mbtb->sampleStage2OccupancyStats();
         mbtbSlotRows = mbtb->collectSwayMbtbTightSlotVisitCounts();
         for (const auto& snap : mbtb->collectAndResetWayVisitCounts()) {
             append(snap.scope, snap.totalWays, snap.validWays,
@@ -643,6 +644,7 @@ DecoupledBPUWithBTB::collectSwayWayVisitForPhase(int phaseID)
         }
     }
     if (ittage) {
+        ittage->sampleStage2OccupancyStats();
         for (const auto& snap : ittage->collectAndResetTableVisitCounts()) {
             ittagePhaseRows.push_back(
                 {phaseID, snap.scope, snap.totalWays, snap.activeWays,
@@ -652,6 +654,7 @@ DecoupledBPUWithBTB::collectSwayWayVisitForPhase(int phaseID)
         }
     }
     if (tage) {
+        tage->sampleStage2OccupancyStats();
         for (const auto& snap : tage->collectAndResetWayVisitCounts()) {
             append(snap.scope, snap.totalWays, snap.validWays,
                    snap.activeWays);
