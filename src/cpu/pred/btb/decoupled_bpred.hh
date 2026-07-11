@@ -743,6 +743,20 @@ class DecoupledBPUWithBTB : public BPredUnit
         double utility;
     };
 
+    struct SwayPhaseBcRawRow
+    {
+        int phaseID;
+        uint64_t phaseStartInst;
+        uint64_t phaseEndInst;
+        uint64_t phaseInstCount;
+        std::string segment;
+        bool replayEligible;
+        uint64_t statsEpochStart;
+        uint64_t statsEpochEnd;
+        sway::PhaseCounterSnapshot counters;
+    };
+    std::vector<SwayPhaseBcRawRow> swayPhaseBcRawRows;
+
     struct SwayF1Counters
     {
         uint64_t mbtbPredMiss{0};
@@ -970,6 +984,7 @@ class DecoupledBPUWithBTB : public BPredUnit
      * @brief Snapshot SWAY per-way visit counters at a phase boundary.
      */
     void collectSwayWayVisitForPhase(int phaseID);
+    void collectSwayPhasePressureForPhase(int phaseID);
     void trySwayReallocForPhase(
         const std::vector<SwayUtilityRow>& phaseRows,
         const std::vector<SwayUtilityRow>& ittagePhaseRows,
@@ -1003,6 +1018,12 @@ class DecoupledBPUWithBTB : public BPredUnit
      * @brief Number of instructions per phase
      */
     int phaseSizeByInst{100000};
+    uint64_t swayWarmupInsts{0};
+    uint64_t swayRawArchInstCommitted{0};
+    uint64_t swayStatsEpoch{0};
+    uint64_t swayPhaseStartInst{0};
+    uint64_t swayPhaseStartEpoch{0};
+    bool swayWarmupResetObserved{false};
     bool enableSwayRealloc{false};
     unsigned swayReallocWays{1};
     double swayReallocHysteresis{0.0};
@@ -1268,6 +1289,8 @@ class DecoupledBPUWithBTB : public BPredUnit
      * @param inst Dynamic instruction pointer of the committed instruction
      */
     void notifyInstCommit(const DynInstPtr &inst);
+
+    void resetStats() override;
 
     /**
      * @brief Tracks mispredictions of indirect branches

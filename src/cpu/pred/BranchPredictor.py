@@ -1241,6 +1241,8 @@ class DecoupledBPUWithBTB(BranchPredictor):
     # sweep can vary W via the gem5 command line (-P) instead of rebuilding.
     phaseSizeByInst = Param.Unsigned(100000,
         "Instructions per main profiling phase (W in SWAY paper)")
+    swayWarmupInsts = Param.Unsigned(0,
+        "Warmup instruction boundary for SWAY phase-stream metadata")
     subPhaseRatio = Param.Unsigned(10,
         "Number of sub-phases per main phase")
     enableSwayRealloc = Param.Bool(False,

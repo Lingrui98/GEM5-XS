@@ -34,6 +34,9 @@ ittageStats(this, p.numPredictors)
     DPRINTF(ITTAGE, "BTBITTAGE constructor numBr=%d\n", numBr);
     tageTable.resize(numPredictors);
     phaseVisitCnt.resize(numPredictors);
+    swayPhaseUpdates.assign(numPredictors, 0);
+    swayPhaseAllocSuccess.assign(numPredictors, 0);
+    swayPhaseEvicts.assign(numPredictors, 0);
     tableIndexBits.resize(numPredictors);
     tableIndexMasks.resize(numPredictors);
     tableTagBits.resize(numPredictors);
@@ -249,6 +252,57 @@ BTBITTAGE::sampleStage2OccupancyStats()
     }
 }
 
+std::vector<sway::PhaseCounterSnapshot>
+BTBITTAGE::collectAndResetSwayPhaseCounters()
+{
+    std::vector<sway::PhaseCounterSnapshot> out;
+    out.reserve(numPredictors + 1);
+    uint64_t totalResident = 0;
+    uint64_t totalCapacity = 0;
+    uint64_t totalEvicts = 0;
+    for (unsigned table = 0; table < numPredictors; ++table) {
+        uint64_t resident = 0;
+        for (const auto &entry : tageTable[table]) {
+            resident += entry.valid;
+        }
+        out.push_back({
+            "ITTAGE",
+            "ittage_t" + std::to_string(table),
+            "table",
+            std::nullopt,
+            std::nullopt,
+            swayPhaseUpdates[table],
+            swayPhaseAllocSuccess[table],
+            swayPhaseEvicts[table],
+            resident,
+            tableSizes[table],
+        });
+        totalResident += resident;
+        totalCapacity += tableSizes[table];
+        totalEvicts += swayPhaseEvicts[table];
+    }
+    out.push_back({
+        "ITTAGE",
+        "ittage_all",
+        "component",
+        swayPhaseCommitHits,
+        swayPhaseCommitMisses,
+        std::nullopt,
+        std::nullopt,
+        totalEvicts,
+        totalResident,
+        totalCapacity,
+    });
+
+    std::fill(swayPhaseUpdates.begin(), swayPhaseUpdates.end(), 0);
+    std::fill(swayPhaseAllocSuccess.begin(),
+              swayPhaseAllocSuccess.end(), 0);
+    std::fill(swayPhaseEvicts.begin(), swayPhaseEvicts.end(), 0);
+    swayPhaseCommitHits = 0;
+    swayPhaseCommitMisses = 0;
+    return out;
+}
+
 uint64_t
 BTBITTAGE::swayCommitMissCount() const
 {
@@ -401,6 +455,7 @@ BTBITTAGE::update(const FetchTarget &stream)
             DPRINTF(ITTAGE, "prediction provided by table %d, idx %d, updating corresponding entry\n",
                 main_info.table, main_info.index);
             ittageStats.perTableUpdates[main_info.table]++;
+            swayPhaseUpdates[main_info.table]++;
             auto &way = tageTable[main_info.table][main_info.index];
             if (use_provider && !way.active) {
                 way.active = true;
@@ -425,6 +480,7 @@ BTBITTAGE::update(const FetchTarget &stream)
             if (used_alt && mispred) {
                 auto &alt_way = tageTable[pred.altInfo.table][pred.altInfo.index];
                 ittageStats.perTableUpdates[pred.altInfo.table]++;
+                swayPhaseUpdates[pred.altInfo.table]++;
                 updateCounter(false, 2, alt_way.counter);
                 if (alt_way.counter == 0) {
                     alt_way.target = exe_target;
@@ -512,10 +568,12 @@ BTBITTAGE::update(const FetchTarget &stream)
                         DPRINTF(ITTAGE, "found allocatable entry, table %d, index %d, tag %d, counter %d\n",
                             ti, newIndex, newTag, 2);
                         ittageStats.perTableAllocSuccess[ti]++;
+                        swayPhaseAllocSuccess[ti]++;
                         if (!newEntry.valid) {
                             ittageStats.validEntriesByTable[ti]++;
                         } else {
                             ittageStats.perTableEvicts[ti]++;
+                            swayPhaseEvicts[ti]++;
                             if (newEntry.active) {
                                 ittageStats.activeEntriesByTable[ti]--;
                             }
@@ -758,6 +816,7 @@ BTBITTAGE::commitBranch(const FetchTarget &stream, const DynInstPtr &inst)
      // Update commit statistics
     if (this_branch_hit) {
         ittageStats.commitHits++;
+        swayPhaseCommitHits++;
         if (pred_npc == npc) {
             ittageStats.commitPredCorrect++;
             if (iscalled) {
@@ -780,6 +839,7 @@ BTBITTAGE::commitBranch(const FetchTarget &stream, const DynInstPtr &inst)
         }
     }else {
         ittageStats.commitMisses++;
+        swayPhaseCommitMisses++;
         ittageStats.commitPredWrong++;
         if (iscalled) {
             ittageStats.callMisses++;

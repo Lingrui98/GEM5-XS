@@ -131,6 +131,7 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     // SWAY: profiling phase length is now a SimObject param so a single
     // build can sweep W via -P system.cpu[0].branchPred.phaseSizeByInst=N.
     phaseSizeByInst = p.phaseSizeByInst;
+    swayWarmupInsts = p.swayWarmupInsts;
     subPhaseRatio = p.subPhaseRatio;
     enableSwayRealloc = p.enableSwayRealloc;
     swayReallocWays = p.swayReallocWays;

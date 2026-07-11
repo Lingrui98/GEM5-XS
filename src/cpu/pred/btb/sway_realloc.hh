@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,42 @@ static constexpr double TageHotUtilityThreshold = 0.70;
 static constexpr unsigned IttageColdPhaseThreshold = 5;
 
 using ScopeCounts = std::array<unsigned, NumScopes>;
+
+/**
+ * Raw, phase-local pressure counters for offline SWAY analysis.
+ *
+ * Event counters are reset only by the component snapshot API, independently
+ * of gem5's global statistics reset. Resident entries are boundary snapshots,
+ * not deltas. std::nullopt denotes a field that has no meaning for the scope.
+ */
+struct PhaseCounterSnapshot
+{
+    std::string component;
+    std::string scope;
+    std::string scopeKind;
+    std::optional<uint64_t> hits;
+    std::optional<uint64_t> misses;
+    std::optional<uint64_t> updates;
+    std::optional<uint64_t> allocSuccess;
+    std::optional<uint64_t> evicts;
+    uint64_t residentEntries = 0;
+    uint64_t capacityEntries = 0;
+};
+
+inline std::string
+phaseSegment(uint64_t phaseStartInst, uint64_t phaseEndInst,
+             uint64_t warmupInsts, uint64_t statsEpochStart,
+             uint64_t statsEpochEnd)
+{
+    if (statsEpochStart != statsEpochEnd ||
+        (phaseStartInst < warmupInsts && warmupInsts < phaseEndInst)) {
+        return "transition";
+    }
+    if (warmupInsts == 0 || phaseStartInst >= warmupInsts) {
+        return "sample";
+    }
+    return "warmup";
+}
 
 enum class Component : uint8_t
 {

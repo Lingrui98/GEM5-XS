@@ -523,6 +523,52 @@ protected:
     std::vector<FullBTBPrediction> stagePreds;
 };
 
+TEST_F(BTBTAGETest, SwayPhaseCountersTrackAndResetTableEvents)
+{
+    const auto empty = tage->collectAndResetSwayPhaseCounters();
+    ASSERT_EQ(empty.size(), 4u);
+    for (unsigned table = 0; table < empty.size(); ++table) {
+        EXPECT_EQ(empty[table].component, "TAGE");
+        EXPECT_EQ(empty[table].scope,
+                  "tage_t" + std::to_string(table));
+        EXPECT_FALSE(empty[table].hits.has_value());
+        EXPECT_EQ(*empty[table].updates, 0u);
+        EXPECT_EQ(*empty[table].allocSuccess, 0u);
+        EXPECT_EQ(*empty[table].evicts, 0u);
+        EXPECT_EQ(empty[table].capacityEntries, 2048u);
+    }
+
+    BTBEntry entry = createBTBEntry(
+        0x1000, true, true, false, -1, 0x2000);
+    setupTageEntry(tage, entry.pc, 0, -2);
+    EXPECT_FALSE(predictUpdateCycle(
+        tage, entry.pc, entry, false, history, stagePreds));
+    EXPECT_FALSE(predictUpdateCycle(
+        tage, entry.pc, entry, true, history, stagePreds));
+
+    const auto first = tage->collectAndResetSwayPhaseCounters();
+    ASSERT_EQ(first.size(), 4u);
+    uint64_t updates = 0;
+    uint64_t allocations = 0;
+    uint64_t resident = 0;
+    for (const auto& row : first) {
+        updates += *row.updates;
+        allocations += *row.allocSuccess;
+        resident += row.residentEntries;
+    }
+    EXPECT_GT(updates, 0u);
+    EXPECT_GT(allocations, 0u);
+    EXPECT_GT(resident, 0u);
+
+    const auto second = tage->collectAndResetSwayPhaseCounters();
+    ASSERT_EQ(second.size(), 4u);
+    for (const auto& row : second) {
+        EXPECT_EQ(*row.updates, 0u);
+        EXPECT_EQ(*row.allocSuccess, 0u);
+        EXPECT_EQ(*row.evicts, 0u);
+    }
+}
+
 TEST(BTBTAGESwayBorrowedBankTest, MbtbTightSlotPredictsDoneeTable) {
     BTBTAGE tage8(8, 2, 2048, 4, true);
     tage8.setSwayReallocEnabled(true);

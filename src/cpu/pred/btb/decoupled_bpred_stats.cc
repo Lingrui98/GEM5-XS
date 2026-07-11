@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <tuple>
 
@@ -582,6 +583,49 @@ DecoupledBPUWithBTB::recordSwayPhaseDiag(
 }
 
 void
+DecoupledBPUWithBTB::collectSwayPhasePressureForPhase(int phaseID)
+{
+    const uint64_t phaseEndInst =
+        static_cast<uint64_t>(phaseID) * phaseSizeByInst;
+    const uint64_t phaseStartInst = swayPhaseStartInst;
+    const uint64_t statsEpochEnd = swayStatsEpoch;
+
+    const std::string segment = sway::phaseSegment(
+        phaseStartInst, phaseEndInst, swayWarmupInsts,
+        swayPhaseStartEpoch, statsEpochEnd);
+    const bool replayEligible = segment != "transition";
+
+    auto append = [&](std::vector<sway::PhaseCounterSnapshot> snapshots) {
+        for (auto &snapshot : snapshots) {
+            swayPhaseBcRawRows.push_back({
+                phaseID,
+                phaseStartInst,
+                phaseEndInst,
+                phaseEndInst - phaseStartInst,
+                segment,
+                replayEligible,
+                swayPhaseStartEpoch,
+                statsEpochEnd,
+                std::move(snapshot),
+            });
+        }
+    };
+
+    if (mbtb) {
+        append(mbtb->collectAndResetSwayPhaseCounters());
+    }
+    if (ittage) {
+        append(ittage->collectAndResetSwayPhaseCounters());
+    }
+    if (tage) {
+        append(tage->collectAndResetSwayPhaseCounters());
+    }
+
+    swayPhaseStartInst = phaseEndInst;
+    swayPhaseStartEpoch = statsEpochEnd;
+}
+
+void
 DecoupledBPUWithBTB::collectSwayWayVisitForPhase(int phaseID)
 {
     std::vector<SwayUtilityRow> phaseRows;
@@ -905,7 +949,46 @@ DecoupledBPUWithBTB::dumpStats()
     }
     simout.close(outFile);
 
-    // 10. SWAY per-way stranded-capacity rows.
+    // 10. SWAY replayable phase-local raw pressure counters.
+    {
+        auto handle = createOutputFile(
+            "sway_phase_bc_raw.csv",
+            "schema_version,phase_id,phase_start_inst,phase_end_inst,"
+            "phase_inst_count,segment,replay_eligible,stats_epoch_start,"
+            "stats_epoch_end,component,scope,scope_kind,hits_delta,"
+            "misses_delta,updates_delta,alloc_success_delta,evicts_delta,"
+            "resident_entries_end,capacity_entries");
+        auto& out = *handle->stream();
+        auto emitOptional = [&](const std::optional<uint64_t>& value) {
+            if (value) {
+                out << *value;
+            }
+        };
+        for (const auto& row : swayPhaseBcRawRows) {
+            const auto& counters = row.counters;
+            out << 1 << ',' << row.phaseID << ','
+                << row.phaseStartInst << ',' << row.phaseEndInst << ','
+                << row.phaseInstCount << ',' << row.segment << ','
+                << (row.replayEligible ? "true" : "false") << ','
+                << row.statsEpochStart << ',' << row.statsEpochEnd << ','
+                << counters.component << ',' << counters.scope << ','
+                << counters.scopeKind << ',';
+            emitOptional(counters.hits);
+            out << ',';
+            emitOptional(counters.misses);
+            out << ',';
+            emitOptional(counters.updates);
+            out << ',';
+            emitOptional(counters.allocSuccess);
+            out << ',';
+            emitOptional(counters.evicts);
+            out << ',' << counters.residentEntries << ','
+                << counters.capacityEntries << '\n';
+        }
+        simout.close(handle);
+    }
+
+    // 11. SWAY per-way stranded-capacity rows.
     {
         auto handle = createOutputFile(
             "sway_stranded_by_phase.csv",
@@ -919,7 +1002,7 @@ DecoupledBPUWithBTB::dumpStats()
         simout.close(handle);
     }
 
-    // 11. SWAY measurement-only utility vector rows.
+    // 12. SWAY measurement-only utility vector rows.
     {
         auto handle = createOutputFile(
             "sway_utility_by_phase.csv",
@@ -933,7 +1016,7 @@ DecoupledBPUWithBTB::dumpStats()
         simout.close(handle);
     }
 
-    // 12. SWAY Phase-A controller diagnosis rows.
+    // 13. SWAY Phase-A controller diagnosis rows.
     {
         std::stringstream header;
         header << "phaseID"
@@ -1665,17 +1748,54 @@ DecoupledBPUWithBTB::commitPredWrongSource(const FetchTarget &entry)
  * boundary is reached, it collects detailed statistics for the phase.
  */
 void
+DecoupledBPUWithBTB::resetStats()
+{
+    BPredUnit::resetStats();
+    ++swayStatsEpoch;
+
+    // A reset exactly on a phase boundary separates two complete phases. If
+    // it lands inside a phase, leave the start epoch unchanged so that phase
+    // is emitted as a non-replayable transition row set.
+    const bool alignedWarmupReset = !swayWarmupResetObserved &&
+        swayWarmupInsts > 0 && swayPhaseStartInst == swayWarmupInsts;
+    if (swayPhaseStartInst == swayRawArchInstCommitted ||
+        alignedWarmupReset) {
+        swayPhaseStartEpoch = swayStatsEpoch;
+    }
+    if (!swayWarmupResetObserved && swayWarmupInsts > 0 &&
+        swayRawArchInstCommitted >= swayWarmupInsts) {
+        swayWarmupResetObserved = true;
+    }
+}
+
+void
 DecoupledBPUWithBTB::notifyInstCommit(const DynInstPtr &inst)
 {
     // Update committed instruction count for target
     ftq.get(inst->ftqId, inst->threadNumber).commitInstNum++;
 
-    // Update global committed instruction count
+    // Preserve the legacy phase clock used by the live controller.
     numInstCommitted++;
 
-    DPRINTF(Profiling, "notifyInstCommit, inst=%s, commitInstNum=%d\n",
+    // The raw replay stream uses CPU::instDone()'s architectural clock so
+    // NOPs, prefetches, micro-ops and fused instructions align with the CPU's
+    // warmup/maxinsts events without changing the live controller cadence.
+    const uint64_t previousRawArchInstCommitted =
+        swayRawArchInstCommitted;
+    swayRawArchInstCommitted = cpu->totalInsts();
+
+    DPRINTF(Profiling,
+            "notifyInstCommit, inst=%s, ftqCommitInstNum=%d, "
+            "rawArchInstNum=%lu\n",
             inst->staticInst->disassemble(inst->pcState().instAddr()),
-            ftq.get(inst->ftqId, inst->threadNumber).commitInstNum);
+            ftq.get(inst->ftqId, inst->threadNumber).commitInstNum,
+            swayRawArchInstCommitted);
+
+    if (previousRawArchInstCommitted / phaseSizeByInst <
+        swayRawArchInstCommitted / phaseSizeByInst) {
+        const int rawPhaseID = swayRawArchInstCommitted / phaseSizeByInst;
+        collectSwayPhasePressureForPhase(rawPhaseID);
+    }
 
     // ----------------------- Main Phase Processing -------------------------
     if (numInstCommitted % phaseSizeByInst == 0) {

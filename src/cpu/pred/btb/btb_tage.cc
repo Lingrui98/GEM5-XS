@@ -164,6 +164,9 @@ tageStats(this, p.numPredictors, p.numBanks)
     swayWayOwner.resize(numPredictors);
     swayExtraTable.resize(numPredictors);
     swayExtraVisitCnt.resize(numPredictors);
+    swayPhaseUpdates.assign(numPredictors, 0);
+    swayPhaseAllocSuccess.assign(numPredictors, 0);
+    swayPhaseEvicts.assign(numPredictors, 0);
 
     for (unsigned int i = 0; i < numPredictors; ++i) {
         //initialize ittage predictor
@@ -671,6 +674,40 @@ BTBTAGE::sampleStage2OccupancyStats()
         tageStats.totalEntriesPerTable[table] =
             static_cast<uint64_t>(tableSizes[table]) * ways;
     }
+}
+
+std::vector<sway::PhaseCounterSnapshot>
+BTBTAGE::collectAndResetSwayPhaseCounters()
+{
+    std::vector<sway::PhaseCounterSnapshot> out;
+    out.reserve(numPredictors);
+    for (unsigned table = 0; table < numPredictors; ++table) {
+        const unsigned ways = getNumWays(table);
+        uint64_t resident = 0;
+        for (unsigned index = 0; index < tableSizes[table]; ++index) {
+            for (unsigned way = 0; way < ways; ++way) {
+                resident += tageTable[table][index][way].valid;
+            }
+        }
+        out.push_back({
+            "TAGE",
+            "tage_t" + std::to_string(table),
+            "table",
+            std::nullopt,
+            std::nullopt,
+            swayPhaseUpdates[table],
+            swayPhaseAllocSuccess[table],
+            swayPhaseEvicts[table],
+            resident,
+            static_cast<uint64_t>(tableSizes[table]) * ways,
+        });
+    }
+
+    std::fill(swayPhaseUpdates.begin(), swayPhaseUpdates.end(), 0);
+    std::fill(swayPhaseAllocSuccess.begin(),
+              swayPhaseAllocSuccess.end(), 0);
+    std::fill(swayPhaseEvicts.begin(), swayPhaseEvicts.end(), 0);
+    return out;
 }
 
 uint64_t
@@ -1190,6 +1227,7 @@ BTBTAGE::updatePredictorStateAndCheckAllocation(const BTBEntry &entry,
         DPRINTF(TAGE, "prediction provided by table %d, idx %lu, way %u, updating corresponding entry\n",
             main_info.table, main_info.index, main_info.way);
         tageStats.perTableUpdates[main_info.table]++;
+        swayPhaseUpdates[main_info.table]++;
 
         auto &way = mutableTageEntry(main_info);
 
@@ -1211,6 +1249,7 @@ BTBTAGE::updatePredictorStateAndCheckAllocation(const BTBEntry &entry,
     // Update alternative prediction provider
     if (used_alt && alt_info.found) {
         tageStats.perTableUpdates[alt_info.table]++;
+        swayPhaseUpdates[alt_info.table]++;
         auto &way = mutableTageEntry(alt_info);
         updateCounter(actual_taken, 3, way.counter);
         // No LRU maintenance
@@ -1435,8 +1474,10 @@ BTBTAGE::handleNewEntryAllocation(const Addr &startPC,
             allocInfo.victimUseful = victim.useful;
             allocInfo.victimPC = victim.pc;
             tageStats.perTableAllocSuccess[ti]++;
+            swayPhaseAllocSuccess[ti]++;
             if (victim.valid) {
                 tageStats.perTableEvicts[ti]++;
+                swayPhaseEvicts[ti]++;
             }
             victim = TageEntry(selected_tag, newCounter, entry.pc); // u = 0 default
             tageStats.updateAllocSuccess++;

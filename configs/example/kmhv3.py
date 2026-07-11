@@ -95,6 +95,8 @@ def setKmhV3Params(args, system):
         if args.bp_type == 'DecoupledBPUWithBTB':
             cpu.branchPred.ftq_size = 64
             cpu.branchPred.fsq_size = 64
+            cpu.branchPred.swayWarmupInsts = \
+                getattr(args, 'warmup_insts_no_switch', 0) or 0
 
             if args.btb_tage_upper_bound:
                 cpu.branchPred.tage = BTBTAGEUpperBound(
