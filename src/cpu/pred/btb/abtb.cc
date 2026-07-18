@@ -353,20 +353,6 @@ AheadBTB::putPCHistory(Addr startAddr,
     // Process BTB entries
     auto processed_entries = processEntries(find_entries, startAddr);
 
-#ifndef UNIT_TEST
-    BtbpTraceEvent lookup_event;
-    lookup_event.tick = curTick();
-    lookup_event.eventType = BtbpTraceEvent::BtbLookup;
-    lookup_event.threadId = tid;
-    lookup_event.branchPc =
-        processed_entries.empty() ? startAddr : processed_entries.front().pc;
-    lookup_event.btbLevel = BtbpTraceEvent::AheadBTB;
-    lookup_event.hit = !processed_entries.empty();
-    lookup_event.target =
-        processed_entries.empty() ? 0 : processed_entries.front().target;
-    notifyBtbpTrace(lookup_event);
-#endif
-
     // Fill predictions for each pipeline stage
     fillStagePredictions(processed_entries, stagePreds);
 
@@ -563,8 +549,7 @@ AheadBTB::collectEntriesToUpdate(const std::vector<BTBEntry>& old_entries,
  */
 void
 AheadBTB::updateBTBEntry(Addr btb_idx, Addr btb_tag, const BTBEntry& entry,
-                         const BranchInfo takenbranchinfo, const bool isTaken,
-                         ThreadID tid)
+                                        const BranchInfo takenbranchinfo,const bool isTaken)
 {
 
     // Look for matching entry
@@ -643,17 +628,6 @@ AheadBTB::updateBTBEntry(Addr btb_idx, Addr btb_tag, const BTBEntry& entry,
         dumpMruList(mruList[btb_idx]);
     }
     std::make_heap(mruList[btb_idx].begin(), mruList[btb_idx].end(), older());
-#ifndef UNIT_TEST
-    BtbpTraceEvent fill_event;
-    fill_event.tick = curTick();
-    fill_event.eventType = BtbpTraceEvent::BtbFill;
-    fill_event.threadId = tid;
-    fill_event.branchPc = ticked_entry.pc;
-    fill_event.btbLevel = BtbpTraceEvent::AheadBTB;
-    fill_event.target = ticked_entry.target;
-    fill_event.fillSource = BtbpTraceEvent::ExecWriteback;
-    notifyBtbpTrace(fill_event);
-#endif
 }
 
 
@@ -687,8 +661,7 @@ AheadBTB::updateUsingS3Pred(FullBTBPrediction &s3Pred, const Addr previousPC)
         takenbranchinfo.target = s3Pred.getTakenEntry().target;
         entry.source = getComponentIdx(); // mark the entry source as AheadBTB
 
-        updateBTBEntry(btb_idx, btb_tag, entry, takenbranchinfo,
-                       s3Pred.isTaken(), s3Pred.tid);
+        updateBTBEntry(btb_idx, btb_tag, entry, takenbranchinfo, s3Pred.isTaken());
     }
 }
 std::vector<BTBEntry>
@@ -763,8 +736,7 @@ AheadBTB::update(const FetchTarget &stream)
         }
         Addr btb_idx = getIndex(previousPC, stream.asidHash);  // use last pc to get idx
         entry.source = getComponentIdx(); // mark the entry source as AheadBTB
-        updateBTBEntry(btb_idx, btb_tag, entry, stream.exeBranchInfo,
-                       stream.exeTaken, stream.tid);
+        updateBTBEntry(btb_idx, btb_tag, entry, stream.exeBranchInfo, stream.exeTaken);
     }
 }
 

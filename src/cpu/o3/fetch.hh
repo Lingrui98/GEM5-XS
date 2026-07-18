@@ -283,6 +283,8 @@ class Fetch
     {
         bool valid = false;
         branch_prediction::btb_pred::FetchTargetId ftqId = 0;
+        uint64_t addressSpaceId = 0;
+        uint8_t asidHash = 0;
         Addr startPC = 0;
         uint64_t epoch = 0;
         unsigned lineCount = 0;
@@ -292,6 +294,8 @@ class Fetch
         {
             valid = false;
             ftqId = 0;
+            addressSpaceId = 0;
+            asidHash = 0;
             startPC = 0;
             epoch = 0;
             lineCount = 0;

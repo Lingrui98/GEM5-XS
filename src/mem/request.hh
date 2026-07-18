@@ -387,6 +387,10 @@ class Request
         uint64_t fdipEpoch;
         uint64_t fdipFtqId;
         Addr fdipStartPC;
+        bool traceIdentityValid;
+        uint64_t traceAddressSpaceId;
+        uint8_t traceAsidHash;
+        uint64_t traceFtqId;
         bool fdipSelectedWayValid;
         uint8_t fdipSelectedWay;
         Tick fdipSelectedWayTick;
@@ -399,6 +403,10 @@ class Request
             fdipEpoch(0),
             fdipFtqId(0),
             fdipStartPC(0),
+            traceIdentityValid(false),
+            traceAddressSpaceId(0),
+            traceAsidHash(0),
+            traceFtqId(0),
             fdipSelectedWayValid(false),
             fdipSelectedWay(0),
             fdipSelectedWayTick(0) {}
@@ -411,6 +419,10 @@ class Request
             fdipEpoch(0),
             fdipFtqId(0),
             fdipStartPC(0),
+            traceIdentityValid(false),
+            traceAddressSpaceId(0),
+            traceAsidHash(0),
+            traceFtqId(0),
             fdipSelectedWayValid(false),
             fdipSelectedWay(0),
             fdipSelectedWayTick(0) {}
@@ -423,6 +435,10 @@ class Request
             fdipEpoch(0),
             fdipFtqId(0),
             fdipStartPC(0),
+            traceIdentityValid(false),
+            traceAddressSpaceId(0),
+            traceAsidHash(0),
+            traceFtqId(0),
             fdipSelectedWayValid(false),
             fdipSelectedWay(0),
             fdipSelectedWayTick(0) {}
@@ -435,6 +451,10 @@ class Request
             fdipEpoch(0),
             fdipFtqId(0),
             fdipStartPC(0),
+            traceIdentityValid(false),
+            traceAddressSpaceId(0),
+            traceAsidHash(0),
+            traceFtqId(0),
             fdipSelectedWayValid(false),
             fdipSelectedWay(0),
             fdipSelectedWayTick(0) {}
@@ -449,6 +469,10 @@ class Request
             fdipEpoch = 0;
             fdipFtqId = 0;
             fdipStartPC = 0;
+            traceIdentityValid = false;
+            traceAddressSpaceId = 0;
+            traceAsidHash = 0;
+            traceFtqId = 0;
             fdipSelectedWayValid = false;
             fdipSelectedWay = 0;
             fdipSelectedWayTick = 0;

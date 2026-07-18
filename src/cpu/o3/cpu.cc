@@ -334,24 +334,27 @@ CPU::regProbePoints()
     ppDataAccessComplete = new ProbePointArg<
         std::pair<DynInstPtr, PacketPtr>>(
                 getProbeManager(), "DataAccessComplete");
-    ppBtbpTraceBtbLookup =
+    ppBtbpTraceMbtbLookup =
         new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
-            getProbeManager(), "BtbpTraceBtbLookup");
-    ppBtbpTraceBtbFill =
+            getProbeManager(), "BtbpTraceMbtbLookup");
+    ppBtbpTraceMbtbFill =
         new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
-            getProbeManager(), "BtbpTraceBtbFill");
+            getProbeManager(), "BtbpTraceMbtbFill");
     ppBtbpTraceIPrefetchIssue =
         new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
             getProbeManager(), "BtbpTraceIPrefetchIssue");
-    ppBtbpTraceIPrefetchFill =
+    ppBtbpTraceLineLifecycle =
         new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
-            getProbeManager(), "BtbpTraceIPrefetchFill");
-    ppBtbpTraceIcacheDemandFill =
+            getProbeManager(), "BtbpTraceLineLifecycle");
+    ppBtbpTraceL1IDemandAccess =
         new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
-            getProbeManager(), "BtbpTraceIcacheDemandFill");
+            getProbeManager(), "BtbpTraceL1IDemandAccess");
     ppBtbpTraceDecodeBranch =
         new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
             getProbeManager(), "BtbpTraceDecodeBranch");
+    ppBtbpTraceBranchDemand =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceBranchDemand");
 
     fetch.regProbePoints();
     rename.regProbePoints();
@@ -366,14 +369,14 @@ CPU::notifyBtbpTrace(
     using Event = branch_prediction::btb_pred::BtbpTraceEvent;
 
     switch (event.eventType) {
-      case Event::BtbLookup:
-        if (ppBtbpTraceBtbLookup) {
-            ppBtbpTraceBtbLookup->notify(event);
+      case Event::MbtbLookup:
+        if (ppBtbpTraceMbtbLookup) {
+            ppBtbpTraceMbtbLookup->notify(event);
         }
         break;
-      case Event::BtbFill:
-        if (ppBtbpTraceBtbFill) {
-            ppBtbpTraceBtbFill->notify(event);
+      case Event::MbtbFill:
+        if (ppBtbpTraceMbtbFill) {
+            ppBtbpTraceMbtbFill->notify(event);
         }
         break;
       case Event::IPrefetchIssue:
@@ -381,19 +384,24 @@ CPU::notifyBtbpTrace(
             ppBtbpTraceIPrefetchIssue->notify(event);
         }
         break;
-      case Event::IPrefetchFill:
-        if (ppBtbpTraceIPrefetchFill) {
-            ppBtbpTraceIPrefetchFill->notify(event);
+      case Event::LineLifecycle:
+        if (ppBtbpTraceLineLifecycle) {
+            ppBtbpTraceLineLifecycle->notify(event);
         }
         break;
-      case Event::IcacheDemandFill:
-        if (ppBtbpTraceIcacheDemandFill) {
-            ppBtbpTraceIcacheDemandFill->notify(event);
+      case Event::L1IDemandAccess:
+        if (ppBtbpTraceL1IDemandAccess) {
+            ppBtbpTraceL1IDemandAccess->notify(event);
         }
         break;
       case Event::DecodeBranch:
         if (ppBtbpTraceDecodeBranch) {
             ppBtbpTraceDecodeBranch->notify(event);
+        }
+        break;
+      case Event::BranchDemand:
+        if (ppBtbpTraceBranchDemand) {
+            ppBtbpTraceBranchDemand->notify(event);
         }
         break;
       default:

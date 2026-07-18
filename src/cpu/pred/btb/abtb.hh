@@ -344,8 +344,7 @@ class AheadBTB : public TimedBaseBTBPredictor
      *  @param stream Fetch stream with update info
      */
     void updateBTBEntry(Addr btb_idx, Addr btb_tag, const BTBEntry& entry,
-                        const BranchInfo takenbranchinfo, const bool isTaken,
-                        ThreadID tid);
+                                    const BranchInfo takenbranchinfo,const bool isTaken);
 
     /*
      * Comparator for MRU heap

@@ -32,17 +32,19 @@ BtbpTracer::regProbeListeners()
 {
     using Listener = ProbeListenerArg<BtbpTracer, BtbpTraceEvent>;
 
-    listeners.push_back(new Listener(this, "BtbpTraceBtbLookup",
+    listeners.push_back(new Listener(this, "BtbpTraceMbtbLookup",
                                      &BtbpTracer::trace));
-    listeners.push_back(new Listener(this, "BtbpTraceBtbFill",
+    listeners.push_back(new Listener(this, "BtbpTraceMbtbFill",
                                      &BtbpTracer::trace));
     listeners.push_back(new Listener(this, "BtbpTraceIPrefetchIssue",
                                      &BtbpTracer::trace));
-    listeners.push_back(new Listener(this, "BtbpTraceIPrefetchFill",
+    listeners.push_back(new Listener(this, "BtbpTraceLineLifecycle",
                                      &BtbpTracer::trace));
-    listeners.push_back(new Listener(this, "BtbpTraceIcacheDemandFill",
+    listeners.push_back(new Listener(this, "BtbpTraceL1IDemandAccess",
                                      &BtbpTracer::trace));
     listeners.push_back(new Listener(this, "BtbpTraceDecodeBranch",
+                                     &BtbpTracer::trace));
+    listeners.push_back(new Listener(this, "BtbpTraceBranchDemand",
                                      &BtbpTracer::trace));
 }
 
@@ -52,16 +54,75 @@ BtbpTracer::trace(const BtbpTraceEvent &event)
     ProtoMessage::BtbpTraceEntry entry;
     entry.set_tick(event.tick);
     entry.set_event_type(event.eventType);
+    entry.set_schema_version(BtbpTraceEvent::SchemaVersion);
+    entry.set_event_seq(++eventSeq);
     entry.set_thread_id(event.threadId);
-    entry.set_branch_pc(event.branchPc);
-    entry.set_btb_level(event.btbLevel);
-    entry.set_hit(event.hit);
-    entry.set_target(event.target);
-    entry.set_fill_source(event.fillSource);
-    entry.set_line_addr(event.lineAddr);
-    entry.set_trigger_pc(event.triggerPc);
-    entry.set_taken_hint(event.takenHint);
-    entry.set_was_in_btb_at_lookup(event.wasInBtbAtLookup);
+    if (event.branchPcValid) {
+        entry.set_branch_pc(event.branchPc);
+    }
+    if (event.hitValid) {
+        entry.set_hit(event.hit);
+    }
+    if (event.targetValid) {
+        entry.set_target(event.target);
+    }
+    if (event.fillSourceValid) {
+        entry.set_fill_source(event.fillSource);
+    }
+    if (event.lineAddrValid) {
+        entry.set_line_addr(event.lineAddr);
+    }
+    if (event.virtualLineAddrValid) {
+        entry.set_virtual_line_addr(event.virtualLineAddr);
+    }
+    if (event.triggerPcValid) {
+        entry.set_trigger_pc(event.triggerPc);
+    }
+    if (event.takenHintValid) {
+        entry.set_taken_hint(event.takenHint);
+    }
+    if (event.lineSizeValid) {
+        entry.set_line_size(event.lineSize);
+    }
+    if (event.addressSpaceIdValid) {
+        entry.set_address_space_id(event.addressSpaceId);
+    }
+    if (event.asidHashValid) {
+        entry.set_asid_hash(event.asidHash);
+    }
+    if (event.ftqIdValid) {
+        entry.set_ftq_id(event.ftqId);
+    }
+    if (event.lookupTickValid) {
+        entry.set_lookup_tick(event.lookupTick);
+    }
+    if (event.instBytesValid) {
+        entry.set_inst_bytes(event.instBytes);
+    }
+    if (event.streamStartPcValid) {
+        entry.set_stream_start_pc(event.streamStartPc);
+    }
+    if (event.structuralMissValid) {
+        entry.set_structural_miss(event.structuralMiss);
+    }
+    if (event.fdipEpochValid) {
+        entry.set_fdip_epoch(event.fdipEpoch);
+    }
+    if (event.fillBytesTickValid) {
+        entry.set_fill_bytes_tick(event.fillBytesTick);
+    }
+    if (event.l1iReadyTickValid) {
+        entry.set_l1i_ready_tick(event.l1iReadyTick);
+    }
+    if (event.scanCompleteTickValid) {
+        entry.set_scan_complete_tick(event.scanCompleteTick);
+    }
+    if (event.requestKindValid) {
+        entry.set_request_kind(event.requestKind);
+    }
+    if (event.branchKindValid) {
+        entry.set_branch_kind(event.branchKind);
+    }
 
     stream->write(entry);
 }

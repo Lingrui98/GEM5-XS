@@ -359,7 +359,9 @@ struct PathHistoryUpdate
 struct FetchTarget
 {
     ThreadID tid;
+    uint64_t addressSpaceId;
     uint8_t asidHash;
+    unsigned lineSize;
     Addr startPC;       // start pc of the stream
     bool predTaken;     // whether the FetchTarget has taken branch
     Addr predEndPC;     // predicted stream end pc (fall through pc)
@@ -410,7 +412,9 @@ struct FetchTarget
 
    FetchTarget()
        : tid(0),
+         addressSpaceId(0),
          asidHash(0),
+         lineSize(0),
          startPC(0),
          predTaken(false),
          predEndPC(0),
@@ -553,6 +557,7 @@ struct FetchTarget
 struct FullBTBPrediction
 {
     ThreadID tid;
+    uint64_t addressSpaceId;
     uint8_t asidHash;
     Addr bbStart;
     std::vector<BTBEntry> btbEntries; // for BTB, only assigned when hit, sorted by inst order
@@ -575,6 +580,7 @@ struct FullBTBPrediction
 
     FullBTBPrediction() :
         tid(0),
+        addressSpaceId(0),
         asidHash(0),
         bbStart(0),
         btbEntries(),

@@ -26,17 +26,15 @@ namespace branch_prediction
 namespace btb_pred
 {
 
-uint8_t
-DecoupledBPUWithBTB::getThreadAsidHash(ThreadID tid) const
+uint64_t
+DecoupledBPUWithBTB::getThreadAddressSpaceId(ThreadID tid) const
 {
     if (!cpu) {
         return 0;
     }
 
-    const RegVal satp =
-        cpu->readMiscRegNoEffect(RiscvISA::MiscRegIndex::MISCREG_SATP, tid);
-    const uint16_t asid = (satp >> 44) & mask(16);
-    return foldAsidHash16To4(asid);
+    return cpu->readMiscRegNoEffect(
+        RiscvISA::MiscRegIndex::MISCREG_SATP, tid);
 }
 
 void
@@ -165,13 +163,11 @@ void
 DecoupledBPUWithBTB::setCpu(CPU *_cpu)
 {
     cpu = _cpu;
-    for (auto *component : components) {
-        component->setBtbpTraceNotify([this](const BtbpTraceEvent &event) {
-            if (cpu) {
-                cpu->notifyBtbpTrace(event);
-            }
-        });
-    }
+    mbtb->setBtbpTraceNotify([this](const BtbpTraceEvent &event) {
+        if (cpu) {
+            cpu->notifyBtbpTrace(event);
+        }
+    });
 }
 
 bool
@@ -365,7 +361,9 @@ DecoupledBPUWithBTB::requestNewPrediction(ThreadID tid)
 {
     auto& thread = threads[tid];
     auto& predsOfEachStage = threads[tid].predsOfEachStage;
-    const uint8_t asid_hash = getThreadAsidHash(tid);
+    const uint64_t address_space_id = getThreadAddressSpaceId(tid);
+    const uint16_t asid = (address_space_id >> 44) & mask(16);
+    const uint8_t asid_hash = foldAsidHash16To4(asid);
 
     DPRINTF(Override, "Requesting new prediction for PC %#lx\n", thread.s0PC);
 
@@ -373,6 +371,7 @@ DecoupledBPUWithBTB::requestNewPrediction(ThreadID tid)
     clearPreds(tid);
     for (int i = 0; i < numStages; i++) {
         predsOfEachStage[i].tid = tid;
+        predsOfEachStage[i].addressSpaceId = address_space_id;
         predsOfEachStage[i].asidHash = asid_hash;
         predsOfEachStage[i].bbStart = thread.s0PC;
         predsOfEachStage[i].predSource = i;
@@ -1006,7 +1005,9 @@ DecoupledBPUWithBTB::createFetchTargetEntry(ThreadID tid)
     // Create a new fetch target entry
     FetchTarget entry;
     entry.tid = tid;
+    entry.addressSpaceId = finalPred.addressSpaceId;
     entry.asidHash = finalPred.asidHash;
+    entry.lineSize = cpu->cacheLineSize();
     entry.startPC = s0PC;
 
     // Extract branch prediction information

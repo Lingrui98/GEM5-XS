@@ -304,18 +304,29 @@ MBTB::putPCHistory(Addr startAddr,
 
     // Process BTB entries
     auto processed_entries = processEntries(find_entries, startAddr);
+    meta->lookupTick = curTick();
 
 #ifndef UNIT_TEST
     BtbpTraceEvent lookup_event;
     lookup_event.tick = curTick();
-    lookup_event.eventType = BtbpTraceEvent::BtbLookup;
+    lookup_event.eventType = BtbpTraceEvent::MbtbLookup;
     lookup_event.threadId = stagePreds.empty() ? 0 : stagePreds.front().tid;
-    lookup_event.branchPc =
-        processed_entries.empty() ? startAddr : processed_entries.front().pc;
-    lookup_event.btbLevel = BtbpTraceEvent::MBTB;
     lookup_event.hit = !processed_entries.empty();
-    lookup_event.target =
-        processed_entries.empty() ? 0 : processed_entries.front().target;
+    lookup_event.hitValid = true;
+    if (!processed_entries.empty()) {
+        lookup_event.branchPc = processed_entries.front().pc;
+        lookup_event.branchPcValid = true;
+        lookup_event.target = processed_entries.front().target;
+        lookup_event.targetValid = true;
+    }
+    lookup_event.streamStartPc = startAddr;
+    lookup_event.streamStartPcValid = true;
+    if (!stagePreds.empty()) {
+        lookup_event.addressSpaceId = stagePreds.front().addressSpaceId;
+        lookup_event.addressSpaceIdValid = true;
+        lookup_event.asidHash = stagePreds.front().asidHash;
+        lookup_event.asidHashValid = true;
+    }
     notifyBtbpTrace(lookup_event);
 #endif
 
@@ -549,12 +560,23 @@ MBTB::updateBTBEntry(const BTBEntry& entry, const FetchTarget &stream)
     auto notify_fill = [&]() {
         BtbpTraceEvent fill_event;
         fill_event.tick = curTick();
-        fill_event.eventType = BtbpTraceEvent::BtbFill;
+        fill_event.eventType = BtbpTraceEvent::MbtbFill;
         fill_event.threadId = stream.tid;
         fill_event.branchPc = ticked_entry.pc;
-        fill_event.btbLevel = BtbpTraceEvent::MBTB;
+        fill_event.branchPcValid = true;
         fill_event.target = ticked_entry.target;
+        fill_event.targetValid = true;
         fill_event.fillSource = BtbpTraceEvent::ExecWriteback;
+        fill_event.fillSourceValid = true;
+        fill_event.addressSpaceId = stream.addressSpaceId;
+        fill_event.addressSpaceIdValid = true;
+        fill_event.asidHash = stream.asidHash;
+        fill_event.asidHashValid = true;
+        fill_event.branchKind = ticked_entry.isReturn ?
+            BtbpTraceEvent::ReturnBranch :
+            (ticked_entry.isIndirect ? BtbpTraceEvent::IndirectBranch :
+                                       BtbpTraceEvent::DirectBranch);
+        fill_event.branchKindValid = true;
         notifyBtbpTrace(fill_event);
     };
 #endif
@@ -928,6 +950,45 @@ MBTB::commitBranch(const FetchTarget &stream, const DynInstPtr &inst)
                 btbStats.returnMisses++;
             }
         }
+    }
+
+    if (inst->isDirectCtrl() && !inst->isIndirectCtrl() &&
+        !inst->isReturn()) {
+        BtbpTraceEvent demand_event;
+        demand_event.tick = curTick();
+        demand_event.eventType = BtbpTraceEvent::BranchDemand;
+        demand_event.threadId = stream.tid;
+        demand_event.branchPc = pc;
+        demand_event.branchPcValid = true;
+        demand_event.hit = this_branch_hit;
+        demand_event.hitValid = true;
+        std::unique_ptr<PCStateBase> target =
+            inst->staticInst->branchTarget(inst->pcState());
+        demand_event.target = target->instAddr();
+        demand_event.targetValid = true;
+        demand_event.takenHint = inst->hasTraceBranchInfo() ?
+            inst->traceBranchTaken() :
+            (inst->branching() || inst->isUncondCtrl());
+        demand_event.takenHintValid = true;
+        demand_event.lineSize = stream.lineSize;
+        demand_event.lineSizeValid = true;
+        demand_event.addressSpaceId = stream.addressSpaceId;
+        demand_event.addressSpaceIdValid = true;
+        demand_event.asidHash = stream.asidHash;
+        demand_event.asidHashValid = true;
+        demand_event.ftqId = inst->getFtqId();
+        demand_event.ftqIdValid = true;
+        demand_event.lookupTick = meta->lookupTick;
+        demand_event.lookupTickValid = true;
+        demand_event.instBytes = inst->getInstBytes();
+        demand_event.instBytesValid = true;
+        demand_event.streamStartPc = stream.startPC;
+        demand_event.streamStartPcValid = true;
+        demand_event.structuralMiss = false;
+        demand_event.structuralMissValid = true;
+        demand_event.branchKind = BtbpTraceEvent::DirectBranch;
+        demand_event.branchKindValid = true;
+        notifyBtbpTrace(demand_event);
     }
 }
 #endif

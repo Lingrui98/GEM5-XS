@@ -765,6 +765,8 @@ Fetch::initFdipTargetState(ThreadID tid)
     state.reset();
     state.valid = true;
     state.ftqId = dbpbtb->ftqPrefetchHeadId(tid);
+    state.addressSpaceId = target.addressSpaceId;
+    state.asidHash = target.asidHash;
     state.startPC = target.startPC;
     state.epoch = fdipEpoch[tid];
     std::array<Addr, 2> line_addrs{};
@@ -810,6 +812,10 @@ Fetch::startFdipTranslation(ThreadID tid, unsigned lineIndex)
     xsMeta.fdipEpoch = state.epoch;
     xsMeta.fdipFtqId = state.ftqId;
     xsMeta.fdipStartPC = state.startPC;
+    xsMeta.traceIdentityValid = true;
+    xsMeta.traceAddressSpaceId = state.addressSpaceId;
+    xsMeta.traceAsidHash = state.asidHash;
+    xsMeta.traceFtqId = state.ftqId;
     req->setXsMetadata(xsMeta);
 
     line.req = req;
@@ -898,7 +904,24 @@ Fetch::issueFdipReadyLine(ThreadID tid, unsigned lineIndex,
         branch_prediction::btb_pred::BtbpTraceEvent::IPrefetchIssue;
     issue_event.threadId = tid;
     issue_event.lineAddr = line.physLineAddr;
+    issue_event.lineAddrValid = true;
+    issue_event.virtualLineAddr = line.lineAddr;
+    issue_event.virtualLineAddrValid = true;
+    issue_event.lineSize = cacheBlkSize;
+    issue_event.lineSizeValid = true;
     issue_event.triggerPc = state.startPC;
+    issue_event.triggerPcValid = true;
+    issue_event.addressSpaceId = state.addressSpaceId;
+    issue_event.addressSpaceIdValid = true;
+    issue_event.asidHash = state.asidHash;
+    issue_event.asidHashValid = true;
+    issue_event.ftqId = state.ftqId;
+    issue_event.ftqIdValid = true;
+    issue_event.fdipEpoch = state.epoch;
+    issue_event.fdipEpochValid = true;
+    issue_event.requestKind =
+        branch_prediction::btb_pred::BtbpTraceEvent::PrefetchRequest;
+    issue_event.requestKindValid = true;
     cpu->notifyBtbpTrace(issue_event);
 
     if (fdipOutstandingLines > fetchStats.fdipOutstandingMax.value()) {
@@ -1273,6 +1296,13 @@ Fetch::handleMultiCacheLineFetch(Addr vaddr, ThreadID tid, Addr pc)
     threads[tid].cacheReq.baseAddr = vaddr;
     threads[tid].cacheReq.totalSize = fetchBufferSize;
 
+    const auto &fetch_target = dbpbtb->ftqFetchingTarget(tid);
+    Request::XsMetadata trace_meta;
+    trace_meta.traceIdentityValid = true;
+    trace_meta.traceAddressSpaceId = fetch_target.addressSpaceId;
+    trace_meta.traceAsidHash = fetch_target.asidHash;
+    trace_meta.traceFtqId = dbpbtb->ftqHeadId(tid);
+
     Addr fetchPC = vaddr;
     unsigned fetchSize = cacheBlkSize - fetchPC % cacheBlkSize;  // Size for first cache line
 
@@ -1286,6 +1316,7 @@ Fetch::handleMultiCacheLineFetch(Addr vaddr, ThreadID tid, Addr pc)
         cpu->thread[tid]->contextId());
 
     first_mem_req->taskId(cpu->taskId());
+    first_mem_req->setXsMetadata(trace_meta);
     first_mem_req->setMisalignedFetch();
     first_mem_req->setReqNum(1);
 
@@ -1313,6 +1344,7 @@ Fetch::handleMultiCacheLineFetch(Addr vaddr, ThreadID tid, Addr pc)
         cpu->thread[tid]->contextId());
 
     second_mem_req->taskId(cpu->taskId());
+    second_mem_req->setXsMetadata(trace_meta);
     second_mem_req->setMisalignedFetch();
     second_mem_req->setReqNum(2);
 

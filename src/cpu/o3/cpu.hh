@@ -195,17 +195,19 @@ class CPU : public BaseCPU
     ProbePointArg<PacketPtr> *ppInstAccessComplete;
     ProbePointArg<std::pair<DynInstPtr, PacketPtr> > *ppDataAccessComplete;
     ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
-        *ppBtbpTraceBtbLookup = nullptr;
+        *ppBtbpTraceMbtbLookup = nullptr;
     ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
-        *ppBtbpTraceBtbFill = nullptr;
+        *ppBtbpTraceMbtbFill = nullptr;
     ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
         *ppBtbpTraceIPrefetchIssue = nullptr;
     ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
-        *ppBtbpTraceIPrefetchFill = nullptr;
+        *ppBtbpTraceLineLifecycle = nullptr;
     ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
-        *ppBtbpTraceIcacheDemandFill = nullptr;
+        *ppBtbpTraceL1IDemandAccess = nullptr;
     ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
         *ppBtbpTraceDecodeBranch = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceBranchDemand = nullptr;
 
     /** Register probe points. */
     void regProbePoints() override;

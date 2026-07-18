@@ -12,44 +12,88 @@ namespace btb_pred
 
 struct BtbpTraceEvent
 {
+    static constexpr uint32_t SchemaVersion = 4;
+
     enum EventType : uint32_t
     {
-        BtbLookup = 1,
-        BtbFill = 2,
+        MbtbLookup = 1,
+        MbtbFill = 2,
         IPrefetchIssue = 3,
-        IPrefetchFill = 4,
-        IcacheDemandFill = 5,
+        LineLifecycle = 4,
+        L1IDemandAccess = 5,
         DecodeBranch = 6,
-    };
-
-    enum BtbLevel : uint32_t
-    {
-        UBTB = 0,
-        AheadBTB = 1,
-        MBTB = 2,
+        BranchDemand = 7,
     };
 
     enum FillSource : uint32_t
     {
-        DecodeWriteback = 0,
-        OracleScan = 1,
-        PrefetchScan = 2,
-        ExecWriteback = 3,
-        CoherenceEvict = 4,
+        ExecWriteback = 1,
+        InternalVictimMove = 3,
+    };
+
+    enum RequestKind : uint32_t
+    {
+        UnknownRequest = 0,
+        DemandRequest = 1,
+        PrefetchRequest = 2,
+    };
+
+    enum BranchKind : uint32_t
+    {
+        UnknownBranch = 0,
+        DirectBranch = 1,
+        IndirectBranch = 2,
+        ReturnBranch = 3,
     };
 
     Tick tick = 0;
     uint32_t eventType = 0;
     ThreadID threadId = 0;
+
     Addr branchPc = 0;
-    uint32_t btbLevel = 0;
+    bool branchPcValid = false;
     bool hit = false;
+    bool hitValid = false;
     Addr target = 0;
+    bool targetValid = false;
     uint32_t fillSource = 0;
+    bool fillSourceValid = false;
     Addr lineAddr = 0;
+    bool lineAddrValid = false;
+    Addr virtualLineAddr = 0;
+    bool virtualLineAddrValid = false;
     Addr triggerPc = 0;
+    bool triggerPcValid = false;
     bool takenHint = false;
-    bool wasInBtbAtLookup = false;
+    bool takenHintValid = false;
+    uint32_t lineSize = 0;
+    bool lineSizeValid = false;
+    uint64_t addressSpaceId = 0;
+    bool addressSpaceIdValid = false;
+    uint32_t asidHash = 0;
+    bool asidHashValid = false;
+    uint64_t ftqId = 0;
+    bool ftqIdValid = false;
+    uint64_t fdipEpoch = 0;
+    bool fdipEpochValid = false;
+    Tick lookupTick = 0;
+    bool lookupTickValid = false;
+    Tick fillBytesTick = 0;
+    bool fillBytesTickValid = false;
+    Tick l1iReadyTick = 0;
+    bool l1iReadyTickValid = false;
+    Tick scanCompleteTick = 0;
+    bool scanCompleteTickValid = false;
+    uint32_t instBytes = 0;
+    bool instBytesValid = false;
+    Addr streamStartPc = 0;
+    bool streamStartPcValid = false;
+    bool structuralMiss = false;
+    bool structuralMissValid = false;
+    uint32_t requestKind = UnknownRequest;
+    bool requestKindValid = false;
+    uint32_t branchKind = UnknownBranch;
+    bool branchKindValid = false;
 };
 
 } // namespace btb_pred

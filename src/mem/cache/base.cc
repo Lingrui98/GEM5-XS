@@ -87,6 +87,68 @@
 namespace gem5
 {
 
+namespace
+{
+
+o3::CPU *
+resolveBtbpTraceCpu(System *system, const RequestPtr &request, ThreadID &tid)
+{
+    if (!request || !request->hasContextId()) {
+        return nullptr;
+    }
+
+    const ContextID context_id = request->contextId();
+    if (context_id < 0 || context_id >= system->threads.size()) {
+        return nullptr;
+    }
+
+    ThreadContext *thread_context = system->threads[context_id];
+    if (!thread_context) {
+        return nullptr;
+    }
+
+    auto *cpu = dynamic_cast<o3::CPU *>(thread_context->getCpuPtr());
+    if (cpu) {
+        tid = cpu->contextToThread(context_id);
+    }
+    return cpu;
+}
+
+void
+populateBtbpRequestIdentity(
+    branch_prediction::btb_pred::BtbpTraceEvent &event,
+    const RequestPtr &request, unsigned line_size)
+{
+    event.lineSize = line_size;
+    event.lineSizeValid = true;
+    if (request->hasVaddr()) {
+        const Addr vaddr = request->getVaddr();
+        event.virtualLineAddr = vaddr - (vaddr % line_size);
+        event.virtualLineAddrValid = true;
+    }
+    if (!request->hasXsMetadata()) {
+        return;
+    }
+
+    const Request::XsMetadata xs_meta = request->getXsMetadata();
+    if (xs_meta.traceIdentityValid) {
+        event.addressSpaceId = xs_meta.traceAddressSpaceId;
+        event.addressSpaceIdValid = true;
+        event.asidHash = xs_meta.traceAsidHash;
+        event.asidHashValid = true;
+        event.ftqId = xs_meta.traceFtqId;
+        event.ftqIdValid = true;
+    }
+    if (xs_meta.isFdip()) {
+        event.fdipEpoch = xs_meta.fdipEpoch;
+        event.fdipEpochValid = true;
+        event.triggerPc = xs_meta.fdipStartPC;
+        event.triggerPcValid = true;
+    }
+}
+
+} // anonymous namespace
+
 BaseCache::SendTimingRespEvent::SendTimingRespEvent(BaseCache* cache, PacketPtr pkt)
     : Event(Delayed_Writeback_Pri, AutoDelete),
       cache(cache),
@@ -866,6 +928,7 @@ BaseCache::calReqInterval(PacketPtr pkt)
 void
 BaseCache::recvTimingReq(PacketPtr pkt)
 {
+    const Tick request_arrival_tick = curTick();
     calReqInterval(pkt);
 
     if (pkt->isStorePFTrain()) {
@@ -920,6 +983,27 @@ BaseCache::recvTimingReq(PacketPtr pkt)
         // to the write buffer to ensure they logically precede anything
         // happening below
         doWritebacks(writebacks, clockEdge(lat + forwardLatency));
+    }
+
+    if (isL1I() && pkt->req && pkt->req->isInstFetch() &&
+        !pkt->req->isPrefetch()) {
+        ThreadID tid = 0;
+        if (auto *cpu = resolveBtbpTraceCpu(system, pkt->req, tid)) {
+            branch_prediction::btb_pred::BtbpTraceEvent demand_event;
+            demand_event.tick = request_arrival_tick;
+            demand_event.eventType = branch_prediction::btb_pred::
+                BtbpTraceEvent::L1IDemandAccess;
+            demand_event.threadId = tid;
+            demand_event.lineAddr = pkt->getBlockAddr(blkSize);
+            demand_event.lineAddrValid = true;
+            demand_event.hit = satisfied;
+            demand_event.hitValid = true;
+            demand_event.requestKind = branch_prediction::btb_pred::
+                BtbpTraceEvent::DemandRequest;
+            demand_event.requestKindValid = true;
+            populateBtbpRequestIdentity(demand_event, pkt->req, blkSize);
+            cpu->notifyBtbpTrace(demand_event);
+        }
     }
 
     if (!satisfied && forceHit && !pkt->req->isInstFetch() && pkt->isRead() && pkt->req->hasPC() &&
@@ -2472,40 +2556,30 @@ BaseCache::handleFill(PacketPtr pkt, CacheBlk *blk, PacketList &writebacks,
         stats.fdipInstalled++;
     }
     if (isL1I() && pkt->req && pkt->req->isInstFetch()) {
-        ContextID context_id = pkt->req->contextId();
-        o3::CPU *cpu = nullptr;
         ThreadID tid = 0;
-        if (context_id >= 0 && context_id < system->threads.size()) {
-            ThreadContext *thread_context = system->threads[context_id];
-            if (thread_context) {
-                cpu = dynamic_cast<o3::CPU *>(thread_context->getCpuPtr());
-                if (cpu) {
-                    tid = cpu->contextToThread(context_id);
-                }
-            }
-        }
-
-        if (cpu) {
-            branch_prediction::btb_pred::BtbpTraceEvent fill_event;
-            fill_event.tick = curTick();
-            fill_event.threadId = tid;
-            fill_event.lineAddr = addr;
-            if (isFdipSource(pkt->req->getPFSource())) {
-                fill_event.eventType = branch_prediction::btb_pred::
-                    BtbpTraceEvent::IPrefetchFill;
-                if (pkt->req->hasXsMetadata()) {
-                    fill_event.triggerPc =
-                        pkt->req->getXsMetadata().fdipStartPC;
-                }
-            } else if (!pkt->req->isPrefetch()) {
-                fill_event.eventType = branch_prediction::btb_pred::
-                    BtbpTraceEvent::IcacheDemandFill;
-                fill_event.triggerPc = pkt->req->getPC();
-            }
-
-            if (fill_event.eventType != 0) {
-                cpu->notifyBtbpTrace(fill_event);
-            }
+        if (auto *cpu = resolveBtbpTraceCpu(system, pkt->req, tid)) {
+            branch_prediction::btb_pred::BtbpTraceEvent lifecycle_event;
+            lifecycle_event.tick = curTick();
+            lifecycle_event.eventType = branch_prediction::btb_pred::
+                BtbpTraceEvent::LineLifecycle;
+            lifecycle_event.threadId = tid;
+            lifecycle_event.lineAddr = addr;
+            lifecycle_event.lineAddrValid = true;
+            lifecycle_event.fillBytesTick = curTick();
+            lifecycle_event.fillBytesTickValid = true;
+            lifecycle_event.l1iReadyTick = blk->getWhenReady();
+            lifecycle_event.l1iReadyTickValid = true;
+            lifecycle_event.scanCompleteTick = curTick();
+            lifecycle_event.scanCompleteTickValid = true;
+            lifecycle_event.requestKind =
+                isFdipSource(pkt->req->getPFSource()) ?
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        PrefetchRequest :
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        DemandRequest;
+            lifecycle_event.requestKindValid = true;
+            populateBtbpRequestIdentity(lifecycle_event, pkt->req, blkSize);
+            cpu->notifyBtbpTrace(lifecycle_event);
         }
     }
     DPRINTF(Cache, "%s: Mark blk as prefetched by source %i, form req %p\n", __func__,

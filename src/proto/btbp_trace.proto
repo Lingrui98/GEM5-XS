@@ -2,27 +2,37 @@ syntax = "proto2";
 
 package ProtoMessage;
 
-// Event type:
-// 1=btb_lookup, 2=btb_fill, 3=iprefetch_issue, 4=iprefetch_fill,
-// 5=icache_demand_fill, 6=decode_branch
-//
-// BTB level:
-// 0=uBTB, 1=AheadBTB, 2=mBTB
-//
-// Fill source:
-// 0=decode_writeback, 1=oracle_scan, 2=prefetch_scan, 3=exec_writeback,
-// 4=coherence_evict
+// Schema v4 is mBTB-only. Event type:
+// 1=mbtb_lookup, 2=mbtb_fill, 3=iprefetch_issue, 4=line_lifecycle,
+// 5=l1i_demand_access, 6=decode_branch, 7=branch_demand.
 message BtbpTraceEntry {
   required uint64 tick = 1;
   required uint32 event_type = 2;
   optional uint32 thread_id = 3;
   optional uint64 branch_pc = 4;
-  optional uint32 btb_level = 5;
+  reserved 5;
   optional bool hit = 6;
   optional uint64 target = 7;
   optional uint32 fill_source = 8;
   optional uint64 line_addr = 9;
   optional uint64 trigger_pc = 10;
   optional bool taken_hint = 11;
-  optional bool was_in_btb_at_lookup = 12;
+  reserved 12;
+  optional uint64 virtual_line_addr = 13;
+  optional uint32 line_size = 14;
+  optional uint64 address_space_id = 15;
+  optional uint32 asid_hash = 16;
+  optional uint64 ftq_id = 17;
+  optional uint64 lookup_tick = 18;
+  optional uint32 inst_bytes = 19;
+  optional uint64 stream_start_pc = 20;
+  optional bool structural_miss = 21;
+  required uint32 schema_version = 22;
+  required uint64 event_seq = 23;
+  optional uint64 fdip_epoch = 24;
+  optional uint64 fill_bytes_tick = 25;
+  optional uint64 l1i_ready_tick = 26;
+  optional uint64 scan_complete_tick = 27;
+  optional uint32 request_kind = 28;
+  optional uint32 branch_kind = 29;
 }

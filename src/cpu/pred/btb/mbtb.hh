@@ -238,6 +238,7 @@ class MBTB : public TimedBaseBTBPredictor
 
     typedef struct BTBMeta {
         std::vector<BTBEntry> hit_entries;
+        Tick lookupTick = 0;
         BTBMeta() {
             std::vector<BTBEntry> es;
             hit_entries = es;

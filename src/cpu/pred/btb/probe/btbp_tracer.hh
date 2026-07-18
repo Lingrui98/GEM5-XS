@@ -1,6 +1,7 @@
 #ifndef __CPU_PRED_BTB_PROBE_BTBP_TRACER_HH__
 #define __CPU_PRED_BTB_PROBE_BTBP_TRACER_HH__
 
+#include <cstdint>
 #include <memory>
 
 #include "cpu/pred/btb/probe/btbp_trace_event.hh"
@@ -29,6 +30,7 @@ class BtbpTracer : public ProbeListenerObject
     void close();
 
     std::unique_ptr<ProtoOutputStream> stream;
+    uint64_t eventSeq = 0;
 };
 
 } // namespace btb_pred

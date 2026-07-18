@@ -43,11 +43,13 @@
 
 #include "arch/generic/pcstate.hh"
 #include "arch/riscv/insts/fusion.hh"
+#include "arch/riscv/regs/misc.hh"
 #include "base/trace.hh"
 #include "config/the_isa.hh"
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/limits.hh"
+#include "cpu/pred/btb/common.hh"
 #include "debug/Activity.hh"
 #include "debug/Counters.hh"
 #include "debug/Decode.hh"
@@ -722,17 +724,35 @@ Decode::decodeInsts(ThreadID tid)
                 branch_prediction::btb_pred::BtbpTraceEvent::DecodeBranch;
             branch_event.threadId = tid;
             branch_event.branchPc = inst->getPC();
+            branch_event.branchPcValid = true;
+            std::unique_ptr<PCStateBase> target =
+                inst->staticInst->branchTarget(inst->pcState());
+            branch_event.target = target->instAddr();
+            branch_event.targetValid = true;
             if (cpu->isTraceMode() && inst->hasTraceBranchInfo()) {
-                branch_event.target = inst->traceBranchNextPC();
                 branch_event.takenHint = inst->traceBranchTaken();
             } else {
-                std::unique_ptr<PCStateBase> target = inst->branchTarget();
-                branch_event.target =
-                    target->as<RiscvISA::PCState>().instAddr();
                 branch_event.takenHint =
                     inst->isUncondCtrl() || inst->readPredTaken();
             }
-            branch_event.wasInBtbAtLookup = inst->readPredTaken();
+            branch_event.takenHintValid = true;
+            branch_event.ftqId = inst->getFtqId();
+            branch_event.ftqIdValid = true;
+            branch_event.instBytes = inst->getInstBytes();
+            branch_event.instBytesValid = true;
+            const RegVal address_space_id = cpu->readMiscRegNoEffect(
+                RiscvISA::MiscRegIndex::MISCREG_SATP, tid);
+            const uint16_t asid = (address_space_id >> 44) & 0xffff;
+            branch_event.addressSpaceId = address_space_id;
+            branch_event.addressSpaceIdValid = true;
+            branch_event.asidHash =
+                branch_prediction::btb_pred::foldAsidHash16To4(asid);
+            branch_event.asidHashValid = true;
+            branch_event.lineSize = cpu->cacheLineSize();
+            branch_event.lineSizeValid = true;
+            branch_event.branchKind = branch_prediction::btb_pred::
+                BtbpTraceEvent::DirectBranch;
+            branch_event.branchKindValid = true;
             cpu->notifyBtbpTrace(branch_event);
         }
 
