@@ -647,12 +647,21 @@ MBTB::updateBTBEntry(
     auto notify_fill = [&]() {
         BtbpTraceEvent fill_event;
         fill_event.tick = curTick();
-        fill_event.eventType = BtbpTraceEvent::BtbFill;
+        fill_event.eventType = BtbpTraceEvent::MbtbFill;
         fill_event.threadId = stream.tid;
         fill_event.branchPc = ticked_entry.pc;
-        fill_event.btbLevel = BtbpTraceEvent::MBTB;
+        fill_event.branchPcValid = true;
         fill_event.target = ticked_entry.target;
+        fill_event.targetValid = true;
         fill_event.fillSource = BtbpTraceEvent::ExecWriteback;
+        fill_event.fillSourceValid = true;
+        fill_event.asidHash = stream.asidHash;
+        fill_event.asidHashValid = true;
+        fill_event.branchKind = ticked_entry.isReturn ?
+            BtbpTraceEvent::ReturnBranch :
+            (ticked_entry.isIndirect ? BtbpTraceEvent::IndirectBranch :
+                                       BtbpTraceEvent::DirectBranch);
+        fill_event.branchKindValid = true;
         notifyBtbpTrace(fill_event);
     };
 #endif
@@ -1033,6 +1042,43 @@ MBTB::commitBranch(const PredictionUpdateContext &context,
         if (outcome.isReturn) {
             btbStats.returnMisses++;
         }
+    }
+
+    if (inst->isDirectCtrl() && !inst->isIndirectCtrl() &&
+        !inst->isReturn()) {
+        BtbpTraceEvent demand_event;
+        demand_event.tick = curTick();
+        demand_event.eventType = BtbpTraceEvent::BranchDemand;
+        demand_event.threadId = stream.tid;
+        demand_event.branchPc = pc;
+        demand_event.branchPcValid = true;
+        demand_event.hit = this_branch_hit;
+        demand_event.hitValid = true;
+        std::unique_ptr<PCStateBase> target =
+            inst->staticInst->branchTarget(inst->pcState());
+        demand_event.target = target->instAddr();
+        demand_event.targetValid = true;
+        demand_event.takenHint = inst->hasTraceBranchInfo() ?
+            inst->traceBranchTaken() :
+            (inst->branching() || inst->isUncondCtrl());
+        demand_event.takenHintValid = true;
+        demand_event.lineSize = stream.lineSize;
+        demand_event.lineSizeValid = true;
+        demand_event.asidHash = stream.asidHash;
+        demand_event.asidHashValid = true;
+        demand_event.ftqId = inst->getFtqId();
+        demand_event.ftqIdValid = true;
+        demand_event.lookupTick = meta->lookupTick;
+        demand_event.lookupTickValid = true;
+        demand_event.instBytes = inst->getInstBytes();
+        demand_event.instBytesValid = true;
+        demand_event.streamStartPc = stream.startPC;
+        demand_event.streamStartPcValid = true;
+        demand_event.structuralMiss = false;
+        demand_event.structuralMissValid = true;
+        demand_event.branchKind = BtbpTraceEvent::DirectBranch;
+        demand_event.branchKindValid = true;
+        notifyBtbpTrace(demand_event);
     }
 }
 #endif
