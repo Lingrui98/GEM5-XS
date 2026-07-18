@@ -340,6 +340,8 @@ def addCommonOptions(parser, configure_xiangshan=False):
     parser.add_argument("--warmup-insts-no-switch", action="store", type=int,
         default=20*10**6,
         help="Warmup period in total instructions, reset stats without switch")
+    parser.add_argument("--roi-insts", action="store", type=int, default=None,
+        help="Measured committed instructions after warmup, then dump stats and exit")
 
     parser.add_argument(
         "--stats-root", action="append", default=[],

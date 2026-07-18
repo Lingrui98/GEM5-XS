@@ -69,6 +69,7 @@
 #include "sim/cur_tick.hh"
 #include "sim/full_system.hh"
 #include "sim/process.hh"
+#include "sim/sim_exit.hh"
 #include "sim/stat_control.hh"
 #include "sim/system.hh"
 
@@ -633,6 +634,10 @@ CPU::tick()
     DPRINTF(O3CPU, "\n\nO3CPU: Ticking main, O3CPU.\n");
     assert(!switchedOut());
     assert(drainState() != DrainState::Drained);
+
+    // A warmup boundary exits m5.simulate() and resumes on a later tick.
+    // The flag only prevents additional commits in the boundary tick.
+    stopCommitAtBoundaryFlag = false;
 
     ++baseStats.numCycles;
     ipc_r.roll(1);
@@ -1431,6 +1436,8 @@ CPU::addInst(const DynInstPtr &inst)
 void
 CPU::instDone(ThreadID tid, const DynInstPtr &inst)
 {
+    const Counter previousCommittedThreadInsts = thread[tid]->numInst;
+
     if (!inst->isMicroop() || inst->isLastMicroop()) {
         thread[tid]->numInst++;
         thread[tid]->threadStats.numInsts++;
@@ -1446,6 +1453,16 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
         }
 
         const uint64_t committedThreadInsts = thread[tid]->numInst;
+
+        // A fused macro advances this architectural count by two. A boundary
+        // crossed by that indivisible macro is therefore target + 1 at most.
+
+        if (this->roiInstCount && !this->warmupInstCount &&
+                !roiEndInstCountSet[tid]) {
+            roiEndInstCounts[tid] =
+                previousCommittedThreadInsts + this->roiInstCount;
+            roiEndInstCountSet[tid] = true;
+        }
 
         if (this->nextDumpInstCount && !dump_done
                 && committedThreadInsts >= this->nextDumpInstCount) {
@@ -1464,10 +1481,38 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
 
         if (this->warmupInstCount && !warmup_done &&
                 committedThreadInsts >= this->warmupInstCount) {
-            fprintf(stderr, "Will trigger stat dump and reset\n");
+            fprintf(stderr,
+                    "BTBP WARMUP_END committed_insts=%llu\n",
+                    static_cast<unsigned long long>(committedThreadInsts));
             statistics::schedStatEvent(true, true, curTick(), 0);
-            scheduleInstStop(tid,0,"Will trigger stat dump and reset");
+            exitSimLoop("Will trigger stat dump and reset");
             warmup_done = true;
+            stopCommitAtBoundaryFlag = true;
+
+            if (this->roiInstCount) {
+                roiEndInstCounts[tid] =
+                    committedThreadInsts + this->roiInstCount;
+                roiEndInstCountSet[tid] = true;
+            }
+        }
+
+        if (this->roiInstCount && !roi_done &&
+                roiEndInstCountSet[tid] &&
+                committedThreadInsts >= roiEndInstCounts[tid]) {
+            const Counter roiStartInsts =
+                roiEndInstCounts[tid] - this->roiInstCount;
+            const Counter measuredRoiInsts =
+                committedThreadInsts - roiStartInsts;
+            fprintf(stderr,
+                    "BTBP ROI_END_REQUEST committed_insts=%llu "
+                    "roi_insts=%llu requested_roi_insts=%llu\n",
+                    static_cast<unsigned long long>(committedThreadInsts),
+                    static_cast<unsigned long long>(measuredRoiInsts),
+                    static_cast<unsigned long long>(this->roiInstCount));
+            statistics::schedStatEvent(true, false, curTick(), 0);
+            exitSimLoop("BTBP ROI end");
+            roi_done = true;
+            stopCommitAtBoundaryFlag = true;
         }
     }
 

@@ -149,6 +149,8 @@ class BaseCPU(ClockedObject):
 
     warmupInstCount = Param.Counter(0,
         "reset stats when any thread has reached this inst count")
+    roiInstCount = Param.Counter(0,
+        "measured committed instructions after warmup, then dump stats and exit")
 
     enable_difftest = Param.Bool(False,"use NEMU as ref to difftest")
     dump_commit = Param.Bool(False,"dump commit log")

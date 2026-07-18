@@ -43,6 +43,7 @@
 #ifndef __CPU_O3_CPU_HH__
 #define __CPU_O3_CPU_HH__
 
+#include <array>
 #include <iostream>
 #include <list>
 #include <queue>
@@ -135,6 +136,10 @@ class CPU : public BaseCPU
 
     bool dump_done = false;
     bool warmup_done = false;
+    bool roi_done = false;
+    bool stopCommitAtBoundaryFlag = false;
+    std::array<Counter, MaxThreads> roiEndInstCounts = {};
+    std::array<bool, MaxThreads> roiEndInstCountSet = {};
 
 
     /** The tick event used for scheduling CPU ticks. */
@@ -421,6 +426,9 @@ class CPU : public BaseCPU
 
     /** Function to tell the CPU that an instruction has completed. */
     void instDone(ThreadID tid, const DynInstPtr &inst);
+
+    /** Stop Commit after the current architectural instruction. */
+    bool stopCommitAtBoundary() const { return stopCommitAtBoundaryFlag; }
 
     /** Remove an instruction from the front end of the list.  There's
      *  no restriction on location of the instruction.

@@ -1235,13 +1235,18 @@ Commit::commitInsts()
 
     // Commit each thread independently for up to its local commit window.
     for (ThreadID commit_thread : *activeThreads) {
+        if (cpu->stopCommitAtBoundary()) {
+            break;
+        }
+
         if (commitStatus[commit_thread] != Running &&
             commitStatus[commit_thread] != Idle &&
             commitStatus[commit_thread] != FetchTrapPending) {
             continue;
         }
 
-            while (num_committed < commit_width &&
+            while (!cpu->stopCommitAtBoundary() &&
+                num_committed < commit_width &&
                 num_committed_per_thread[commit_thread] <
                     commit_width_per_thread[commit_thread]) {
             // hardware transactionally memory
