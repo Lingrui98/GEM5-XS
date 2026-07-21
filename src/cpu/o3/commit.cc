@@ -2153,12 +2153,20 @@ Commit::updateComInstStats(const DynInstPtr &inst)
         stats.instsCommitted[tid]++;
     stats.opsCommitted[tid]++;
 
-    // A trace record can decode as a nop when its dependencies cannot be
-    // represented by the synthetic instruction. Count that record so trace
-    // ROI boundaries remain aligned with the source trace.
+    // Trace-mode ROI boundaries follow the source-record catalog, not the
+    // architectural commit counter. Wrong-path and injected prefetch
+    // instructions have no trace metadata and must not advance that boundary.
     const bool is_trace_record =
         cpu->isTraceMode() && cpu->isTraceInstruction(inst->seqNum);
-    if ((!inst->isNop() || is_trace_record) && !inst->isInstPrefetch()) {
+    if (is_trace_record) {
+        const uint64_t trace_record_index =
+            cpu->getTraceIndexForSeqNum(inst->seqNum);
+        panic_if(trace_record_index == 0,
+                 "Committed trace instruction [sn:%llu] has no source index",
+                 inst->seqNum);
+        cpu->instDone(tid, inst, trace_record_index);
+    } else if (!cpu->isTraceMode() && !inst->isNop() &&
+               !inst->isInstPrefetch()) {
         cpu->instDone(tid, inst);
     }
 

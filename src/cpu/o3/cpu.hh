@@ -435,7 +435,8 @@ class CPU : public BaseCPU
     ListIt addInst(const DynInstPtr &inst);
 
     /** Function to tell the CPU that an instruction has completed. */
-    void instDone(ThreadID tid, const DynInstPtr &inst);
+    void instDone(ThreadID tid, const DynInstPtr &inst,
+                  Counter traceRecordIndex = 0);
 
     /** Stop Commit after the current architectural instruction. */
     bool stopCommitAtBoundary() const { return stopCommitAtBoundaryFlag; }

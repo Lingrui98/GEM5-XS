@@ -1457,7 +1457,8 @@ CPU::addInst(const DynInstPtr &inst)
 }
 
 void
-CPU::instDone(ThreadID tid, const DynInstPtr &inst)
+CPU::instDone(ThreadID tid, const DynInstPtr &inst,
+              Counter traceRecordIndex)
 {
     const Counter previousCommittedThreadInsts = thread[tid]->numInst;
 
@@ -1475,15 +1476,22 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
             cpi_r.roll(1);
         }
 
-        const uint64_t committedThreadInsts = thread[tid]->numInst;
+        const Counter committedThreadInsts = thread[tid]->numInst;
+        const Counter boundaryCommittedInsts =
+            traceRecordIndex ? traceRecordIndex : committedThreadInsts;
+        const Counter previousBoundaryCommittedInsts =
+            traceRecordIndex ? traceRecordIndex - 1 :
+                               previousCommittedThreadInsts;
 
         // A fused macro advances this architectural count by two. A boundary
         // crossed by that indivisible macro is therefore target + 1 at most.
+        // Trace-mode boundaries instead use the exact 1-based source-record
+        // index, while architectural counters retain their normal semantics.
 
         if (this->roiInstCount && !this->warmupInstCount &&
                 !roiEndInstCountSet[tid]) {
             roiEndInstCounts[tid] =
-                previousCommittedThreadInsts + this->roiInstCount;
+                previousBoundaryCommittedInsts + this->roiInstCount;
             roiEndInstCountSet[tid] = true;
         }
 
@@ -1503,7 +1511,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
         thread[tid]->comInstEventQueue.serviceEvents(thread[tid]->numInst);
 
         if (this->warmupInstCount && !warmup_done &&
-                committedThreadInsts >= this->warmupInstCount) {
+                boundaryCommittedInsts >= this->warmupInstCount) {
             fetch.beginBtbpRoiTracking();
             btbpRoiTrackingStarted = true;
             branch_prediction::btb_pred::BtbpTraceEvent event;
@@ -1513,7 +1521,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
             event.threadId = tid;
             event.coreCycle = curCycle();
             event.coreCycleValid = true;
-            event.committedInsts = committedThreadInsts;
+            event.committedInsts = boundaryCommittedInsts;
             event.committedInstsValid = true;
             notifyBtbpTrace(event);
             fprintf(stderr,
@@ -1521,7 +1529,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     "committed_insts=%llu reset_mode=scheduled_dump_reset\n",
                     static_cast<unsigned long long>(curTick()),
                     static_cast<unsigned long long>(curCycle()),
-                    static_cast<unsigned long long>(committedThreadInsts));
+                    static_cast<unsigned long long>(boundaryCommittedInsts));
             statistics::schedStatEvent(true, true, curTick(), 0);
             exitSimLoop("Will trigger stat dump and reset");
             warmup_done = true;
@@ -1529,18 +1537,18 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
 
             if (this->roiInstCount) {
                 roiEndInstCounts[tid] =
-                    committedThreadInsts + this->roiInstCount;
+                    boundaryCommittedInsts + this->roiInstCount;
                 roiEndInstCountSet[tid] = true;
             }
         }
 
         if (this->roiInstCount && !roi_done &&
                 roiEndInstCountSet[tid] &&
-                committedThreadInsts >= roiEndInstCounts[tid]) {
+                boundaryCommittedInsts >= roiEndInstCounts[tid]) {
             const Counter roiStartInsts =
                 roiEndInstCounts[tid] - this->roiInstCount;
             const Counter measuredRoiInsts =
-                committedThreadInsts - roiStartInsts;
+                boundaryCommittedInsts - roiStartInsts;
             branch_prediction::btb_pred::BtbpTraceEvent event;
             event.tick = curTick();
             event.eventType =
@@ -1548,7 +1556,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
             event.threadId = tid;
             event.coreCycle = curCycle();
             event.coreCycleValid = true;
-            event.committedInsts = committedThreadInsts;
+            event.committedInsts = boundaryCommittedInsts;
             event.committedInstsValid = true;
             event.roiInsts = measuredRoiInsts;
             event.roiInstsValid = true;
@@ -1559,7 +1567,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                     "roi_insts=%llu requested_roi_insts=%llu\n",
                     static_cast<unsigned long long>(curTick()),
                     static_cast<unsigned long long>(curCycle()),
-                    static_cast<unsigned long long>(committedThreadInsts),
+                    static_cast<unsigned long long>(boundaryCommittedInsts),
                     static_cast<unsigned long long>(measuredRoiInsts),
                     static_cast<unsigned long long>(this->roiInstCount));
             fetch.beginBtbpRoiDrain();
