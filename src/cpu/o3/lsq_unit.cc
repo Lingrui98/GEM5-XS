@@ -2366,6 +2366,13 @@ LSQUnit::offloadToStoreBuffer(uint32_t max_entries, std::vector<bool>& offload_f
         assert(!storeWBIt->committed());
         DynInstPtr inst = storeWBIt->instruction();
         LSQRequest *request = storeWBIt->request();
+        std::vector<uint8_t> zero_data;
+        uint8_t *store_data =
+            reinterpret_cast<uint8_t *>(storeWBIt->data());
+        if (storeWBIt->isAllZeros()) {
+            zero_data.resize(storeWBIt->size(), 0);
+            store_data = zero_data.data();
+        }
 
         if (request->mainReq()->isLLSC() ||
             request->mainReq()->isAtomic() ||
@@ -2401,7 +2408,7 @@ LSQUnit::offloadToStoreBuffer(uint32_t max_entries, std::vector<bool>& offload_f
                 DPRINTF(LSQUnit, "Spilt store idx %d [sn:%lli] insert into sbuffer\n", i, inst->seqNum);
                 assert(offset + req->getSize() <= storeWBIt->size());
                 bool success = insertStoreBuffer(
-                    vaddr, paddr, (uint8_t *)storeWBIt->data() + offset,
+                    vaddr, paddr, store_data + offset,
                     req->getSize(), req->getByteEnable(), inst->seqNum);
                 if (success) {
                     request->_numOutstandingPackets++;
@@ -2424,7 +2431,7 @@ LSQUnit::offloadToStoreBuffer(uint32_t max_entries, std::vector<bool>& offload_f
             Addr paddr = request->mainReq()->getPaddr();
             DPRINTF(LSQUnit, "Store [sn:%lli] insert into sbuffer\n", inst->seqNum);
             bool success = insertStoreBuffer(
-                vaddr, paddr, (uint8_t *)storeWBIt->data(), request->_size,
+                vaddr, paddr, store_data, request->_size,
                 request->mainReq()->getByteEnable(), inst->seqNum);
             if (!success) {
                 offload_fail[lsqID] = true;

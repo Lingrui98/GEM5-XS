@@ -6,24 +6,13 @@
 //
 
 def template CacheBlockZeroDeclare {{
-    class %(class_name)s : public RiscvMacroInst
-    {
-      public:
-        %(class_name)s(ExtMachInst machInst);
-
-        std::string generateDisassembly(Addr pc,
-            const loader::SymbolTable *symtab) const override;
-    };
-
-    class %(class_name)sMicro : public RiscvMicroInst
+    class %(class_name)s : public Store
     {
       private:
         %(reg_idx_arr_decl)s;
-        uint8_t microIdx;
-        Request::Flags memAccessFlags;
 
       public:
-        %(class_name)sMicro(ExtMachInst machInst, uint8_t microIdx);
+        %(class_name)s(ExtMachInst machInst);
 
         Fault execute(ExecContext *, Trace::InstRecord *) const override;
         Fault initiateAcc(ExecContext *, Trace::InstRecord *) const override;
@@ -37,33 +26,17 @@ def template CacheBlockZeroDeclare {{
 
 def template CacheBlockZeroConstructor {{
     %(class_name)s::%(class_name)s(ExtMachInst machInst)
-        : RiscvMacroInst("%(mnemonic)s", machInst, %(op_class)s)
-    {
-        for (uint8_t idx = 0; idx < 8; ++idx) {
-            StaticInstPtr microop = new %(class_name)sMicro(machInst, idx);
-            microop->setDelayedCommit();
-            microop->setFlag(IsStore);
-            this->microops.push_back(microop);
-        }
-
-        this->microops.front()->setFirstMicroop();
-        this->microops.back()->setLastMicroop();
-    }
-
-    %(class_name)sMicro::%(class_name)sMicro(
-        ExtMachInst machInst, uint8_t _microIdx)
-        : RiscvMicroInst("%(mnemonic)s", machInst, %(op_class)s),
-          microIdx(_microIdx),
-          memAccessFlags(0)
+        : Store("%(mnemonic)s", machInst, %(op_class)s)
     {
         %(set_reg_idx_arr)s;
         %(constructor)s;
+        memAccessFlags = Request::CACHE_BLOCK_ZERO;
     }
 }};
 
 def template CacheBlockZeroExecute {{
     Fault
-    %(class_name)sMicro::execute(
+    %(class_name)s::execute(
         ExecContext *xc, Trace::InstRecord *traceData) const
     {
         Addr EA;
@@ -73,8 +46,10 @@ def template CacheBlockZeroExecute {{
         %(ea_code)s;
         %(memacc_code)s;
 
-        Fault fault =
-            writeMemAtomicLE(xc, traceData, Mem, EA, memAccessFlags, nullptr);
+        constexpr unsigned CboBlockBytes = 64;
+        Fault fault = writeMemAtomic(
+            xc, nullptr, EA, CboBlockBytes, memAccessFlags, nullptr,
+            std::vector<bool>(CboBlockBytes, true));
         if (fault != NoFault)
             return fault;
 
@@ -84,7 +59,7 @@ def template CacheBlockZeroExecute {{
     }
 
     Fault
-    %(class_name)sMicro::initiateAcc(
+    %(class_name)s::initiateAcc(
         ExecContext *xc, Trace::InstRecord *traceData) const
     {
         Addr EA;
@@ -94,8 +69,10 @@ def template CacheBlockZeroExecute {{
         %(ea_code)s;
         %(memacc_code)s;
 
-        Fault fault =
-            writeMemTimingLE(xc, traceData, Mem, EA, memAccessFlags, nullptr);
+        constexpr unsigned CboBlockBytes = 64;
+        Fault fault = writeMemTiming(
+            xc, nullptr, EA, CboBlockBytes, memAccessFlags, nullptr,
+            std::vector<bool>(CboBlockBytes, true));
         if (fault != NoFault)
             return fault;
 
@@ -105,7 +82,7 @@ def template CacheBlockZeroExecute {{
     }
 
     Fault
-    %(class_name)sMicro::completeAcc(
+    %(class_name)s::completeAcc(
         PacketPtr pkt, ExecContext *xc, Trace::InstRecord *traceData) const
     {
         return NoFault;
@@ -121,33 +98,21 @@ def template CacheBlockZeroExecute {{
         return ss.str();
     }
 
-    std::string
-    %(class_name)sMicro::generateDisassembly(
-        Addr pc, const loader::SymbolTable *symtab) const
-    {
-        std::stringstream ss;
-        ss << mnemonic << '[' << static_cast<unsigned>(microIdx) << "] ("
-           << registerName(srcRegIdx(0)) << ')';
-        return ss.str();
-    }
 }};
 
 def format CacheBlockZero() {{
-    macro_iop = InstObjParams(name, Name, 'RiscvMacroInst', '', [])
-
-    micro_iop = InstObjParams(name, Name, 'RiscvMicroInst',
+    iop = InstObjParams(name, Name, 'Store',
         {'ea_code': '''
-            constexpr Addr CboBlockBytes = 64;
-            constexpr Addr CboStoreBytes = sizeof(uint64_t);
-            EA = (Rs1 & ~(CboBlockBytes - 1)) + microIdx * CboStoreBytes;
+            constexpr Addr CboBlockMask = 64 - 1;
+            EA = Rs1 & ~CboBlockMask;
         ''',
         'memacc_code': '''
             Mem_ud = 0;
         '''},
         ['IsStore', 'IsOper64'])
 
-    header_output = CacheBlockZeroDeclare.subst(micro_iop)
-    decoder_output = CacheBlockZeroConstructor.subst(micro_iop)
-    decode_block = BasicDecode.subst(macro_iop)
-    exec_output = CacheBlockZeroExecute.subst(micro_iop)
+    header_output = CacheBlockZeroDeclare.subst(iop)
+    decoder_output = CacheBlockZeroConstructor.subst(iop)
+    decode_block = BasicDecode.subst(iop)
+    exec_output = CacheBlockZeroExecute.subst(iop)
 }};
