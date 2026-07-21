@@ -123,6 +123,42 @@ BtbpTracer::trace(const BtbpTraceEvent &event)
     if (event.branchKindValid) {
         entry.set_branch_kind(event.branchKind);
     }
+    if (event.demandUidValid) {
+        entry.set_demand_uid(event.demandUid);
+    }
+    if (event.prefetchDecisionIdValid) {
+        entry.set_prefetch_decision_id(event.prefetchDecisionId);
+    }
+    if (event.prefetchSourceValid) {
+        entry.set_prefetch_source(event.prefetchSource);
+    }
+    if (event.terminalReasonValid) {
+        entry.set_terminal_reason(event.terminalReason);
+    }
+    if (event.mshrDemandOwnedValid) {
+        entry.set_mshr_demand_owned(event.mshrDemandOwned);
+    }
+    if (event.mshrInstPrefetchOwnedValid) {
+        entry.set_mshr_inst_prefetch_owned(event.mshrInstPrefetchOwned);
+    }
+    if (event.mshrTotalValid) {
+        entry.set_mshr_total(event.mshrTotal);
+    }
+    if (event.lifecycleKindValid) {
+        entry.set_lifecycle_kind(event.lifecycleKind);
+    }
+    if (event.residencyIdValid) {
+        entry.set_residency_id(event.residencyId);
+    }
+    if (event.coreCycleValid) {
+        entry.set_core_cycle(event.coreCycle);
+    }
+    if (event.committedInstsValid) {
+        entry.set_committed_insts(event.committedInsts);
+    }
+    if (event.roiInstsValid) {
+        entry.set_roi_insts(event.roiInsts);
+    }
 
     stream->write(entry);
 }

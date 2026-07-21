@@ -12,7 +12,7 @@ namespace btb_pred
 
 struct BtbpTraceEvent
 {
-    static constexpr uint32_t SchemaVersion = 4;
+    static constexpr uint32_t SchemaVersion = 5;
 
     enum EventType : uint32_t
     {
@@ -23,6 +23,34 @@ struct BtbpTraceEvent
         L1IDemandAccess = 5,
         DecodeBranch = 6,
         BranchDemand = 7,
+        IPrefetchDecisionAccepted = 8,
+        IPrefetchTerminal = 9,
+        L1IMshrOccupancy = 10,
+        L1ILineEvict = 11,
+        RoiBegin = 12,
+        RoiEnd = 13,
+    };
+
+    enum class TerminalReason : uint32_t
+    {
+        Unknown = 0,
+        Completed = 1,
+        TranslationFault = 2,
+        Uncacheable = 3,
+        CacheOrMergeCompletion = 4,
+        QueueFullCompletion = 5,
+        ResetCanceled = 6,
+        PolicyFiltered = 7,
+    };
+
+    enum class LifecycleKind : uint32_t
+    {
+        Unknown = 0,
+        PrefetchFill = 1,
+        DemandFill = 2,
+        DemandUse = 3,
+        Evict = 4,
+        RoiDrainClose = 5,
     };
 
     enum FillSource : uint32_t
@@ -94,6 +122,32 @@ struct BtbpTraceEvent
     bool requestKindValid = false;
     uint32_t branchKind = UnknownBranch;
     bool branchKindValid = false;
+    uint64_t demandUid = 0;
+    bool demandUidValid = false;
+    uint64_t prefetchDecisionId = 0;
+    bool prefetchDecisionIdValid = false;
+    uint32_t prefetchSource = 0;
+    bool prefetchSourceValid = false;
+    uint32_t terminalReason =
+        static_cast<uint32_t>(TerminalReason::Unknown);
+    bool terminalReasonValid = false;
+    uint32_t mshrDemandOwned = 0;
+    bool mshrDemandOwnedValid = false;
+    uint32_t mshrInstPrefetchOwned = 0;
+    bool mshrInstPrefetchOwnedValid = false;
+    uint32_t mshrTotal = 0;
+    bool mshrTotalValid = false;
+    uint32_t lifecycleKind =
+        static_cast<uint32_t>(LifecycleKind::Unknown);
+    bool lifecycleKindValid = false;
+    uint64_t residencyId = 0;
+    bool residencyIdValid = false;
+    uint64_t coreCycle = 0;
+    bool coreCycleValid = false;
+    uint64_t committedInsts = 0;
+    bool committedInstsValid = false;
+    uint64_t roiInsts = 0;
+    bool roiInstsValid = false;
 };
 
 } // namespace btb_pred

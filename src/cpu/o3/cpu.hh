@@ -138,6 +138,7 @@ class CPU : public BaseCPU
     bool warmup_done = false;
     bool roi_done = false;
     bool stopCommitAtBoundaryFlag = false;
+    bool btbpRoiTrackingStarted = false;
     std::array<Counter, MaxThreads> roiEndInstCounts = {};
     std::array<bool, MaxThreads> roiEndInstCountSet = {};
 
@@ -405,6 +406,15 @@ class CPU : public BaseCPU
 
     bool shouldDropFdipRefill(ContextID contextId,
                               const Request::XsMetadata &xsMeta) const;
+
+    bool eipEnabled() const { return fetch.eipEnabled(); }
+    void notifyEipDemand(ContextID contextId, Addr virtualAddr,
+                         Addr physicalAddr, uint64_t demandId,
+                         bool cacheHit, bool prefetchHit, bool wrongPath,
+                         const Request::XsMetadata &requestMeta);
+    void notifyEipFill(ContextID contextId, Addr virtualAddr,
+                       Addr physicalAddr);
+    void notifyEipEvict(ContextID contextId, Addr physicalAddr);
 
     /**
      * Wrapper for internal drain check used by trace-mode helpers.

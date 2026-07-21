@@ -60,6 +60,7 @@
 #include "base/statistics.hh"
 #include "base/trace.hh"
 #include "base/types.hh"
+#include "cpu/pred/btb/probe/btbp_trace_event.hh"
 #include "debug/Cache.hh"
 #include "debug/CachePort.hh"
 #include "debug/CacheTrace.hh"
@@ -1128,11 +1129,23 @@ class BaseCache : public ClockedObject, public CacheAccessor
      */
     const bool isReadOnly;
 
-    /** Protected demand-fetch miss capacity for L1I FDIP gating. */
+    /** Maximum demand-owned miss entries allowed in a partitioned L1I. */
     const unsigned demandFetchMSHRs;
 
-    /** Maximum pure-FDIP miss entries allowed in L1I. */
-    const unsigned fdipPrefetchMSHRs;
+    /** Maximum FDIP/EIP-owned miss entries allowed in a partitioned L1I. */
+    const unsigned instPrefetchMSHRs;
+
+    /** Monotonic identity for each real L1I line residency. */
+    uint64_t nextL1iResidencyId = 1;
+
+    struct BtbpRoiResidency
+    {
+        ContextID contextId = InvalidContextID;
+        branch_prediction::btb_pred::BtbpTraceEvent event;
+    };
+
+    /** Prefetch residencies whose accepting decisions originated in ROI. */
+    std::unordered_map<uint64_t, BtbpRoiResidency> btbpRoiResidencies;
 
     /**
      * when a data expansion of a compressed block happens it will not be
@@ -1339,6 +1352,10 @@ class BaseCache : public ClockedObject, public CacheAccessor
         statistics::Value mshrAvgEntryNum;
         /** Average allocated-entry ratio normalized by queue capacity. */
         statistics::Value mshrOccupancyRatio;
+        /** Reset-safe allocated-entry time integral in entry*ticks. */
+        statistics::Value mshrEntryTicks;
+        /** Reset-safe time integral at full MSHR occupancy in ticks. */
+        statistics::Value mshrFullTicks;
         /** Cycles for which the cache stayed blocked due to no free MSHR. */
         statistics::Scalar noMshrBlockedCycles;
 
@@ -1563,6 +1580,7 @@ class BaseCache : public ClockedObject, public CacheAccessor
         MSHR *mshr = mshrQueue.allocate(pkt->getBlockAddr(blkSize), blkSize,
                                         pkt, time, order++,
                                         allocOnFill(pkt->cmd));
+        emitL1IMshrOccupancy(pkt);
 
         if (mshrQueue.isFull()) {
             setBlocked((BlockedCause)MSHRQueue_MSHRs);
@@ -1728,6 +1746,11 @@ class BaseCache : public ClockedObject, public CacheAccessor
         return pf_source == PF_FDIP;
     }
 
+    bool isInstPrefetchSource(PrefetchSourceType pf_source) const
+    {
+        return pf_source == PF_FDIP || pf_source == PF_EIP;
+    }
+
     bool isFdipReq(const RequestPtr &req) const
     {
         return req && req->hasXsMetadata() && req->getXsMetadata().isFdip();
@@ -1736,6 +1759,17 @@ class BaseCache : public ClockedObject, public CacheAccessor
     bool isFdipPkt(const PacketPtr pkt) const
     {
         return pkt && isFdipReq(pkt->req);
+    }
+
+    bool isInstPrefetchReq(const RequestPtr &req) const
+    {
+        return req && req->hasXsMetadata() &&
+               req->getXsMetadata().isInstPrefetch();
+    }
+
+    bool isInstPrefetchPkt(const PacketPtr pkt) const
+    {
+        return pkt && isInstPrefetchReq(pkt->req);
     }
 
     bool isFdipBlk(const CacheBlk *blk) const
@@ -1755,29 +1789,25 @@ class BaseCache : public ClockedObject, public CacheAccessor
                blk->getWay() == xs_meta.fdipSelectedWay;
     }
 
-    enum class FdipMissAllocDecision
-    {
-        Allow,
-        RejectNoPrefetchMSHR,
-        RejectByDemandReserve
-    };
-
-    FdipMissAllocDecision classifyFdipMissAllocation() const
+    bool canAllocateL1IMSHR(const PacketPtr pkt) const
     {
         if (!isL1I()) {
-            return FdipMissAllocDecision::Allow;
+            return true;
         }
 
-        if (!mshrQueue.canAllocateFDIP(fdipPrefetchMSHRs)) {
-            return FdipMissAllocDecision::RejectNoPrefetchMSHR;
-        }
-
-        if (!mshrQueue.preservesDemandEntries(demandFetchMSHRs)) {
-            return FdipMissAllocDecision::RejectByDemandReserve;
-        }
-
-        return FdipMissAllocDecision::Allow;
+        const auto owner = isInstPrefetchPkt(pkt) ?
+            MSHR::AllocationOwner::InstPrefetch :
+            MSHR::AllocationOwner::Demand;
+        return mshrQueue.canAllocate(owner, demandFetchMSHRs,
+                                     instPrefetchMSHRs);
     }
+
+    void deferMshrAllocation(PacketPtr pkt);
+
+    void rollbackDeferredMiss(PacketPtr pkt);
+
+    void emitL1IMshrOccupancy(const PacketPtr pkt);
+    void emitL1ILineEvict(CacheBlk *blk);
 
     bool shouldDropFdipRefill(MSHR *mshr, const PacketPtr pkt) const;
     FdipLineKey makeFdipLineKey(Addr blkAddr, bool is_secure) const
@@ -1798,6 +1828,8 @@ class BaseCache : public ClockedObject, public CacheAccessor
     void noteFdipDroppedLifecycle(Addr blkAddr, bool is_secure);
     bool shouldSuppressFdipLine(Addr addr, bool is_secure,
                                 uint64_t cooldown_cycles) const override;
+    void beginBtbpRoiTracking() override;
+    unsigned closeBtbpRoiResidencies() override;
 
     Tick nextPrefetchReadyTime() const
     {
@@ -1956,6 +1988,10 @@ public:
     double getMshrAvgEntryNum() const;
 
     double getMshrOccupancyRatio() const;
+
+    Counter getMshrEntryTicks() const;
+
+    Counter getMshrFullTicks() const;
 
     const uint8_t* findBlock(Addr addr, bool is_secure) const override {
         auto blk = tags->findBlock(addr, is_secure);

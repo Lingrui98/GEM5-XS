@@ -74,6 +74,22 @@ class BaseCache;
 class MSHR : public QueueEntry, public Printable
 {
 
+  public:
+
+    enum class AllocationOwner
+    {
+        Unallocated,
+        Demand,
+        InstPrefetch
+    };
+
+    static constexpr AllocationOwner
+    allocationOwnerAfterMerge(AllocationOwner current,
+                              AllocationOwner)
+    {
+        return current;
+    }
+
     /**
      * Consider the queues friends to avoid making everything public.
      */
@@ -117,6 +133,9 @@ class MSHR : public QueueEntry, public Printable
 
     /** Did we snoop a read while waiting for data? */
     bool postDowngrade;
+
+    /** Request class that allocated this entry. Merges do not change it. */
+    AllocationOwner allocationOwner;
 
   public:
 
@@ -383,6 +402,22 @@ class MSHR : public QueueEntry, public Printable
 
     bool hasFromFDIP() const {
         return targets.hasFromFDIP;
+    }
+
+    AllocationOwner getAllocationOwner() const
+    {
+        assert(allocationOwner != AllocationOwner::Unallocated);
+        return allocationOwner;
+    }
+
+    bool allocatedByInstPrefetch() const
+    {
+        return getAllocationOwner() == AllocationOwner::InstPrefetch;
+    }
+
+    bool allocatedByDemand() const
+    {
+        return getAllocationOwner() == AllocationOwner::Demand;
     }
 
     PrefetchSourceType getPFSource() const {

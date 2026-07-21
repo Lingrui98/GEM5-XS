@@ -2,9 +2,16 @@ syntax = "proto2";
 
 package ProtoMessage;
 
-// Schema v4 is mBTB-only. Event type:
+// Schema v5 event type:
 // 1=mbtb_lookup, 2=mbtb_fill, 3=iprefetch_issue, 4=line_lifecycle,
-// 5=l1i_demand_access, 6=decode_branch, 7=branch_demand.
+// 5=l1i_demand_access, 6=decode_branch, 7=branch_demand,
+// 8=iprefetch_decision_accepted, 9=iprefetch_terminal,
+// 10=l1i_mshr_occupancy, 11=l1i_line_evict, 12=roi_begin, 13=roi_end.
+// terminal_reason: 0=unknown, 1=completed, 2=translation_fault,
+// 3=uncacheable, 4=cache_or_merge_completion, 5=queue_full_completion,
+// 6=reset_canceled, 7=policy_filtered.
+// lifecycle_kind: 0=unknown, 1=prefetch_fill, 2=demand_fill,
+// 3=demand_use, 4=evict, 5=roi_drain_close.
 message BtbpTraceEntry {
   required uint64 tick = 1;
   required uint32 event_type = 2;
@@ -35,4 +42,16 @@ message BtbpTraceEntry {
   optional uint64 scan_complete_tick = 27;
   optional uint32 request_kind = 28;
   optional uint32 branch_kind = 29;
+  optional uint64 demand_uid = 30;
+  optional uint64 prefetch_decision_id = 31;
+  optional uint32 prefetch_source = 32;
+  optional uint32 terminal_reason = 33;
+  optional uint32 mshr_demand_owned = 34;
+  optional uint32 mshr_inst_prefetch_owned = 35;
+  optional uint32 mshr_total = 36;
+  optional uint32 lifecycle_kind = 37;
+  optional uint64 residency_id = 38;
+  optional uint64 core_cycle = 39;
+  optional uint64 committed_insts = 40;
+  optional uint64 roi_insts = 41;
 }

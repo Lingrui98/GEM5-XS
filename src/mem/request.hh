@@ -86,6 +86,7 @@ enum PrefetchSourceType
     SOpt,
     DespacitoStream,
     PF_FDIP,
+    PF_EIP,
     NUM_PF_SOURCES
 };
 
@@ -387,6 +388,13 @@ class Request
         uint64_t fdipEpoch;
         uint64_t fdipFtqId;
         Addr fdipStartPC;
+        uint64_t eipDemandId;
+        uint64_t instPrefetchDecisionId;
+        Addr eipTriggerPC;
+        ContextID eipContextId;
+        bool eipDemandObserved;
+        uint64_t l1iResidencyId;
+        bool btbpRoiOrigin;
         bool traceIdentityValid;
         uint64_t traceAddressSpaceId;
         uint8_t traceAsidHash;
@@ -403,6 +411,13 @@ class Request
             fdipEpoch(0),
             fdipFtqId(0),
             fdipStartPC(0),
+            eipDemandId(0),
+            instPrefetchDecisionId(0),
+            eipTriggerPC(0),
+            eipContextId(InvalidContextID),
+            eipDemandObserved(false),
+            l1iResidencyId(0),
+            btbpRoiOrigin(false),
             traceIdentityValid(false),
             traceAddressSpaceId(0),
             traceAsidHash(0),
@@ -419,6 +434,13 @@ class Request
             fdipEpoch(0),
             fdipFtqId(0),
             fdipStartPC(0),
+            eipDemandId(0),
+            instPrefetchDecisionId(0),
+            eipTriggerPC(0),
+            eipContextId(InvalidContextID),
+            eipDemandObserved(false),
+            l1iResidencyId(0),
+            btbpRoiOrigin(false),
             traceIdentityValid(false),
             traceAddressSpaceId(0),
             traceAsidHash(0),
@@ -435,6 +457,13 @@ class Request
             fdipEpoch(0),
             fdipFtqId(0),
             fdipStartPC(0),
+            eipDemandId(0),
+            instPrefetchDecisionId(0),
+            eipTriggerPC(0),
+            eipContextId(InvalidContextID),
+            eipDemandObserved(false),
+            l1iResidencyId(0),
+            btbpRoiOrigin(false),
             traceIdentityValid(false),
             traceAddressSpaceId(0),
             traceAsidHash(0),
@@ -451,6 +480,13 @@ class Request
             fdipEpoch(0),
             fdipFtqId(0),
             fdipStartPC(0),
+            eipDemandId(0),
+            instPrefetchDecisionId(0),
+            eipTriggerPC(0),
+            eipContextId(InvalidContextID),
+            eipDemandObserved(false),
+            l1iResidencyId(0),
+            btbpRoiOrigin(false),
             traceIdentityValid(false),
             traceAddressSpaceId(0),
             traceAsidHash(0),
@@ -461,6 +497,13 @@ class Request
 
         bool isFdip() const { return prefetchSource == PF_FDIP; }
 
+        bool isEip() const { return prefetchSource == PF_EIP; }
+
+        bool isInstPrefetch() const
+        {
+            return isFdip() || isEip();
+        }
+
         void invalidate() {
             validXsMetadata = false;
             instXsMetadata = nullptr;
@@ -469,6 +512,13 @@ class Request
             fdipEpoch = 0;
             fdipFtqId = 0;
             fdipStartPC = 0;
+            eipDemandId = 0;
+            instPrefetchDecisionId = 0;
+            eipTriggerPC = 0;
+            eipContextId = InvalidContextID;
+            eipDemandObserved = false;
+            l1iResidencyId = 0;
+            btbpRoiOrigin = false;
             traceIdentityValid = false;
             traceAddressSpaceId = 0;
             traceAsidHash = 0;

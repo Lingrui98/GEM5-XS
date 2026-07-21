@@ -342,6 +342,13 @@ def addCommonOptions(parser, configure_xiangshan=False):
         help="Warmup period in total instructions, reset stats without switch")
     parser.add_argument("--roi-insts", action="store", type=int, default=None,
         help="Measured committed instructions after warmup, then dump stats and exit")
+    parser.add_argument(
+        "--btbp-roi-drain-ticks", type=int, default=50_000_000,
+        help=(
+            "Maximum ticks allowed to terminalize accepted BTBP requests "
+            "after ROI_END; no post-ROI prefetch decisions are admitted"
+        ),
+    )
 
     parser.add_argument(
         "--stats-root", action="append", default=[],
@@ -728,6 +735,16 @@ def addXiangshanTraceOptions(parser):
 
 
 def addXiangshanFDIPOptions(parser):
+    parser.add_argument(
+        "--eip-algorithm",
+        type=str,
+        default="disabled",
+        choices=["disabled", "tc24", "isca21"],
+        help=(
+            "Enable one frozen Entangling instruction-prefetcher bundle; "
+            "isca21 is the non-voting same-port regression"
+        ),
+    )
     parser.add_argument(
         "--enable-fdip",
         action="store_true",

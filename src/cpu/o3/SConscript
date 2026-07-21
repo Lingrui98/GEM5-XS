@@ -42,6 +42,7 @@ if env['CONF']['TARGET_ISA'] != 'null':
     Source('cpu.cc')
     Source('decode.cc')
     Source('dyn_inst.cc')
+    Source('entangling_prefetcher.cc')
     Source('fetch.cc')
     Source('free_list.cc')
     Source('fu_pool.cc')
@@ -110,6 +111,9 @@ if env['CONF']['TARGET_ISA'] == 'null':
     env.Append(LIBS=['z'])
     GTest('fdip_cleanup.test',
           'fdip_cleanup.test.cc')
+    GTest('entangling_prefetcher.test',
+          'entangling_prefetcher.test.cc',
+          'entangling_prefetcher.cc')
     GTest('champsim_trace_reader.test',
           'trace/ChampSimTraceReader.test.cc',
           'trace/TraceReader.cc',
@@ -131,6 +135,9 @@ else:
     env.Append(LIBS=['z'])
     GTest('fdip_cleanup.test',
           'fdip_cleanup.test.cc')
+    GTest('entangling_prefetcher.test',
+          'entangling_prefetcher.test.cc',
+          'entangling_prefetcher.cc')
     GTest('champsim_trace_reader.test',
           'trace/ChampSimTraceReader.test.cc',
           'trace/TraceReader.cc',

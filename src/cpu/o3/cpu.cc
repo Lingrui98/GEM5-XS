@@ -381,11 +381,17 @@ CPU::notifyBtbpTrace(
         }
         break;
       case Event::IPrefetchIssue:
+      case Event::IPrefetchDecisionAccepted:
+      case Event::IPrefetchTerminal:
         if (ppBtbpTraceIPrefetchIssue) {
             ppBtbpTraceIPrefetchIssue->notify(event);
         }
         break;
       case Event::LineLifecycle:
+      case Event::L1IMshrOccupancy:
+      case Event::L1ILineEvict:
+      case Event::RoiBegin:
+      case Event::RoiEnd:
         if (ppBtbpTraceLineLifecycle) {
             ppBtbpTraceLineLifecycle->notify(event);
         }
@@ -716,6 +722,23 @@ CPU::startup()
     iew.startupStage();
     rename.startupStage();
     commit.startupStage();
+
+    if (roiInstCount && !warmupInstCount && !btbpRoiTrackingStarted) {
+        fetch.beginBtbpRoiTracking();
+        btbpRoiTrackingStarted = true;
+        branch_prediction::btb_pred::BtbpTraceEvent event;
+        event.tick = curTick();
+        event.eventType = branch_prediction::btb_pred::BtbpTraceEvent::RoiBegin;
+        event.coreCycle = curCycle();
+        event.coreCycleValid = true;
+        event.committedInstsValid = true;
+        notifyBtbpTrace(event);
+        fprintf(stderr,
+                "BTBP ROI_BEGIN_RESET tick=%llu core_cycle=%llu "
+                "committed_insts=0 reset_mode=simulation_start\n",
+                static_cast<unsigned long long>(curTick()),
+                static_cast<unsigned long long>(curCycle()));
+    }
 }
 
 void
@@ -1481,8 +1504,23 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
 
         if (this->warmupInstCount && !warmup_done &&
                 committedThreadInsts >= this->warmupInstCount) {
+            fetch.beginBtbpRoiTracking();
+            btbpRoiTrackingStarted = true;
+            branch_prediction::btb_pred::BtbpTraceEvent event;
+            event.tick = curTick();
+            event.eventType =
+                branch_prediction::btb_pred::BtbpTraceEvent::RoiBegin;
+            event.threadId = tid;
+            event.coreCycle = curCycle();
+            event.coreCycleValid = true;
+            event.committedInsts = committedThreadInsts;
+            event.committedInstsValid = true;
+            notifyBtbpTrace(event);
             fprintf(stderr,
-                    "BTBP WARMUP_END committed_insts=%llu\n",
+                    "BTBP ROI_BEGIN_RESET tick=%llu core_cycle=%llu "
+                    "committed_insts=%llu reset_mode=scheduled_dump_reset\n",
+                    static_cast<unsigned long long>(curTick()),
+                    static_cast<unsigned long long>(curCycle()),
                     static_cast<unsigned long long>(committedThreadInsts));
             statistics::schedStatEvent(true, true, curTick(), 0);
             exitSimLoop("Will trigger stat dump and reset");
@@ -1503,12 +1541,28 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
                 roiEndInstCounts[tid] - this->roiInstCount;
             const Counter measuredRoiInsts =
                 committedThreadInsts - roiStartInsts;
+            branch_prediction::btb_pred::BtbpTraceEvent event;
+            event.tick = curTick();
+            event.eventType =
+                branch_prediction::btb_pred::BtbpTraceEvent::RoiEnd;
+            event.threadId = tid;
+            event.coreCycle = curCycle();
+            event.coreCycleValid = true;
+            event.committedInsts = committedThreadInsts;
+            event.committedInstsValid = true;
+            event.roiInsts = measuredRoiInsts;
+            event.roiInstsValid = true;
+            notifyBtbpTrace(event);
             fprintf(stderr,
-                    "BTBP ROI_END_REQUEST committed_insts=%llu "
+                    "BTBP ROI_END_REQUEST tick=%llu core_cycle=%llu "
+                    "committed_insts=%llu "
                     "roi_insts=%llu requested_roi_insts=%llu\n",
+                    static_cast<unsigned long long>(curTick()),
+                    static_cast<unsigned long long>(curCycle()),
                     static_cast<unsigned long long>(committedThreadInsts),
                     static_cast<unsigned long long>(measuredRoiInsts),
                     static_cast<unsigned long long>(this->roiInstCount));
+            fetch.beginBtbpRoiDrain();
             statistics::schedStatEvent(true, false, curTick(), 0);
             exitSimLoop("BTBP ROI end");
             roi_done = true;
@@ -1905,6 +1959,28 @@ CPU::shouldDropFdipRefill(ContextID contextId,
                           const Request::XsMetadata &xsMeta) const
 {
     return fetch.shouldDropFdipRefill(contextId, xsMeta);
+}
+
+void
+CPU::notifyEipDemand(ContextID contextId, Addr virtualAddr,
+                     Addr physicalAddr, uint64_t demandId, bool cacheHit,
+                     bool prefetchHit, bool wrongPath,
+                     const Request::XsMetadata &requestMeta)
+{
+    fetch.notifyEipDemand(contextId, virtualAddr, physicalAddr, demandId,
+                          cacheHit, prefetchHit, wrongPath, requestMeta);
+}
+
+void
+CPU::notifyEipFill(ContextID contextId, Addr virtualAddr, Addr physicalAddr)
+{
+    fetch.notifyEipFill(contextId, virtualAddr, physicalAddr);
+}
+
+void
+CPU::notifyEipEvict(ContextID contextId, Addr physicalAddr)
+{
+    fetch.notifyEipEvict(contextId, physicalAddr);
 }
 
 const o3::TraceInstruction*

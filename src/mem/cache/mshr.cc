@@ -64,6 +64,7 @@ MSHR::MSHR(const std::string &name)
         downstreamPending(false),
         pendingModified(false),
         postInvalidate(false), postDowngrade(false),
+        allocationOwner(AllocationOwner::Unallocated),
         wasWholeLineWrite(false), isForward(false),
         targets(name + ".targets"),
         deferredTargets(name + ".deferredTargets")
@@ -88,6 +89,8 @@ MSHR::TargetList::updateFlags(PacketPtr pkt, Target::Source source,
 {
     const bool is_fdip = pkt->req->hasXsMetadata() &&
                          pkt->req->getXsMetadata().isFdip();
+    const bool is_inst_prefetch = pkt->req->hasXsMetadata() &&
+                                  pkt->req->getXsMetadata().isInstPrefetch();
 
     if (source != Target::FromSnoop) {
         if (pkt->needsWritable()) {
@@ -115,7 +118,7 @@ MSHR::TargetList::updateFlags(PacketPtr pkt, Target::Source source,
             DPRINTF(Cache, "MSHR: set source as prefetcher %i\n", pfSource);
         }
 
-        if (is_fdip && !hasFromFDIP) {
+        if (is_inst_prefetch && pfSource == PF_NONE) {
             pfSource = pkt->req->getXsMetadata().prefetchSource;
             pfDepth = pkt->req->getXsMetadata().prefetchDepth;
         }
@@ -350,6 +353,10 @@ MSHR::allocate(Addr blk_addr, unsigned blk_size, PacketPtr target,
     inService = false;
     downstreamPending = false;
     fdipLateSeen = false;
+    const bool is_inst_prefetch = target->req->hasXsMetadata() &&
+                                  target->req->getXsMetadata().isInstPrefetch();
+    allocationOwner = is_inst_prefetch ? AllocationOwner::InstPrefetch :
+                                         AllocationOwner::Demand;
 
     targets.init(blkAddr, blkSize);
     deferredTargets.init(blkAddr, blkSize);
@@ -405,6 +412,7 @@ MSHR::deallocate()
     assert(deferredTargets.isReset());
     inService = false;
     fdipLateSeen = false;
+    allocationOwner = AllocationOwner::Unallocated;
 }
 
 /*
@@ -414,6 +422,14 @@ void
 MSHR::allocateTarget(PacketPtr pkt, Tick whenReady, Counter _order,
                      bool alloc_on_fill)
 {
+    assert(allocationOwner != AllocationOwner::Unallocated);
+    const bool incoming_inst_prefetch = pkt->req->hasXsMetadata() &&
+        pkt->req->getXsMetadata().isInstPrefetch();
+    const auto incoming_owner = incoming_inst_prefetch ?
+        AllocationOwner::InstPrefetch : AllocationOwner::Demand;
+    allocationOwner = allocationOwnerAfterMerge(allocationOwner,
+                                                incoming_owner);
+
     // assume we'd never issue a prefetch when we've got an
     // outstanding miss
     assert(pkt->cmd != MemCmd::HardPFReq);
