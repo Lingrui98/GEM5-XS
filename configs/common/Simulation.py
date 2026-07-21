@@ -277,8 +277,18 @@ def benchCheckpoints(testsys, options, maxtick, cptdir):
     if exit_cause == "BTBP ROI end":
         roi_end_tick = m5.curTick()
         print("BTBP ROI_END @ tick %d" % roi_end_tick)
-        print("BTBP TRACE_DRAIN_ON_EXIT")
-        return exit_event
+        if options.btbp_roi_drain_ticks <= 0:
+            fatal("--btbp-roi-drain-ticks must be positive")
+        print("BTBP ROI_DRAIN_BEGIN max_ticks=%d" %
+              options.btbp_roi_drain_ticks)
+        drain_event = m5.simulate(options.btbp_roi_drain_ticks)
+        drain_cause = drain_event.getCause()
+        if drain_cause == "BTBP ROI drain complete":
+            print("BTBP ROI_DRAIN_COMPLETE @ tick %d" % m5.curTick())
+        else:
+            print("BTBP ROI_DRAIN_FAILED @ tick %d cause=%s" %
+                  (m5.curTick(), drain_cause))
+        return drain_event
 
     num_checkpoints = 0
     if hasattr(options, 'max_checkpoints'):
