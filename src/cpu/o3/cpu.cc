@@ -645,6 +645,60 @@ CPU::tick()
     // The flag only prevents additional commits in the boundary tick.
     stopCommitAtBoundaryFlag = false;
 
+    // The stat event runs after the CPU tick that requests a boundary. Emit
+    // the trace witness and change ROI ownership on the following CPU tick,
+    // while retaining the original boundary timestamp and cycle.
+    if (btbpRoiBeginPending && curTick() > btbpRoiBeginTick) {
+        fetch.beginBtbpRoiTracking();
+        btbpRoiTrackingStarted = true;
+        branch_prediction::btb_pred::BtbpTraceEvent event;
+        event.tick = btbpRoiBeginTick;
+        event.eventType =
+            branch_prediction::btb_pred::BtbpTraceEvent::RoiBegin;
+        event.threadId = btbpRoiBeginTid;
+        event.coreCycle = btbpRoiBeginCycle;
+        event.coreCycleValid = true;
+        event.committedInsts = btbpRoiBeginInsts;
+        event.committedInstsValid = true;
+        notifyBtbpTrace(event);
+        fprintf(stderr,
+                "BTBP ROI_BEGIN_RESET tick=%llu core_cycle=%llu "
+                "committed_insts=%llu reset_mode=scheduled_dump_reset "
+                "activation_tick=%llu\n",
+                static_cast<unsigned long long>(btbpRoiBeginTick),
+                static_cast<unsigned long long>(btbpRoiBeginCycle),
+                static_cast<unsigned long long>(btbpRoiBeginInsts),
+                static_cast<unsigned long long>(curTick()));
+        btbpRoiBeginPending = false;
+    }
+
+    if (btbpRoiEndPending && curTick() > btbpRoiEndTick) {
+        branch_prediction::btb_pred::BtbpTraceEvent event;
+        event.tick = btbpRoiEndTick;
+        event.eventType =
+            branch_prediction::btb_pred::BtbpTraceEvent::RoiEnd;
+        event.threadId = btbpRoiEndTid;
+        event.coreCycle = btbpRoiEndCycle;
+        event.coreCycleValid = true;
+        event.committedInsts = btbpRoiEndInsts;
+        event.committedInstsValid = true;
+        event.roiInsts = btbpMeasuredRoiInsts;
+        event.roiInstsValid = true;
+        notifyBtbpTrace(event);
+        fprintf(stderr,
+                "BTBP ROI_END_REQUEST tick=%llu core_cycle=%llu "
+                "committed_insts=%llu roi_insts=%llu "
+                "requested_roi_insts=%llu activation_tick=%llu\n",
+                static_cast<unsigned long long>(btbpRoiEndTick),
+                static_cast<unsigned long long>(btbpRoiEndCycle),
+                static_cast<unsigned long long>(btbpRoiEndInsts),
+                static_cast<unsigned long long>(btbpMeasuredRoiInsts),
+                static_cast<unsigned long long>(this->roiInstCount),
+                static_cast<unsigned long long>(curTick()));
+        fetch.beginBtbpRoiDrain();
+        btbpRoiEndPending = false;
+    }
+
     ++baseStats.numCycles;
     ipc_r.roll(1);
     cpi_r++;
@@ -1512,24 +1566,13 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst,
 
         if (this->warmupInstCount && !warmup_done &&
                 boundaryCommittedInsts >= this->warmupInstCount) {
-            fetch.beginBtbpRoiTracking();
-            btbpRoiTrackingStarted = true;
-            branch_prediction::btb_pred::BtbpTraceEvent event;
-            event.tick = curTick();
-            event.eventType =
-                branch_prediction::btb_pred::BtbpTraceEvent::RoiBegin;
-            event.threadId = tid;
-            event.coreCycle = curCycle();
-            event.coreCycleValid = true;
-            event.committedInsts = boundaryCommittedInsts;
-            event.committedInstsValid = true;
-            notifyBtbpTrace(event);
-            fprintf(stderr,
-                    "BTBP ROI_BEGIN_RESET tick=%llu core_cycle=%llu "
-                    "committed_insts=%llu reset_mode=scheduled_dump_reset\n",
-                    static_cast<unsigned long long>(curTick()),
-                    static_cast<unsigned long long>(curCycle()),
-                    static_cast<unsigned long long>(boundaryCommittedInsts));
+            panic_if(btbpRoiBeginPending,
+                     "BTBP ROI begin boundary already pending");
+            btbpRoiBeginPending = true;
+            btbpRoiBeginTick = curTick();
+            btbpRoiBeginCycle = curCycle();
+            btbpRoiBeginTid = tid;
+            btbpRoiBeginInsts = boundaryCommittedInsts;
             statistics::schedStatEvent(true, true, curTick(), 0);
             exitSimLoop("Will trigger stat dump and reset");
             warmup_done = true;
@@ -1549,28 +1592,14 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst,
                 roiEndInstCounts[tid] - this->roiInstCount;
             const Counter measuredRoiInsts =
                 boundaryCommittedInsts - roiStartInsts;
-            branch_prediction::btb_pred::BtbpTraceEvent event;
-            event.tick = curTick();
-            event.eventType =
-                branch_prediction::btb_pred::BtbpTraceEvent::RoiEnd;
-            event.threadId = tid;
-            event.coreCycle = curCycle();
-            event.coreCycleValid = true;
-            event.committedInsts = boundaryCommittedInsts;
-            event.committedInstsValid = true;
-            event.roiInsts = measuredRoiInsts;
-            event.roiInstsValid = true;
-            notifyBtbpTrace(event);
-            fprintf(stderr,
-                    "BTBP ROI_END_REQUEST tick=%llu core_cycle=%llu "
-                    "committed_insts=%llu "
-                    "roi_insts=%llu requested_roi_insts=%llu\n",
-                    static_cast<unsigned long long>(curTick()),
-                    static_cast<unsigned long long>(curCycle()),
-                    static_cast<unsigned long long>(boundaryCommittedInsts),
-                    static_cast<unsigned long long>(measuredRoiInsts),
-                    static_cast<unsigned long long>(this->roiInstCount));
-            fetch.beginBtbpRoiDrain();
+            panic_if(btbpRoiEndPending,
+                     "BTBP ROI end boundary already pending");
+            btbpRoiEndPending = true;
+            btbpRoiEndTick = curTick();
+            btbpRoiEndCycle = curCycle();
+            btbpRoiEndTid = tid;
+            btbpRoiEndInsts = boundaryCommittedInsts;
+            btbpMeasuredRoiInsts = measuredRoiInsts;
             statistics::schedStatEvent(true, false, curTick(), 0);
             exitSimLoop("BTBP ROI end");
             roi_done = true;

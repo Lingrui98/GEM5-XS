@@ -139,6 +139,17 @@ class CPU : public BaseCPU
     bool roi_done = false;
     bool stopCommitAtBoundaryFlag = false;
     bool btbpRoiTrackingStarted = false;
+    bool btbpRoiBeginPending = false;
+    bool btbpRoiEndPending = false;
+    Tick btbpRoiBeginTick = 0;
+    Tick btbpRoiEndTick = 0;
+    uint64_t btbpRoiBeginCycle = 0;
+    uint64_t btbpRoiEndCycle = 0;
+    ThreadID btbpRoiBeginTid = 0;
+    ThreadID btbpRoiEndTid = 0;
+    Counter btbpRoiBeginInsts = 0;
+    Counter btbpRoiEndInsts = 0;
+    Counter btbpMeasuredRoiInsts = 0;
     std::array<Counter, MaxThreads> roiEndInstCounts = {};
     std::array<bool, MaxThreads> roiEndInstCountSet = {};
 
