@@ -1782,6 +1782,7 @@ void
 Fetch::beginBtbpRoiDrain()
 {
     btbpRoiDrainMode = true;
+    btbpRoiDrainBeginTick = curTick();
 }
 
 uint64_t
@@ -2702,6 +2703,7 @@ Fetch::tick()
     runEip();
 
     if (btbpRoiDrainMode && !btbpRoiDrainExitRequested &&
+        curTick() > btbpRoiDrainBeginTick &&
         instPrefetchOutstandingLines == 0) {
         const unsigned closed = fdipIcacheAccessor ?
             fdipIcacheAccessor->closeBtbpRoiResidencies() : 0;
