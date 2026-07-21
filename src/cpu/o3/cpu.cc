@@ -641,9 +641,9 @@ CPU::tick()
     assert(!switchedOut());
     assert(drainState() != DrainState::Drained);
 
-    // A warmup boundary exits m5.simulate() and resumes on a later tick.
-    // The flag only prevents additional commits in the boundary tick.
-    stopCommitAtBoundaryFlag = false;
+    // Warmup resumes commit on the next tick, but ROI end is terminal: keep
+    // commit frozen while the delayed witness and prefetch drain complete.
+    stopCommitAtBoundaryFlag = roi_done;
 
     // The stat event runs after the CPU tick that requests a boundary. Emit
     // the trace witness and change ROI ownership on the following CPU tick,
