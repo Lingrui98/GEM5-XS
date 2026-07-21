@@ -1227,6 +1227,7 @@ class Fetch
     bool btbpRoiActive = false;
     bool btbpRoiDrainMode = false;
     bool btbpRoiDrainExitRequested = false;
+    Tick btbpRoiDrainBeginTick = 0;
 
     /**
      * Check if the thread can fetch instructions

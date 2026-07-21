@@ -2153,10 +2153,12 @@ Commit::updateComInstStats(const DynInstPtr &inst)
         stats.instsCommitted[tid]++;
     stats.opsCommitted[tid]++;
 
-    // To match the old model, don't count nops and instruction
-    // prefetches towards the total commit count.
-    if (!inst->isNop() &&
-        !inst->isInstPrefetch()) {
+    // A trace record can decode as a nop when its dependencies cannot be
+    // represented by the synthetic instruction. Count that record so trace
+    // ROI boundaries remain aligned with the source trace.
+    const bool is_trace_record =
+        cpu->isTraceMode() && cpu->isTraceInstruction(inst->seqNum);
+    if ((!inst->isNop() || is_trace_record) && !inst->isInstPrefetch()) {
         cpu->instDone(tid, inst);
     }
 

@@ -114,6 +114,13 @@ bool
 Commit::traceMaybeExitOnLastTraceInst(const DynInstPtr &head_inst)
 {
     if (cpu->isTraceMode() && head_inst->isLastTraceInst()) {
+        if (cpu->stopCommitAtBoundary()) {
+            warn("[Commit] Committed LAST trace-driven instruction "
+                 "[sn:%llu] at an instruction-count boundary; preserving "
+                 "the boundary exit.\n",
+                 head_inst->seqNum);
+            return false;
+        }
         warn("[Commit] Committed LAST trace-driven instruction [sn:%llu]; exiting cleanly.\n",
              head_inst->seqNum);
         exitSimLoop("Trace-driven CPU committed last traced instruction");
