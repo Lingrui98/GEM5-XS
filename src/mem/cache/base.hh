@@ -66,6 +66,7 @@
 #include "debug/CachePort.hh"
 #include "debug/CacheTrace.hh"
 #include "enums/Clusivity.hh"
+#include "mem/cache/btbp_l1i_lifecycle.hh"
 #include "mem/cache/cache_blk.hh"
 #include "mem/cache/cache_probe_arg.hh"
 #include "mem/cache/compressors/base.hh"
@@ -1372,8 +1373,14 @@ class BaseCache : public ClockedObject, public CacheAccessor
         statistics::Value mshrOccupancyRatio;
         /** Reset-safe allocated-entry time integral in entry*ticks. */
         statistics::Value mshrEntryTicks;
+        /** Reset-safe demand-owned entry*tick integral. */
+        statistics::Value mshrDemandEntryTicks;
+        /** Reset-safe instruction-prefetch-owned entry*tick integral. */
+        statistics::Value mshrInstPrefetchEntryTicks;
         /** Reset-safe time integral at full MSHR occupancy in ticks. */
         statistics::Value mshrFullTicks;
+        /** Reset-safe ticks at the Stage-A total occupancy of fourteen. */
+        statistics::Value mshrFourteenEntryFullTicks;
         /** Cycles for which the cache stayed blocked due to no free MSHR. */
         statistics::Scalar noMshrBlockedCycles;
         /** Clean read hits served while the cache was blocked (hit-under-blocked). */
@@ -1961,7 +1968,13 @@ public:
 
     Counter getMshrEntryTicks() const;
 
+    Counter getMshrDemandEntryTicks() const;
+
+    Counter getMshrInstPrefetchEntryTicks() const;
+
     Counter getMshrFullTicks() const;
+
+    Counter getMshrFourteenEntryFullTicks() const;
 
     const uint8_t* findBlock(Addr addr, bool is_secure) const override {
         auto blk = tags->findBlock(addr, is_secure);

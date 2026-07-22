@@ -144,6 +144,10 @@ populateBtbpRequestIdentity(
         event.prefetchDecisionId = xs_meta.instPrefetchDecisionId;
         event.prefetchDecisionIdValid = true;
     }
+    if (xs_meta.instPrefetchAttemptId != 0) {
+        event.prefetchAttemptId = xs_meta.instPrefetchAttemptId;
+        event.prefetchAttemptIdValid = true;
+    }
     if (xs_meta.isInstPrefetch()) {
         event.prefetchSource =
             static_cast<uint32_t>(xs_meta.prefetchSource);
@@ -706,9 +710,27 @@ BaseCache::getMshrEntryTicks() const
 }
 
 Counter
+BaseCache::getMshrDemandEntryTicks() const
+{
+    return mshrQueue.getDemandOccupancyEntryTicks(curTick());
+}
+
+Counter
+BaseCache::getMshrInstPrefetchEntryTicks() const
+{
+    return mshrQueue.getInstPrefetchOccupancyEntryTicks(curTick());
+}
+
+Counter
 BaseCache::getMshrFullTicks() const
 {
     return mshrQueue.getOccupancyFullTicks(curTick());
+}
+
+Counter
+BaseCache::getMshrFourteenEntryFullTicks() const
+{
+    return mshrQueue.getFourteenEntryFullTicks(curTick());
 }
 
 void
@@ -1139,6 +1161,8 @@ BaseCache::recvTimingReq(PacketPtr pkt)
             demand_event.lineAddrValid = true;
             demand_event.hit = satisfied;
             demand_event.hitValid = true;
+            demand_event.secure = pkt->isSecure();
+            demand_event.secureValid = true;
             demand_event.requestKind = branch_prediction::btb_pred::
                 BtbpTraceEvent::DemandRequest;
             demand_event.requestKindValid = true;
@@ -1151,6 +1175,12 @@ BaseCache::recvTimingReq(PacketPtr pkt)
                 if (blk_meta.l1iResidencyId != 0) {
                     demand_event.residencyId = blk_meta.l1iResidencyId;
                     demand_event.residencyIdValid = true;
+                    panic_if(!btbpLifecycleLedger.markDemandUse(
+                                 {regenerateBlkAddr(blk), blk->isSecure()},
+                                 blk_meta.l1iResidencyId),
+                             "BTBP demand use references inactive L1I "
+                             "residency %llu",
+                             blk_meta.l1iResidencyId);
                 }
             }
             populateBtbpRequestIdentity(demand_event, pkt->req, blkSize);
@@ -3030,6 +3060,7 @@ BaseCache::handleFill(
     }
     blk_meta.btbpRoiOrigin = pkt->req->hasXsMetadata() &&
         pkt->req->getXsMetadata().btbpRoiOrigin;
+    blk_meta.l1iResidencyId = 0;
     if (isL1I() && pkt->req && pkt->req->isInstFetch() &&
         pkt->req->hasContextId()) {
         blk_meta.eipContextId = pkt->req->contextId();
@@ -3083,6 +3114,8 @@ BaseCache::handleFill(
             lifecycle_event.threadId = tid;
             lifecycle_event.lineAddr = addr;
             lifecycle_event.lineAddrValid = true;
+            lifecycle_event.secure = is_secure;
+            lifecycle_event.secureValid = true;
             lifecycle_event.fillBytesTick = curTick();
             lifecycle_event.fillBytesTickValid = true;
             lifecycle_event.l1iReadyTick = blk->getWhenReady();
@@ -3215,7 +3248,16 @@ BaseCache::invalidateBlock(CacheBlk *blk)
     static uint64_t _inval_cnt{0};
     const uint64_t residency_id = blk && blk->isValid() ?
         blk->getXsMetadata().l1iResidencyId : 0;
-    emitL1ILineEvict(blk);
+    if (isL1I() && blk && blk->isValid() && blk != tempBlock &&
+        residency_id != 0) {
+        panic_if(!btbpLifecycleLedger.close(
+                     {regenerateBlkAddr(blk), blk->isSecure()}, residency_id),
+                 "BTBP eviction references inactive L1I residency %llu",
+                 residency_id);
+    }
+    emitL1ILineEvict(blk,
+        branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind::Evict,
+        btbpReplacementPacket);
     if (residency_id != 0) {
         btbpRoiResidencies.erase(residency_id);
     }
@@ -3879,8 +3921,14 @@ BaseCache::CacheStats::CacheStats(BaseCache &c)
              "average allocated MSHR entry ratio"),
     ADD_STAT(mshrEntryTicks, statistics::units::Tick::get(),
              "allocated MSHR entry*tick integral"),
+    ADD_STAT(mshrDemandEntryTicks, statistics::units::Tick::get(),
+             "demand-owned MSHR entry*tick integral"),
+    ADD_STAT(mshrInstPrefetchEntryTicks, statistics::units::Tick::get(),
+             "instruction-prefetch-owned MSHR entry*tick integral"),
     ADD_STAT(mshrFullTicks, statistics::units::Tick::get(),
              "ticks at full MSHR occupancy"),
+    ADD_STAT(mshrFourteenEntryFullTicks, statistics::units::Tick::get(),
+             "ticks at Stage-A total MSHR occupancy fourteen"),
     ADD_STAT(noMshrBlockedCycles, statistics::units::Cycle::get(),
              "number of cycles blocked by no MSHR entries"),
     ADD_STAT(hitUnderBlockServed, statistics::units::Count::get(),
@@ -4218,9 +4266,21 @@ BaseCache::CacheStats::regStats()
         .flags(nonan)
         .functor([this]() { return cache.getMshrEntryTicks(); });
 
+    mshrDemandEntryTicks
+        .flags(nonan)
+        .functor([this]() { return cache.getMshrDemandEntryTicks(); });
+
+    mshrInstPrefetchEntryTicks
+        .flags(nonan)
+        .functor([this]() { return cache.getMshrInstPrefetchEntryTicks(); });
+
     mshrFullTicks
         .flags(nonan)
         .functor([this]() { return cache.getMshrFullTicks(); });
+
+    mshrFourteenEntryFullTicks
+        .flags(nonan)
+        .functor([this]() { return cache.getMshrFourteenEntryFullTicks(); });
 
     bytesRecvPerCycle.flags(total | nozero | nonan);
     bytesRecvPerCycle = bytesRecv / simTicks * cache.clockPeriod();
