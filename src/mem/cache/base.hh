@@ -65,6 +65,7 @@
 #include "debug/CachePort.hh"
 #include "debug/CacheTrace.hh"
 #include "enums/Clusivity.hh"
+#include "mem/cache/btbp_l1i_lifecycle.hh"
 #include "mem/cache/cache_blk.hh"
 #include "mem/cache/cache_probe_arg.hh"
 #include "mem/cache/compressors/base.hh"
@@ -1147,6 +1148,12 @@ class BaseCache : public ClockedObject, public CacheAccessor
     /** Prefetch residencies whose accepting decisions originated in ROI. */
     std::unordered_map<uint64_t, BtbpRoiResidency> btbpRoiResidencies;
 
+    /** Measurement-only source of truth for active physical L1I lines. */
+    BtbpL1iLifecycleLedger btbpLifecycleLedger;
+
+    /** Incoming fill whose allocation is currently evicting a victim. */
+    PacketPtr btbpReplacementPacket = nullptr;
+
     /**
      * when a data expansion of a compressed block happens it will not be
      * able to co-allocate where it is at anymore. If true, the replacement
@@ -1354,8 +1361,14 @@ class BaseCache : public ClockedObject, public CacheAccessor
         statistics::Value mshrOccupancyRatio;
         /** Reset-safe allocated-entry time integral in entry*ticks. */
         statistics::Value mshrEntryTicks;
+        /** Reset-safe demand-owned entry*tick integral. */
+        statistics::Value mshrDemandEntryTicks;
+        /** Reset-safe instruction-prefetch-owned entry*tick integral. */
+        statistics::Value mshrInstPrefetchEntryTicks;
         /** Reset-safe time integral at full MSHR occupancy in ticks. */
         statistics::Value mshrFullTicks;
+        /** Reset-safe ticks at the Stage-A total occupancy of fourteen. */
+        statistics::Value mshrFourteenEntryFullTicks;
         /** Cycles for which the cache stayed blocked due to no free MSHR. */
         statistics::Scalar noMshrBlockedCycles;
 
@@ -1807,7 +1820,11 @@ class BaseCache : public ClockedObject, public CacheAccessor
     void rollbackDeferredMiss(PacketPtr pkt);
 
     void emitL1IMshrOccupancy(const PacketPtr pkt);
-    void emitL1ILineEvict(CacheBlk *blk);
+    void emitL1ILineEvict(
+        CacheBlk *blk,
+        branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind kind =
+            branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind::Evict,
+        const PacketPtr incoming = nullptr);
 
     bool shouldDropFdipRefill(MSHR *mshr, const PacketPtr pkt) const;
     FdipLineKey makeFdipLineKey(Addr blkAddr, bool is_secure) const
@@ -1991,7 +2008,13 @@ public:
 
     Counter getMshrEntryTicks() const;
 
+    Counter getMshrDemandEntryTicks() const;
+
+    Counter getMshrInstPrefetchEntryTicks() const;
+
     Counter getMshrFullTicks() const;
+
+    Counter getMshrFourteenEntryFullTicks() const;
 
     const uint8_t* findBlock(Addr addr, bool is_secure) const override {
         auto blk = tags->findBlock(addr, is_secure);

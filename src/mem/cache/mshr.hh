@@ -137,6 +137,10 @@ class MSHR : public QueueEntry, public Printable
     /** Request class that allocated this entry. Merges do not change it. */
     AllocationOwner allocationOwner;
 
+    /** Identity of the instruction prefetch that allocated this entry. */
+    uint64_t allocationInstPrefetchDecisionId;
+    PrefetchSourceType allocationInstPrefetchSource;
+
   public:
 
     /** Track if we sent this as a whole line write or not */
@@ -423,6 +427,10 @@ class MSHR : public QueueEntry, public Printable
     PrefetchSourceType getPFSource() const {
         return targets.pfSource;
     }
+
+    uint64_t getInstPrefetchDecisionId() const;
+
+    PrefetchSourceType getInstPrefetchSource() const;
 
 
     int getPFDepth() const {

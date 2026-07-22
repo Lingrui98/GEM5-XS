@@ -2,16 +2,20 @@ syntax = "proto2";
 
 package ProtoMessage;
 
-// Schema v5 event type:
+// Schema v6 event type:
 // 1=mbtb_lookup, 2=mbtb_fill, 3=iprefetch_issue, 4=line_lifecycle,
 // 5=l1i_demand_access, 6=decode_branch, 7=branch_demand,
 // 8=iprefetch_decision_accepted, 9=iprefetch_terminal,
-// 10=l1i_mshr_occupancy, 11=l1i_line_evict, 12=roi_begin, 13=roi_end.
+// 10=l1i_mshr_occupancy, 11=l1i_line_evict, 12=roi_begin, 13=roi_end,
+// 14=iprefetch_gate_attempt.
 // terminal_reason: 0=unknown, 1=completed, 2=translation_fault,
 // 3=uncacheable, 4=cache_or_merge_completion, 5=queue_full_completion,
 // 6=reset_canceled, 7=policy_filtered.
 // lifecycle_kind: 0=unknown, 1=prefetch_fill, 2=demand_fill,
-// 3=demand_use, 4=evict, 5=roi_drain_close.
+// 3=demand_use, 4=evict_or_invalidate, 5=roi_drain_close,
+// 6=same_line_refill.
+// gate_outcome: 0=unknown, 1=accepted, 2=bandwidth_rejected,
+// 3=outstanding_rejected, 4=drain_rejected.
 message BtbpTraceEntry {
   required uint64 tick = 1;
   required uint32 event_type = 2;
@@ -54,4 +58,12 @@ message BtbpTraceEntry {
   optional uint64 core_cycle = 39;
   optional uint64 committed_insts = 40;
   optional uint64 roi_insts = 41;
+  optional bool secure = 42;
+  optional uint64 prefetch_attempt_id = 43;
+  optional uint32 gate_outcome = 44;
+  optional uint32 incoming_request_kind = 45;
+  optional uint64 incoming_prefetch_decision_id = 46;
+  optional uint32 incoming_prefetch_source = 47;
+  optional bool prefetch_owned_mshr = 48;
+  optional bool replacement = 49;
 }

@@ -389,6 +389,7 @@ class Request
         uint64_t fdipFtqId;
         Addr fdipStartPC;
         uint64_t eipDemandId;
+        uint64_t instPrefetchAttemptId;
         uint64_t instPrefetchDecisionId;
         Addr eipTriggerPC;
         ContextID eipContextId;
@@ -412,6 +413,7 @@ class Request
             fdipFtqId(0),
             fdipStartPC(0),
             eipDemandId(0),
+            instPrefetchAttemptId(0),
             instPrefetchDecisionId(0),
             eipTriggerPC(0),
             eipContextId(InvalidContextID),
@@ -435,6 +437,7 @@ class Request
             fdipFtqId(0),
             fdipStartPC(0),
             eipDemandId(0),
+            instPrefetchAttemptId(0),
             instPrefetchDecisionId(0),
             eipTriggerPC(0),
             eipContextId(InvalidContextID),
@@ -458,6 +461,7 @@ class Request
             fdipFtqId(0),
             fdipStartPC(0),
             eipDemandId(0),
+            instPrefetchAttemptId(0),
             instPrefetchDecisionId(0),
             eipTriggerPC(0),
             eipContextId(InvalidContextID),
@@ -481,6 +485,7 @@ class Request
             fdipFtqId(0),
             fdipStartPC(0),
             eipDemandId(0),
+            instPrefetchAttemptId(0),
             instPrefetchDecisionId(0),
             eipTriggerPC(0),
             eipContextId(InvalidContextID),
@@ -513,6 +518,7 @@ class Request
             fdipFtqId = 0;
             fdipStartPC = 0;
             eipDemandId = 0;
+            instPrefetchAttemptId = 0;
             instPrefetchDecisionId = 0;
             eipTriggerPC = 0;
             eipContextId = InvalidContextID;

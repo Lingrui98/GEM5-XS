@@ -12,7 +12,7 @@ namespace btb_pred
 
 struct BtbpTraceEvent
 {
-    static constexpr uint32_t SchemaVersion = 5;
+    static constexpr uint32_t SchemaVersion = 6;
 
     enum EventType : uint32_t
     {
@@ -29,6 +29,7 @@ struct BtbpTraceEvent
         L1ILineEvict = 11,
         RoiBegin = 12,
         RoiEnd = 13,
+        IPrefetchGateAttempt = 14,
     };
 
     enum class TerminalReason : uint32_t
@@ -51,6 +52,16 @@ struct BtbpTraceEvent
         DemandUse = 3,
         Evict = 4,
         RoiDrainClose = 5,
+        SameLineRefill = 6,
+    };
+
+    enum class GateOutcome : uint32_t
+    {
+        Unknown = 0,
+        Accepted = 1,
+        BandwidthRejected = 2,
+        OutstandingRejected = 3,
+        DrainRejected = 4,
     };
 
     enum FillSource : uint32_t
@@ -148,6 +159,22 @@ struct BtbpTraceEvent
     bool committedInstsValid = false;
     uint64_t roiInsts = 0;
     bool roiInstsValid = false;
+    bool secure = false;
+    bool secureValid = false;
+    uint64_t prefetchAttemptId = 0;
+    bool prefetchAttemptIdValid = false;
+    uint32_t gateOutcome = static_cast<uint32_t>(GateOutcome::Unknown);
+    bool gateOutcomeValid = false;
+    uint32_t incomingRequestKind = UnknownRequest;
+    bool incomingRequestKindValid = false;
+    uint64_t incomingPrefetchDecisionId = 0;
+    bool incomingPrefetchDecisionIdValid = false;
+    uint32_t incomingPrefetchSource = 0;
+    bool incomingPrefetchSourceValid = false;
+    bool prefetchOwnedMshr = false;
+    bool prefetchOwnedMshrValid = false;
+    bool replacement = false;
+    bool replacementValid = false;
 };
 
 } // namespace btb_pred

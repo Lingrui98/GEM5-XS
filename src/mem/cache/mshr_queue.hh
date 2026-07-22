@@ -102,8 +102,14 @@ class MSHRQueue : public Queue<MSHR>
     Tick occupancyLastUpdate;
     /** Time integral of allocated-entry count over the accounting window. */
     Counter occupancyEntryTicks;
+    /** Time integral of demand-owned entry count. */
+    Counter occupancyDemandEntryTicks;
+    /** Time integral of instruction-prefetch-owned entry count. */
+    Counter occupancyInstPrefetchEntryTicks;
     /** Time integral for which every MSHR entry is allocated. */
     Counter occupancyFullTicks;
+    /** Time integral at the Stage-A common-resource total of 14 entries. */
+    Counter occupancyFourteenEntryFullTicks;
 
     void updateOccupancyStats(Tick now);
 
@@ -149,8 +155,14 @@ class MSHRQueue : public Queue<MSHR>
     /** Return accumulated entry*tick integral up to @p now. */
     Counter getOccupancyEntryTicks(Tick now) const;
 
+    Counter getDemandOccupancyEntryTicks(Tick now) const;
+
+    Counter getInstPrefetchOccupancyEntryTicks(Tick now) const;
+
     /** Return accumulated ticks at full queue occupancy up to @p now. */
     Counter getOccupancyFullTicks(Tick now) const;
+
+    Counter getFourteenEntryFullTicks(Tick now) const;
 
     /** Return elapsed ticks in the current occupancy accounting window. */
     Tick getOccupancyElapsedTicks(Tick now) const;

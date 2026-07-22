@@ -42,6 +42,8 @@ Source('write_queue.cc')
 Source('write_queue_entry.cc')
 
 GTest('mshr_partition.test', 'mshr_partition.test.cc', '../../base/debug.cc')
+GTest('btbp_l1i_lifecycle.test', 'btbp_l1i_lifecycle.test.cc',
+      '../../base/debug.cc')
 
 DebugFlag('Cache')
 DebugFlag('CacheComp')

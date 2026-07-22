@@ -61,18 +61,29 @@ MSHRQueue::MSHRQueue(const std::string &_label,
       occupancyStartTick(curTick()),
       occupancyLastUpdate(curTick()),
       occupancyEntryTicks(0),
-      occupancyFullTicks(0)
+      occupancyDemandEntryTicks(0),
+      occupancyInstPrefetchEntryTicks(0),
+      occupancyFullTicks(0),
+      occupancyFourteenEntryFullTicks(0)
 {}
 
 void
 MSHRQueue::updateOccupancyStats(Tick now)
 {
     if (now > occupancyLastUpdate) {
+        const auto occupancy = partitionOccupancy();
+        const Counter elapsed = now - occupancyLastUpdate;
         occupancyEntryTicks +=
-            static_cast<Counter>(allocated) *
-            static_cast<Counter>(now - occupancyLastUpdate);
+            static_cast<Counter>(allocated) * elapsed;
+        occupancyDemandEntryTicks +=
+            static_cast<Counter>(occupancy.demandOwned) * elapsed;
+        occupancyInstPrefetchEntryTicks +=
+            static_cast<Counter>(occupancy.instPrefetchOwned) * elapsed;
         if (allocated == numEntries) {
-            occupancyFullTicks += now - occupancyLastUpdate;
+            occupancyFullTicks += elapsed;
+        }
+        if (allocated == 14) {
+            occupancyFourteenEntryFullTicks += elapsed;
         }
     }
     occupancyLastUpdate = now;
@@ -116,7 +127,10 @@ MSHRQueue::resetOccupancyStats(Tick now)
     occupancyStartTick = now;
     occupancyLastUpdate = now;
     occupancyEntryTicks = 0;
+    occupancyDemandEntryTicks = 0;
+    occupancyInstPrefetchEntryTicks = 0;
     occupancyFullTicks = 0;
+    occupancyFourteenEntryFullTicks = 0;
 }
 
 Counter
@@ -131,10 +145,43 @@ MSHRQueue::getOccupancyEntryTicks(Tick now) const
 }
 
 Counter
+MSHRQueue::getDemandOccupancyEntryTicks(Tick now) const
+{
+    Counter total = occupancyDemandEntryTicks;
+    if (now > occupancyLastUpdate) {
+        total += static_cast<Counter>(partitionOccupancy().demandOwned) *
+            static_cast<Counter>(now - occupancyLastUpdate);
+    }
+    return total;
+}
+
+Counter
+MSHRQueue::getInstPrefetchOccupancyEntryTicks(Tick now) const
+{
+    Counter total = occupancyInstPrefetchEntryTicks;
+    if (now > occupancyLastUpdate) {
+        total +=
+            static_cast<Counter>(partitionOccupancy().instPrefetchOwned) *
+            static_cast<Counter>(now - occupancyLastUpdate);
+    }
+    return total;
+}
+
+Counter
 MSHRQueue::getOccupancyFullTicks(Tick now) const
 {
     Counter total = occupancyFullTicks;
     if (now > occupancyLastUpdate && allocated == numEntries) {
+        total += now - occupancyLastUpdate;
+    }
+    return total;
+}
+
+Counter
+MSHRQueue::getFourteenEntryFullTicks(Tick now) const
+{
+    Counter total = occupancyFourteenEntryFullTicks;
+    if (now > occupancyLastUpdate && allocated == 14) {
         total += now - occupancyLastUpdate;
     }
     return total;

@@ -65,6 +65,8 @@ MSHR::MSHR(const std::string &name)
         pendingModified(false),
         postInvalidate(false), postDowngrade(false),
         allocationOwner(AllocationOwner::Unallocated),
+        allocationInstPrefetchDecisionId(0),
+        allocationInstPrefetchSource(PF_NONE),
         wasWholeLineWrite(false), isForward(false),
         targets(name + ".targets"),
         deferredTargets(name + ".deferredTargets")
@@ -357,6 +359,16 @@ MSHR::allocate(Addr blk_addr, unsigned blk_size, PacketPtr target,
                                   target->req->getXsMetadata().isInstPrefetch();
     allocationOwner = is_inst_prefetch ? AllocationOwner::InstPrefetch :
                                          AllocationOwner::Demand;
+    allocationInstPrefetchDecisionId = 0;
+    allocationInstPrefetchSource = PF_NONE;
+    if (is_inst_prefetch) {
+        const auto metadata = target->req->getXsMetadata();
+        panic_if(metadata.instPrefetchDecisionId == 0,
+                 "instruction-prefetch MSHR owner lacks decision identity");
+        allocationInstPrefetchDecisionId =
+            metadata.instPrefetchDecisionId;
+        allocationInstPrefetchSource = metadata.prefetchSource;
+    }
 
     targets.init(blkAddr, blkSize);
     deferredTargets.init(blkAddr, blkSize);
@@ -413,6 +425,8 @@ MSHR::deallocate()
     inService = false;
     fdipLateSeen = false;
     allocationOwner = AllocationOwner::Unallocated;
+    allocationInstPrefetchDecisionId = 0;
+    allocationInstPrefetchSource = PF_NONE;
 }
 
 /*
@@ -471,6 +485,18 @@ MSHR::allocateTarget(PacketPtr pkt, Tick whenReady, Counter _order,
     }
 
     DPRINTF(MSHR, "After target allocation: %s", print());
+}
+
+uint64_t
+MSHR::getInstPrefetchDecisionId() const
+{
+    return allocationInstPrefetchDecisionId;
+}
+
+PrefetchSourceType
+MSHR::getInstPrefetchSource() const
+{
+    return allocationInstPrefetchSource;
 }
 
 bool

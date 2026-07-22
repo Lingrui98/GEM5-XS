@@ -360,12 +360,18 @@ Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
     ADD_STAT(instPrefetchDecisionsAccepted,
              statistics::units::Count::get(),
              "Instruction-prefetch decisions accepted at the common gate"),
+    ADD_STAT(instPrefetchGateAttempts,
+             statistics::units::Count::get(),
+             "Instruction-prefetch common-gate attempts"),
     ADD_STAT(instPrefetchDecisionBandwidthRejects,
              statistics::units::Count::get(),
              "Instruction-prefetch decisions rejected by cycle bandwidth"),
     ADD_STAT(instPrefetchDecisionOutstandingRejects,
              statistics::units::Count::get(),
              "Instruction-prefetch decisions rejected by outstanding limit"),
+    ADD_STAT(instPrefetchDecisionDrainRejects,
+             statistics::units::Count::get(),
+             "Instruction-prefetch decisions rejected during ROI drain"),
     ADD_STAT(instPrefetchOutstandingMax, statistics::units::Count::get(),
              "Peak accepted-but-incomplete instruction-prefetch requests"),
     ADD_STAT(eipDemandAccesses, statistics::units::Count::get(),
@@ -523,10 +529,10 @@ Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
             .prereq(fdipEpochMismatch);
         instPrefetchDecisionsAccepted
             .prereq(instPrefetchDecisionsAccepted);
-        instPrefetchDecisionBandwidthRejects
-            .prereq(instPrefetchDecisionBandwidthRejects);
-        instPrefetchDecisionOutstandingRejects
-            .prereq(instPrefetchDecisionOutstandingRejects);
+        instPrefetchGateAttempts.flags(statistics::nonan);
+        instPrefetchDecisionBandwidthRejects.flags(statistics::nonan);
+        instPrefetchDecisionOutstandingRejects.flags(statistics::nonan);
+        instPrefetchDecisionDrainRejects.flags(statistics::nonan);
         instPrefetchOutstandingMax
             .prereq(instPrefetchOutstandingMax);
         eipDemandAccesses
@@ -773,15 +779,24 @@ Fetch::resetFdipTracking(ThreadID tid)
 
 bool
 Fetch::reserveInstPrefetchDecision(
-    unsigned maxOutstanding, unsigned issueBandwidth, uint64_t &decisionId)
+    unsigned maxOutstanding, unsigned issueBandwidth, uint64_t &attemptId,
+    uint64_t &decisionId,
+    branch_prediction::btb_pred::BtbpTraceEvent::GateOutcome &outcome)
 {
+    using GateOutcome = branch_prediction::btb_pred::BtbpTraceEvent::GateOutcome;
+
+    attemptId = nextInstPrefetchAttemptId++;
+    ++fetchStats.instPrefetchGateAttempts;
     if (btbpRoiDrainMode) {
+        ++fetchStats.instPrefetchDecisionDrainRejects;
+        outcome = GateOutcome::DrainRejected;
         return false;
     }
 
     if (maxOutstanding == 0 ||
         instPrefetchOutstandingLines >= maxOutstanding) {
         ++fetchStats.instPrefetchDecisionOutstandingRejects;
+        outcome = GateOutcome::OutstandingRejected;
         return false;
     }
 
@@ -793,6 +808,7 @@ Fetch::reserveInstPrefetchDecision(
     if (issueBandwidth == 0 ||
         instPrefetchDecisionsThisTick >= issueBandwidth) {
         ++fetchStats.instPrefetchDecisionBandwidthRejects;
+        outcome = GateOutcome::BandwidthRejected;
         return false;
     }
 
@@ -800,11 +816,54 @@ Fetch::reserveInstPrefetchDecision(
     ++instPrefetchDecisionsThisTick;
     ++instPrefetchOutstandingLines;
     ++fetchStats.instPrefetchDecisionsAccepted;
+    outcome = GateOutcome::Accepted;
     if (instPrefetchOutstandingLines >
         fetchStats.instPrefetchOutstandingMax.value()) {
         fetchStats.instPrefetchOutstandingMax = instPrefetchOutstandingLines;
     }
     return true;
+}
+
+void
+Fetch::emitInstPrefetchGateAttempt(
+    ThreadID tid, PrefetchSourceType source, Addr virtual_line_addr,
+    Addr trigger_pc, const Request::XsMetadata &trace_meta,
+    uint64_t attempt_id, uint64_t decision_id,
+    branch_prediction::btb_pred::BtbpTraceEvent::GateOutcome outcome)
+{
+    using Event = branch_prediction::btb_pred::BtbpTraceEvent;
+
+    Event event;
+    event.tick = curTick();
+    event.eventType = Event::IPrefetchGateAttempt;
+    event.threadId = tid;
+    event.virtualLineAddr = virtual_line_addr;
+    event.virtualLineAddrValid = true;
+    event.triggerPc = trigger_pc;
+    event.triggerPcValid = true;
+    event.lineSize = cacheBlkSize;
+    event.lineSizeValid = true;
+    event.requestKind = Event::PrefetchRequest;
+    event.requestKindValid = true;
+    event.prefetchSource = static_cast<uint32_t>(source);
+    event.prefetchSourceValid = true;
+    event.prefetchAttemptId = attempt_id;
+    event.prefetchAttemptIdValid = true;
+    event.gateOutcome = static_cast<uint32_t>(outcome);
+    event.gateOutcomeValid = true;
+    if (decision_id != 0) {
+        event.prefetchDecisionId = decision_id;
+        event.prefetchDecisionIdValid = true;
+    }
+    if (trace_meta.traceIdentityValid) {
+        event.addressSpaceId = trace_meta.traceAddressSpaceId;
+        event.addressSpaceIdValid = true;
+        event.asidHash = trace_meta.traceAsidHash;
+        event.asidHashValid = true;
+        event.ftqId = trace_meta.traceFtqId;
+        event.ftqIdValid = true;
+    }
+    cpu->notifyBtbpTrace(event);
 }
 
 void
@@ -849,6 +908,10 @@ Fetch::emitInstPrefetchTrace(
     if (xs_meta.instPrefetchDecisionId != 0) {
         event.prefetchDecisionId = xs_meta.instPrefetchDecisionId;
         event.prefetchDecisionIdValid = true;
+    }
+    if (xs_meta.instPrefetchAttemptId != 0) {
+        event.prefetchAttemptId = xs_meta.instPrefetchAttemptId;
+        event.prefetchAttemptIdValid = true;
     }
     if (xs_meta.isInstPrefetch()) {
         event.prefetchSource =
@@ -1022,10 +1085,22 @@ Fetch::startFdipTranslation(ThreadID tid, unsigned lineIndex)
         return false;
     }
 
+    uint64_t attempt_id = 0;
     uint64_t decision_id = 0;
-    if (!reserveInstPrefetchDecision(
+    branch_prediction::btb_pred::BtbpTraceEvent::GateOutcome gate_outcome;
+    const bool accepted = reserveInstPrefetchDecision(
             dbpbtb->fdipMaxOutstanding(),
-            dbpbtb->fdipIssueBandwidth(), decision_id)) {
+            dbpbtb->fdipIssueBandwidth(), attempt_id, decision_id,
+            gate_outcome);
+    Request::XsMetadata trace_meta;
+    trace_meta.traceIdentityValid = true;
+    trace_meta.traceAddressSpaceId = state.addressSpaceId;
+    trace_meta.traceAsidHash = state.asidHash;
+    trace_meta.traceFtqId = state.ftqId;
+    emitInstPrefetchGateAttempt(
+        tid, PF_FDIP, line.lineAddr, state.startPC, trace_meta,
+        attempt_id, decision_id, gate_outcome);
+    if (!accepted) {
         return false;
     }
 
@@ -1043,6 +1118,7 @@ Fetch::startFdipTranslation(ThreadID tid, unsigned lineIndex)
     xsMeta.fdipEpoch = state.epoch;
     xsMeta.fdipFtqId = state.ftqId;
     xsMeta.fdipStartPC = state.startPC;
+    xsMeta.instPrefetchAttemptId = attempt_id;
     xsMeta.instPrefetchDecisionId = decision_id;
     xsMeta.btbpRoiOrigin = btbpRoiActive;
     xsMeta.traceIdentityValid = true;
@@ -1577,9 +1653,17 @@ Fetch::acceptEipCandidate(
         return false;
     }
 
+    uint64_t attempt_id = 0;
     uint64_t decision_id = 0;
-    if (!reserveInstPrefetchDecision(
-            eipMaxOutstanding, eipIssueBandwidth, decision_id)) {
+    branch_prediction::btb_pred::BtbpTraceEvent::GateOutcome gate_outcome;
+    const bool accepted = reserveInstPrefetchDecision(
+        eipMaxOutstanding, eipIssueBandwidth, attempt_id, decision_id,
+        gate_outcome);
+    emitInstPrefetchGateAttempt(
+        tid, PF_EIP, candidate.virtualLine << 6,
+        candidate.triggerVirtualLine << 6, trigger_meta,
+        attempt_id, decision_id, gate_outcome);
+    if (!accepted) {
         return false;
     }
 
@@ -1597,6 +1681,7 @@ Fetch::acceptEipCandidate(
     req->setPFDepth(0);
 
     Request::XsMetadata xs_meta(PF_EIP, 0);
+    xs_meta.instPrefetchAttemptId = attempt_id;
     xs_meta.instPrefetchDecisionId = decision_id;
     xs_meta.eipTriggerPC = trigger_pc;
     xs_meta.eipContextId = cpu->thread[tid]->contextId();

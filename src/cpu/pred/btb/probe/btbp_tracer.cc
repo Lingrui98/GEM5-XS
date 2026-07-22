@@ -159,6 +159,31 @@ BtbpTracer::trace(const BtbpTraceEvent &event)
     if (event.roiInstsValid) {
         entry.set_roi_insts(event.roiInsts);
     }
+    if (event.secureValid) {
+        entry.set_secure(event.secure);
+    }
+    if (event.prefetchAttemptIdValid) {
+        entry.set_prefetch_attempt_id(event.prefetchAttemptId);
+    }
+    if (event.gateOutcomeValid) {
+        entry.set_gate_outcome(event.gateOutcome);
+    }
+    if (event.incomingRequestKindValid) {
+        entry.set_incoming_request_kind(event.incomingRequestKind);
+    }
+    if (event.incomingPrefetchDecisionIdValid) {
+        entry.set_incoming_prefetch_decision_id(
+            event.incomingPrefetchDecisionId);
+    }
+    if (event.incomingPrefetchSourceValid) {
+        entry.set_incoming_prefetch_source(event.incomingPrefetchSource);
+    }
+    if (event.prefetchOwnedMshrValid) {
+        entry.set_prefetch_owned_mshr(event.prefetchOwnedMshr);
+    }
+    if (event.replacementValid) {
+        entry.set_replacement(event.replacement);
+    }
 
     stream->write(entry);
 }

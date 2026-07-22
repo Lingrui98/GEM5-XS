@@ -633,8 +633,14 @@ class Fetch
         Addr physLineAddr, bool isSecure, FdipProbeHint &hint);
     bool reserveInstPrefetchDecision(
         unsigned maxOutstanding, unsigned issueBandwidth,
-        uint64_t &decisionId);
+        uint64_t &attemptId, uint64_t &decisionId,
+        branch_prediction::btb_pred::BtbpTraceEvent::GateOutcome &outcome);
     void releaseInstPrefetchDecision();
+    void emitInstPrefetchGateAttempt(
+        ThreadID tid, PrefetchSourceType source, Addr virtualLineAddr,
+        Addr triggerPc, const Request::XsMetadata &traceMeta,
+        uint64_t attemptId, uint64_t decisionId,
+        branch_prediction::btb_pred::BtbpTraceEvent::GateOutcome outcome);
     void emitInstPrefetchTrace(
         branch_prediction::btb_pred::BtbpTraceEvent::EventType eventType,
         ThreadID tid, const RequestPtr &req,
@@ -1221,6 +1227,7 @@ class Fetch
     unsigned instPrefetchOutstandingLines = 0;
     Tick instPrefetchDecisionTick = MaxTick;
     unsigned instPrefetchDecisionsThisTick = 0;
+    uint64_t nextInstPrefetchAttemptId = 1;
     uint64_t nextInstPrefetchDecisionId = 1;
     uint64_t nextL1iDemandUid = 1;
     CacheAccessor *fdipIcacheAccessor = nullptr;
@@ -1423,10 +1430,14 @@ class Fetch
         statistics::Scalar fdipEpochMismatch;
         /** Number of instruction-prefetch decisions accepted at the common gate. */
         statistics::Scalar instPrefetchDecisionsAccepted;
+        /** Number of instruction-prefetch common-gate attempts. */
+        statistics::Scalar instPrefetchGateAttempts;
         /** Number of decisions rejected by the per-cycle bandwidth gate. */
         statistics::Scalar instPrefetchDecisionBandwidthRejects;
         /** Number of decisions rejected by the outstanding-request gate. */
         statistics::Scalar instPrefetchDecisionOutstandingRejects;
+        /** Number of decisions rejected because ROI drain has started. */
+        statistics::Scalar instPrefetchDecisionDrainRejects;
         /** Peak accepted-but-incomplete instruction-prefetch requests. */
         statistics::Scalar instPrefetchOutstandingMax;
         /** Number of demand tag checks observed by EIP. */
