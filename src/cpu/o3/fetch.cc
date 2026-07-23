@@ -64,6 +64,7 @@
 #include "cpu/o3/trace/TraceFetch.hh"
 #include "cpu/o3/trace/TraceL1iIdentity.hh"
 #include "cpu/pred/btb/decoupled_bpred.hh"
+#include "cpu/pred/btb/probe/btbp_trace_field_helpers.hh"
 #include "cpu/valuepred/example_value_predictor_metadata.hh"
 #include "debug/Activity.hh"
 #include "debug/Drain.hh"
@@ -1806,6 +1807,8 @@ Fetch::issueFdipReadyLine(ThreadID tid, unsigned lineIndex,
     issue_event.prefetchDecisionIdValid = true;
     issue_event.prefetchSource = static_cast<uint32_t>(PF_FDIP);
     issue_event.prefetchSourceValid = true;
+    branch_prediction::btb_pred::applyFdipAttemptIdentity(
+        issue_event, line.req->getXsMetadata());
     cpu->notifyBtbpTrace(issue_event);
 
     if (remainingBudget > 0) {

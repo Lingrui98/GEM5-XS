@@ -1,0 +1,17 @@
+Import('*')
+
+# Stage-A v2.3 trace-contract route + field tests.
+# Build with --unit-test, eg:
+#   scons build/RISCV/cpu/pred/btb/probe/btbp_trace_route.test.debug --unit-test -j8
+#
+# btbp_trace_route.test exercises the extracted routing decision
+# (btbpTraceRouteClass / requireBtbpTraceRouteable) and the FDIP
+# attempt-identity helper (applyFdipAttemptIdentity). It depends only on
+# header-only probe helpers plus the Request::XsMetadata struct, mirroring the
+# btbp_l1i_lifecycle.test dependency shape (no protobuf, no SimObject).
+GTest('btbp_trace_route.test',
+      'btbp_trace_route.test.cc',
+      '../../../../base/debug.cc',
+      '../../../../sim/cur_tick.cc')
+
+env.Append(UNITTESTS=['btbp_trace_route.test'])
