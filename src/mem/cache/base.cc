@@ -343,24 +343,6 @@ BaseCache::emitL1ILineEvict(
 }
 
 void
-BaseCache::verifyL1IBlockResidency(CacheBlk *blk)
-{
-    panic_if(!isL1I() || !blk || blk == tempBlock || !blk->isValid(),
-             "BTBP prefetch completion lacks a tracked valid L1I block");
-    const auto xs_meta = blk->getXsMetadata();
-    panic_if(xs_meta.l1iResidencyId == 0,
-             "BTBP prefetch completion cleared its block residency");
-    const BtbpL1iLifecycleLedger::LineKey key{
-        regenerateBlkAddr(blk), blk->isSecure()};
-    panic_if(!btbpLifecycleLedger.isCurrent(
-                 key, xs_meta.l1iResidencyId),
-             "BTBP prefetch completion block/ledger residency mismatch: "
-             "line %#llx (%s), id %llu",
-             key.lineAddr, key.secure ? "secure" : "non-secure",
-             xs_meta.l1iResidencyId);
-}
-
-void
 BaseCache::beginBtbpRoiTracking()
 {
     panic_if(btbpLifecycleLedger.size() != btbpRoiResidencies.size(),
@@ -1194,9 +1176,10 @@ BaseCache::recvTimingReq(PacketPtr pkt)
                 if (blk_meta.l1iResidencyId != 0) {
                     demand_event.residencyId = blk_meta.l1iResidencyId;
                     demand_event.residencyIdValid = true;
-                    panic_if(!btbpLifecycleLedger.markDemandUse(
+                    panic_if(!markBtbpL1iDemandUse(
+                                 btbpLifecycleLedger,
                                  {regenerateBlkAddr(blk), blk->isSecure()},
-                                 blk_meta.l1iResidencyId),
+                                 *blk),
                              "BTBP demand use references inactive L1I "
                              "residency %llu",
                              blk_meta.l1iResidencyId);
@@ -3269,8 +3252,9 @@ BaseCache::invalidateBlock(CacheBlk *blk)
         blk->getXsMetadata().l1iResidencyId : 0;
     if (isL1I() && blk && blk->isValid() && blk != tempBlock &&
         residency_id != 0) {
-        panic_if(!btbpLifecycleLedger.close(
-                     {regenerateBlkAddr(blk), blk->isSecure()}, residency_id),
+        panic_if(!closeBtbpL1iBlockResidency(
+                     btbpLifecycleLedger,
+                     {regenerateBlkAddr(blk), blk->isSecure()}, *blk),
                  "BTBP eviction references inactive L1I residency %llu",
                  residency_id);
     }

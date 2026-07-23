@@ -173,15 +173,20 @@ TEST(BtbpL1iLifecycleTest, InstallConflictDoesNotMutateEitherMapping)
 
 TEST(BtbpL1iLifecycleTest, PrefetchMarkPreservesFillOwnedMetadata)
 {
+    Ledger ledger;
+    const Ledger::LineKey key{0x2c00, false};
     CacheBlk block;
+    block.insert(key.lineAddr, key.secure);
     Request::XsMetadata fill_metadata(PF_FDIP);
     fill_metadata.instPrefetchAttemptId = 11;
     fill_metadata.instPrefetchDecisionId = 12;
     fill_metadata.l1iResidencyId = 13;
     fill_metadata.btbpRoiOrigin = true;
-    block.setXsMetadata(fill_metadata);
+    transitionBtbpL1iFillMetadata(
+        ledger, key, block, fill_metadata, false, true,
+        [](const Request::XsMetadata &) { ADD_FAILURE(); });
 
-    block.setPrefetched();
+    completeBtbpL1iPrefetch(ledger, key, block, true);
 
     const auto marked_metadata = block.getXsMetadata();
     EXPECT_TRUE(block.wasPrefetched());
@@ -189,18 +194,43 @@ TEST(BtbpL1iLifecycleTest, PrefetchMarkPreservesFillOwnedMetadata)
     EXPECT_EQ(marked_metadata.instPrefetchDecisionId, 12);
     EXPECT_EQ(marked_metadata.l1iResidencyId, 13);
     EXPECT_TRUE(marked_metadata.btbpRoiOrigin);
+    EXPECT_TRUE(ledger.isCurrent(key, 13));
+    EXPECT_TRUE(closeBtbpL1iBlockResidency(ledger, key, block));
+    block.invalidate();
 }
 
 TEST(BtbpL1iLifecycleTest, CapacityBoundFailsClosed)
 {
     Ledger ledger(2);
-    EXPECT_FALSE(ledger.install({0x3000, false}, {1, false, false, false}));
-    EXPECT_FALSE(ledger.install({0x4000, false}, {2, false, false, false}));
-    EXPECT_ANY_THROW(
-        ledger.install({0x5000, false}, {3, false, false, false}));
+    CacheBlk first;
+    CacheBlk second;
+    CacheBlk rejected;
+    first.insert(0x3000, false);
+    second.insert(0x4000, false);
+    rejected.insert(0x5000, false);
+    const auto no_close = [](const Request::XsMetadata &) {
+        ADD_FAILURE();
+    };
+    transitionBtbpL1iFillMetadata(
+        ledger, {0x3000, false}, first, makeMetadata(1, false), false,
+        false, no_close);
+    transitionBtbpL1iFillMetadata(
+        ledger, {0x4000, false}, second, makeMetadata(2, false), false,
+        false, no_close);
+    EXPECT_ANY_THROW(transitionBtbpL1iFillMetadata(
+        ledger, {0x5000, false}, rejected, makeMetadata(3, false),
+        false, false, no_close));
     EXPECT_EQ(ledger.size(), 2);
     EXPECT_TRUE(ledger.isCurrent({0x3000, false}, 1));
     EXPECT_TRUE(ledger.isCurrent({0x4000, false}, 2));
+    EXPECT_EQ(rejected.getXsMetadata().l1iResidencyId, 0);
+    EXPECT_TRUE(closeBtbpL1iBlockResidency(
+        ledger, {0x3000, false}, first));
+    EXPECT_TRUE(closeBtbpL1iBlockResidency(
+        ledger, {0x4000, false}, second));
+    first.invalidate();
+    second.invalidate();
+    rejected.invalidate();
 }
 
 TEST(BtbpL1iLifecycleTest, DrainClosesOnlyRoiOriginPrefetchResidencies)
