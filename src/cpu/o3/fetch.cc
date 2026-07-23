@@ -62,6 +62,7 @@
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/trace/TraceFetch.hh"
 #include "cpu/pred/btb/decoupled_bpred.hh"
+#include "cpu/pred/btb/probe/btbp_trace_field_helpers.hh"
 #include "debug/Activity.hh"
 #include "debug/Drain.hh"
 #include "debug/Fetch.hh"
@@ -1237,6 +1238,8 @@ Fetch::issueFdipReadyLine(ThreadID tid, unsigned lineIndex,
     issue_event.prefetchDecisionIdValid = true;
     issue_event.prefetchSource = static_cast<uint32_t>(PF_FDIP);
     issue_event.prefetchSourceValid = true;
+    branch_prediction::btb_pred::applyFdipAttemptIdentity(
+        issue_event, line.req->getXsMetadata());
     cpu->notifyBtbpTrace(issue_event);
 
     if (remainingBudget > 0) {

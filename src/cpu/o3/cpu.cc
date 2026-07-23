@@ -55,6 +55,7 @@
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/thread_context.hh"
 #include "cpu/o3/trace/TraceReader.hh"
+#include "cpu/pred/btb/probe/btbp_trace_route.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/simple_thread.hh"
 #include "cpu/thread_context.hh"
@@ -367,51 +368,47 @@ void
 CPU::notifyBtbpTrace(
     const branch_prediction::btb_pred::BtbpTraceEvent &event)
 {
-    using Event = branch_prediction::btb_pred::BtbpTraceEvent;
+    using Route = branch_prediction::btb_pred::BtbpTraceRouteClass;
+    branch_prediction::btb_pred::requireBtbpTraceRouteable(event.eventType);
 
-    switch (event.eventType) {
-      case Event::MbtbLookup:
+    switch (branch_prediction::btb_pred::btbpTraceRouteClass(event.eventType)) {
+      case Route::MbtbLookup:
         if (ppBtbpTraceMbtbLookup) {
             ppBtbpTraceMbtbLookup->notify(event);
         }
         break;
-      case Event::MbtbFill:
+      case Route::MbtbFill:
         if (ppBtbpTraceMbtbFill) {
             ppBtbpTraceMbtbFill->notify(event);
         }
         break;
-      case Event::IPrefetchIssue:
-      case Event::IPrefetchDecisionAccepted:
-      case Event::IPrefetchTerminal:
+      case Route::IPrefetchIssue:
         if (ppBtbpTraceIPrefetchIssue) {
             ppBtbpTraceIPrefetchIssue->notify(event);
         }
         break;
-      case Event::LineLifecycle:
-      case Event::L1IMshrOccupancy:
-      case Event::L1ILineEvict:
-      case Event::RoiBegin:
-      case Event::RoiEnd:
+      case Route::LineLifecycle:
         if (ppBtbpTraceLineLifecycle) {
             ppBtbpTraceLineLifecycle->notify(event);
         }
         break;
-      case Event::L1IDemandAccess:
+      case Route::L1IDemandAccess:
         if (ppBtbpTraceL1IDemandAccess) {
             ppBtbpTraceL1IDemandAccess->notify(event);
         }
         break;
-      case Event::DecodeBranch:
+      case Route::DecodeBranch:
         if (ppBtbpTraceDecodeBranch) {
             ppBtbpTraceDecodeBranch->notify(event);
         }
         break;
-      case Event::BranchDemand:
+      case Route::BranchDemand:
         if (ppBtbpTraceBranchDemand) {
             ppBtbpTraceBranchDemand->notify(event);
         }
         break;
       default:
+        // Unreachable: requireBtbpTraceRouteable panicked on Unsupported.
         break;
     }
 }
