@@ -1062,8 +1062,8 @@ Cache::serviceMSHRTargets(MSHR *mshr, const PacketPtr pkt, CacheBlk *blk)
     const bool inst_prefetched = inst_prefetch_fill && !demand_merged;
     if (blk && ((!from_core && from_pref) || inst_prefetched)) {
         blk->setPrefetched();
-        blk->setXsMetadata(pkt->req->getXsMetadata());
-        DPRINTF(Cache, "Marking block as prefetched from prefetcher %i\n", blk->getXsMetadata().prefetchSource);
+        DPRINTF(Cache, "Marking block as prefetched from prefetcher %i\n",
+                blk->getXsMetadata().prefetchSource);
         stats.pfOnlyFill++;  // Pure prefetch fill (no demand merge)
     } else if (blk && ((from_core && from_pref) ||
                        (inst_prefetch_fill && demand_merged))) {
@@ -1071,6 +1071,9 @@ Cache::serviceMSHRTargets(MSHR *mshr, const PacketPtr pkt, CacheBlk *blk)
         stats.pfMergedWithDemand++;
         DPRINTF(Cache, "Prefetch merged with demand for %#lx - not marking as prefetched\n",
                 blk->getTag());
+    }
+    if (inst_prefetch_fill) {
+        verifyL1IBlockResidency(blk);
     }
 
     if (!mshr->hasLockedRMWReadTarget()) {

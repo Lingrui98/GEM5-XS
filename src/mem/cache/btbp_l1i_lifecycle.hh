@@ -2,6 +2,7 @@
 #define __MEM_CACHE_BTBP_L1I_LIFECYCLE_HH__
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <unordered_map>
 #include <utility>
@@ -47,8 +48,18 @@ class BtbpL1iLifecycleLedger
 
     std::unordered_map<LineKey, Residency, LineKeyHash> activeByLine;
     std::unordered_map<uint64_t, LineKey> lineByResidency;
+    const std::size_t maxActiveLines;
 
   public:
+    explicit BtbpL1iLifecycleLedger(
+        std::size_t max_active_lines =
+            std::numeric_limits<std::size_t>::max())
+        : maxActiveLines(max_active_lines)
+    {
+        panic_if(maxActiveLines == 0,
+                 "BTBP lifecycle capacity must be nonzero");
+    }
+
     std::optional<Residency> install(
         const LineKey &key, const Residency &residency)
     {
@@ -57,17 +68,16 @@ class BtbpL1iLifecycleLedger
                      lineByResidency.end(),
                  "BTBP residency id %llu is not unique", residency.id);
 
-        std::optional<Residency> previous;
         if (const auto current = activeByLine.find(key);
             current != activeByLine.end()) {
-            previous = current->second;
-            lineByResidency.erase(current->second.id);
-            current->second = residency;
-        } else {
-            activeByLine.emplace(key, residency);
+            return current->second;
         }
+        panic_if(activeByLine.size() >= maxActiveLines,
+                 "BTBP active L1I residencies exceed capacity %llu",
+                 static_cast<unsigned long long>(maxActiveLines));
+        activeByLine.emplace(key, residency);
         lineByResidency.emplace(residency.id, key);
-        return previous;
+        return std::nullopt;
     }
 
     bool close(const LineKey &key, uint64_t residency_id)
@@ -90,6 +100,15 @@ class BtbpL1iLifecycleLedger
         }
         current->second.demandUsed = true;
         return true;
+    }
+
+    bool isCurrent(const LineKey &key, uint64_t residency_id) const
+    {
+        const auto current = activeByLine.find(key);
+        const auto reverse = lineByResidency.find(residency_id);
+        return current != activeByLine.end() &&
+            current->second.id == residency_id &&
+            reverse != lineByResidency.end() && reverse->second == key;
     }
 
     std::vector<std::pair<LineKey, Residency>> drainRoiPrefetch()
