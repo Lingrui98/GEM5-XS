@@ -10,6 +10,7 @@
 
 #include "base/logging.hh"
 #include "base/types.hh"
+#include "mem/cache/cache_blk.hh"
 
 namespace gem5
 {
@@ -133,6 +134,82 @@ class BtbpL1iLifecycleLedger
         return activeByLine.size();
     }
 };
+
+inline bool
+closeBtbpL1iBlockResidency(
+    BtbpL1iLifecycleLedger &ledger,
+    const BtbpL1iLifecycleLedger::LineKey &key,
+    const CacheBlk &block)
+{
+    const uint64_t residency_id =
+        block.getXsMetadata().l1iResidencyId;
+    return residency_id != 0 && ledger.close(key, residency_id);
+}
+
+inline bool
+markBtbpL1iDemandUse(
+    BtbpL1iLifecycleLedger &ledger,
+    const BtbpL1iLifecycleLedger::LineKey &key,
+    const CacheBlk &block)
+{
+    const uint64_t residency_id =
+        block.getXsMetadata().l1iResidencyId;
+    return residency_id != 0 &&
+        ledger.markDemandUse(key, residency_id);
+}
+
+template <class CloseCallback>
+void
+transitionBtbpL1iFillMetadata(
+    BtbpL1iLifecycleLedger &ledger,
+    const BtbpL1iLifecycleLedger::LineKey &key,
+    CacheBlk &block,
+    const Request::XsMetadata &new_metadata,
+    bool has_old_data,
+    bool prefetch_source,
+    CloseCallback &&on_close)
+{
+    const Request::XsMetadata old_metadata = block.getXsMetadata();
+    if (has_old_data && old_metadata.l1iResidencyId != 0) {
+        panic_if(!closeBtbpL1iBlockResidency(ledger, key, block),
+                 "BTBP same-line refill could not close residency %llu",
+                 old_metadata.l1iResidencyId);
+        on_close(old_metadata);
+    }
+    if (new_metadata.l1iResidencyId != 0) {
+        panic_if(ledger.install(
+                     key,
+                     {new_metadata.l1iResidencyId,
+                      prefetch_source,
+                      new_metadata.btbpRoiOrigin,
+                      false}),
+                 "BTBP L1I line %#llx (%s) remained active after close",
+                 key.lineAddr, key.secure ? "secure" : "non-secure");
+    }
+    block.setXsMetadata(new_metadata);
+}
+
+inline void
+completeBtbpL1iPrefetch(
+    BtbpL1iLifecycleLedger &ledger,
+    const BtbpL1iLifecycleLedger::LineKey &key,
+    CacheBlk &block,
+    bool mark_prefetched)
+{
+    panic_if(!block.isValid(),
+             "BTBP prefetch completion lacks a tracked valid L1I block");
+    if (mark_prefetched) {
+        block.setPrefetched();
+    }
+    const auto metadata = block.getXsMetadata();
+    panic_if(metadata.l1iResidencyId == 0,
+             "BTBP prefetch completion cleared its block residency");
+    panic_if(!ledger.isCurrent(key, metadata.l1iResidencyId),
+             "BTBP prefetch completion block/ledger residency mismatch: "
+             "line %#llx (%s), id %llu",
+             key.lineAddr, key.secure ? "secure" : "non-secure",
+             metadata.l1iResidencyId);
+}
 
 } // namespace gem5
 

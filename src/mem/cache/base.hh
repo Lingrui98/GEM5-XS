@@ -1826,8 +1826,6 @@ class BaseCache : public ClockedObject, public CacheAccessor
             branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind::Evict,
         const PacketPtr incoming = nullptr);
 
-    void verifyL1IBlockResidency(CacheBlk *blk);
-
     bool shouldDropFdipRefill(MSHR *mshr, const PacketPtr pkt) const;
     FdipLineKey makeFdipLineKey(Addr blkAddr, bool is_secure) const
     {
