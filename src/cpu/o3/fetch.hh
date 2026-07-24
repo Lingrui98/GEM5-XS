@@ -447,11 +447,6 @@ class Fetch
     void processFdipCompletion(PacketPtr pkt);
     void processEipCompletion(PacketPtr pkt);
 
-    /** [BTBP_V24_DIAG] attempt-1 diagnostic: dump full identity of a
-     * completion that would trip the misaligned-fetch assertion.
-     * Removed in the clean v2.4 candidate. */
-    void btbpV24DiagUnclassifiedCompletion(PacketPtr pkt);
-
     /** Resume after a drain. */
     void drainResume();
 

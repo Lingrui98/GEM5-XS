@@ -2127,78 +2127,6 @@ Fetch::processMultiCacheLineCompletion(ThreadID tid, PacketPtr pkt)
 }
 
 void
-Fetch::btbpV24DiagUnclassifiedCompletion(PacketPtr pkt)
-{
-    // [BTBP_V24_DIAG] attempt-1 diagnostic only; removed in the clean
-    // v2.4 candidate. Read-only identity capture: no state is modified.
-    const RequestPtr &req = pkt->req;
-    warn("[BTBP_V24_DIAG_FETCH] unclassified completion pkt=%#lx cmd=%s "
-         "addr=%#llx size=%u needsResponse=%d senderState=%s\n",
-         (unsigned long long)(uintptr_t)pkt, pkt->cmd.toString().c_str(),
-         (unsigned long long)pkt->getAddr(), pkt->getSize(),
-         pkt->needsResponse(), pkt->senderState ? "set" : "null");
-    warn("[BTBP_V24_DIAG_FETCH] req=%#lx prefetch=%d instFetch=%d pfSrc=%d "
-         "pfDepth=%d misalignedFetch=%d reqNum=%d firstReqAfterSquash=%d\n",
-         (unsigned long long)(uintptr_t)req.get(), req->isPrefetch(),
-         req->isInstFetch(), (int)req->getPFSource(), req->getPFDepth(),
-         req->isMisalignedFetch(), req->getReqNum(),
-         req->isFirstReqAfterSquash());
-    warn("[BTBP_V24_DIAG_FETCH] req vaddr=%s%#llx paddr=%s%#llx "
-         "contextId=%s%d requestorId=%u\n",
-         req->hasVaddr() ? "" : "INVALID:",
-         req->hasVaddr() ? (unsigned long long)req->getVaddr() : 0ULL,
-         req->hasPaddr() ? "" : "INVALID:",
-         req->hasPaddr() ? (unsigned long long)req->getPaddr() : 0ULL,
-         req->hasContextId() ? "" : "INVALID:",
-         req->hasContextId() ? req->contextId() : -1, req->requestorId());
-    if (req->hasXsMetadata()) {
-        const auto &meta = req->getXsMetadata();
-        warn("[BTBP_V24_DIAG_FETCH] xsMeta prefetchSource=%d attemptId=%llu "
-             "decisionId=%llu eipDemandId=%llu eipContextId=%d "
-             "l1iResidencyId=%llu fdipEpoch=%llu fdipFtqId=%llu "
-             "traceIdentityValid=%d traceFtqId=%llu btbpRoiOrigin=%d\n",
-             (int)meta.prefetchSource,
-             (unsigned long long)meta.instPrefetchAttemptId,
-             (unsigned long long)meta.instPrefetchDecisionId,
-             (unsigned long long)meta.eipDemandId, (int)meta.eipContextId,
-             (unsigned long long)meta.l1iResidencyId,
-             (unsigned long long)meta.fdipEpoch,
-             (unsigned long long)meta.fdipFtqId,
-             (int)meta.traceIdentityValid,
-             (unsigned long long)meta.traceFtqId, (int)meta.btbpRoiOrigin);
-    } else {
-        warn("[BTBP_V24_DIAG_FETCH] xsMeta absent\n");
-    }
-    for (ThreadID t = 0; t < MaxThreads; t++) {
-        bool in_cache_req = false;
-        for (const auto &tracked : threads[t].cacheReq.requests) {
-            if (tracked == req) {
-                in_cache_req = true;
-                break;
-            }
-        }
-        bool in_eip_pending = false;
-        for (const auto &pending : eipPendingReqs) {
-            if (pending.req == req) {
-                in_eip_pending = true;
-                break;
-            }
-        }
-        bool in_fdip_pending = false;
-        for (const auto &pending : fdipPendingReqs) {
-            if (pending.req == req) {
-                in_fdip_pending = true;
-                break;
-            }
-        }
-        warn("[BTBP_V24_DIAG_FETCH] membership tid=%d inCacheReq=%d "
-             "inEipPending=%d inFdipPending=%d cacheReqSize=%zu\n",
-             t, (int)in_cache_req, (int)in_eip_pending, (int)in_fdip_pending,
-             threads[t].cacheReq.requests.size());
-    }
-}
-
-void
 Fetch::processCacheCompletion(PacketPtr pkt)
 {
     if (pkt->req->isPrefetch() && pkt->req->getPFSource() == PF_EIP) {
@@ -2212,11 +2140,6 @@ Fetch::processCacheCompletion(PacketPtr pkt)
     }
 
     ThreadID tid = cpu->contextToThread(pkt->req->contextId());
-    // [BTBP_V24_DIAG] attempt-1 diagnostic (removed in the clean candidate):
-    // capture identity before the assertion fires.
-    if (!pkt->req->isMisalignedFetch()) {
-        btbpV24DiagUnclassifiedCompletion(pkt);
-    }
     assert(pkt->req->isMisalignedFetch() && "Only multi-cacheline fetch is supported");
 
     bool allCompleted = processMultiCacheLineCompletion(tid, pkt);

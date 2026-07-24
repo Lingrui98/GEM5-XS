@@ -734,8 +734,12 @@ class Request
           _pc(other._pc), _reqInstSeqNum(other._reqInstSeqNum),
           _xsMetadata(other._xsMetadata),
           _localAccessor(other._localAccessor),
+          misalignedFetch(other.misalignedFetch),
+          reqNum(other.reqNum),
           translateDelta(other.translateDelta),
-          accessDelta(other.accessDelta), depth(other.depth)
+          accessDelta(other.accessDelta), depth(other.depth),
+          pfSource(other.pfSource), pfDepth(other.pfDepth),
+          firstReqAfterSquash(other.firstReqAfterSquash)
     {
         atomicOpFunctor.reset(other.atomicOpFunctor ?
                                 other.atomicOpFunctor->clone() : nullptr);
