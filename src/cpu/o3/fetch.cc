@@ -2134,7 +2134,7 @@ Fetch::btbpV24DiagUnclassifiedCompletion(PacketPtr pkt)
     const RequestPtr &req = pkt->req;
     warn("[BTBP_V24_DIAG_FETCH] unclassified completion pkt=%#lx cmd=%s "
          "addr=%#llx size=%u needsResponse=%d senderState=%s\n",
-         (unsigned long long)(uintptr_t)pkt.get(), pkt->cmd.toString().c_str(),
+         (unsigned long long)(uintptr_t)pkt, pkt->cmd.toString().c_str(),
          (unsigned long long)pkt->getAddr(), pkt->getSize(),
          pkt->needsResponse(), pkt->senderState ? "set" : "null");
     warn("[BTBP_V24_DIAG_FETCH] req=%#lx prefetch=%d instFetch=%d pfSrc=%d "

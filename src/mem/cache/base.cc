@@ -2350,7 +2350,7 @@ BaseCache::btbpV24DiagReadOnlyDirtyFill(PacketPtr pkt, CacheBlk *blk)
     warn("[BTBP_V24_DIAG_FILL] pkt=%#lx cmd=%s addr=%#llx sharers=%d "
          "cacheResponding=%d responder=%#llx isRead=%d needsResponse=%d "
          "blkTemp=%d\n",
-         (unsigned long long)(uintptr_t)pkt.get(), pkt->cmd.toString().c_str(),
+         (unsigned long long)(uintptr_t)pkt, pkt->cmd.toString().c_str(),
          (unsigned long long)pkt->getAddr(), (int)pkt->hasSharers(),
          (int)pkt->cacheResponding(),
          (unsigned long long)pkt->getCacheRespondingBy(),
