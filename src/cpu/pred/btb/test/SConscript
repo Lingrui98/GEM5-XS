@@ -54,6 +54,12 @@ GTest('fetch_target_queue.test',
     '../ftq.cc',
 )
 
+# SWAY live beta controller — pure-logic unit tests (no gem5 dependency).
+GTest('sway_beta.test',
+    'sway_beta.test.cc',
+    '../sway_beta_controller.cc',
+)
+
 # add --unit-test to enable unit test mode for RAS
 # TODO: Fix RAS test
 # GTest('ras.test',
@@ -72,4 +78,5 @@ env.Append(UNITTESTS=['uras.test',
         'history_manager.test',
         'jump_ahead.test',
         'fetch_target_queue.test',
+        'sway_beta.test',
         'decoupled_bpred.test'])

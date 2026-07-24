@@ -141,6 +141,8 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     swayExtraBitSourcePerPair = p.swayExtraBitSourcePerPair;
     swayEnableITTAGEDonor = p.swayEnableITTAGEDonor;
     swayEnableRelaxedSlot = p.swayEnableRelaxedSlot;
+    swayReallocThetaDonor = p.swayReallocThetaDonor;
+    swayReallocThetaDonee = p.swayReallocThetaDonee;
     swayDoneeTables = parseSwayDoneeTableSet(swayDoneeTableSetParam);
     if (swayReallocTageDoneeHysteresis != 0.0) {
         warn_once("swayReallocTageDoneeHysteresis is deprecated in D6 SWAY; "
@@ -149,6 +151,10 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
     swayController.configure(enableSwayRealloc, swayReallocWays,
                              swayReallocHysteresis, 0.0, swayDoneeTables,
                              swayEnableITTAGEDonor, swayEnableRelaxedSlot);
+    // The beta engine is configured regardless of enableSwayRealloc so the
+    // theta params are validated at init; it is only invoked (and mutates
+    // ownership) when enableSwayRealloc is True.
+    swayBeta.configure(swayReallocThetaDonor, swayReallocThetaDonee);
     if (mbtb) {
         mbtb->setSwayReallocEnabled(enableSwayRealloc);
     }
@@ -1035,7 +1041,7 @@ DecoupledBPUWithBTB::pHistShiftIn(int shamt, bool taken, boost::dynamic_bitset<>
     if (shamt == 0) {
         return;
     }
-    if(taken){
+    if (taken){
         // Calculate path hash
         uint64_t hash = pathHash(pc, target);
 
