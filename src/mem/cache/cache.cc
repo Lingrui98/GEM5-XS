@@ -396,6 +396,20 @@ Cache::handleTimingReqMiss(PacketPtr pkt, CacheBlk *blk, Tick forward_time,
             PacketPtr pf = nullptr;
 
             if (!mshr) {
+                // [BTBP_V24_DIAG] attempt-1 diagnostic (removed in the clean
+                // candidate): the Request copy below drops misalignedFetch,
+                // reqNum and firstReqAfterSquash (pfSource/pfDepth/XsMetadata
+                // are restored by hand); log any live classification state.
+                if (pkt->req->isMisalignedFetch() || pkt->req->getReqNum() != 1 ||
+                    pkt->req->isFirstReqAfterSquash()) {
+                    warn("[BTBP_V24_DIAG_COPY] %s SoftPFReq copy drops "
+                         "classification: misaligned=%d reqNum=%d "
+                         "firstAfterSquash=%d cmd=%s addr=%#llx\n",
+                         name().c_str(), pkt->req->isMisalignedFetch(),
+                         pkt->req->getReqNum(), pkt->req->isFirstReqAfterSquash(),
+                         pkt->cmd.toString().c_str(),
+                         (unsigned long long)pkt->getAddr());
+                }
                 // copy the request and create a new SoftPFReq packet
                 RequestPtr req = std::make_shared<Request>(*pkt->req);
                 req->setPFSource(pkt->req->getPFSource());
@@ -631,6 +645,22 @@ Cache::createMissPacket(PacketPtr cpu_pkt, CacheBlk *blk,
         bool force_clean_rsp = isReadOnly || clusivity == enums::mostly_excl;
         cmd = needsWritable ? MemCmd::ReadExReq :
             (force_clean_rsp ? MemCmd::ReadCleanReq : MemCmd::ReadSharedReq);
+    }
+    // [BTBP_V24_DIAG] attempt-1 diagnostic (removed in the clean candidate):
+    // a read-only cache must always miss with ReadCleanReq; log any deviation
+    // and every instruction-prefetch fill command for attribution.
+    if (isReadOnly &&
+        (cmd != MemCmd::ReadCleanReq || cpu_pkt->cmd == MemCmd::HardPFReq ||
+         cpu_pkt->cmd == MemCmd::SoftPFReq)) {
+        warn("[BTBP_V24_DIAG_MISSCMD] %s cpu_cmd=%s gen_cmd=%s "
+             "needsWritable=%d blkValid=%d addr=%#llx req{requestor=%u pf=%d "
+             "pfSrc=%d instFetch=%d misaligned=%d reqNum=%d}\n",
+             name().c_str(), cpu_pkt->cmd.toString().c_str(),
+             cmd.toString().c_str(), (int)needsWritable, (int)blkValid,
+             (unsigned long long)cpu_pkt->getAddr(),
+             cpu_pkt->req->requestorId(), cpu_pkt->req->isPrefetch(),
+             (int)cpu_pkt->req->getPFSource(), cpu_pkt->req->isInstFetch(),
+             cpu_pkt->req->isMisalignedFetch(), cpu_pkt->req->getReqNum());
     }
     PacketPtr pkt = new Packet(cpu_pkt->req, cmd, blkSize);
     pkt->setLSQPtr(cpu_pkt->getLSQPtr());

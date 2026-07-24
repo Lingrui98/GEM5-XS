@@ -976,6 +976,11 @@ class BaseCache : public ClockedObject, public CacheAccessor
         PrefetchSourceType prefetch_fill_source = PrefetchSourceType::PF_NONE,
         bool *refill_need_data_read = nullptr);
 
+    /** [BTBP_V24_DIAG] attempt-1 diagnostic: dump full provenance of a
+     * dirty (cacheResponding) fill arriving at a read-only cache.
+     * Removed in the clean v2.4 candidate. */
+    void btbpV24DiagReadOnlyDirtyFill(PacketPtr pkt, CacheBlk *blk);
+
     /**
      * Allocate a new block and perform any necessary writebacks
      *
