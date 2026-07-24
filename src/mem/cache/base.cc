@@ -1356,7 +1356,11 @@ BaseCache::recvTimingReq(PacketPtr pkt)
             DPRINTF(Cache, "Hit on prefetch for addr %#x (%s), source: %i\n", pkt->getAddr(),
                     pkt->isSecure() ? "s" : "ns", blk->getXsMetadata().prefetchSource);
             // pass the pf source from block to req, it may be used by either load inst or L(n-1) cache
-            pkt->req->setPFSource(blk->getXsMetadata().prefetchSource);
+            // v2.5 §4.2 repair class 1: do not overwrite a real req pfSource from a (possibly
+            // zero) block; block metadata is a fallback for unidentified requests only.
+            if (pkt->req->getPFSource() == PF_NONE) {
+                pkt->req->setPFSource(blk->getXsMetadata().prefetchSource);
+            }
             DPRINTF(Cache, "Mark req %p pf source: %i\n", pkt->req, pkt->req->getPFSource());
             pkt->req->setPFDepth(0);
             if (isL1I() && pkt->isDemand() && isFdipBlk(blk)) {
