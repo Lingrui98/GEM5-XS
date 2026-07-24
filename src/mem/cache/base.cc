@@ -2339,11 +2339,81 @@ BaseCache::satisfyRequest(PacketPtr pkt, CacheBlk *blk, bool, bool)
     }
 }
 
+void
+BaseCache::btbpV24DiagReadOnlyDirtyFill(PacketPtr pkt, CacheBlk *blk)
+{
+    // [BTBP_V24_DIAG] attempt-1 diagnostic only; removed in the clean
+    // v2.4 candidate. Read-only provenance capture: no state is modified.
+    const RequestPtr &req = pkt->req;
+    warn("[BTBP_V24_DIAG_FILL] %s level=%d readOnly=%d dirty fill into "
+         "read-only cache\n", name().c_str(), cacheLevel, (int)isReadOnly);
+    warn("[BTBP_V24_DIAG_FILL] pkt=%#lx cmd=%s addr=%#llx sharers=%d "
+         "cacheResponding=%d responder=%#llx isRead=%d needsResponse=%d "
+         "blkTemp=%d\n",
+         (unsigned long long)(uintptr_t)pkt.get(), pkt->cmd.toString().c_str(),
+         (unsigned long long)pkt->getAddr(), (int)pkt->hasSharers(),
+         (int)pkt->cacheResponding(),
+         (unsigned long long)pkt->getCacheRespondingBy(),
+         (int)pkt->isRead(), (int)pkt->needsResponse(), (int)(blk == tempBlock));
+    warn("[BTBP_V24_DIAG_FILL] req=%#lx requestorId=%u prefetch=%d "
+         "instFetch=%d pfSrc=%d pfDepth=%d misalignedFetch=%d reqNum=%d "
+         "firstReqAfterSquash=%d\n",
+         (unsigned long long)(uintptr_t)req.get(), req->requestorId(),
+         req->isPrefetch(), req->isInstFetch(), (int)req->getPFSource(),
+         req->getPFDepth(), req->isMisalignedFetch(), req->getReqNum(),
+         req->isFirstReqAfterSquash());
+    warn("[BTBP_V24_DIAG_FILL] req vaddr=%s%#llx paddr=%s%#llx "
+         "contextId=%s%d\n",
+         req->hasVaddr() ? "" : "INVALID:",
+         req->hasVaddr() ? (unsigned long long)req->getVaddr() : 0ULL,
+         req->hasPaddr() ? "" : "INVALID:",
+         req->hasPaddr() ? (unsigned long long)req->getPaddr() : 0ULL,
+         req->hasContextId() ? "" : "INVALID:",
+         req->hasContextId() ? req->contextId() : -1);
+    if (req->hasXsMetadata()) {
+        const auto &meta = req->getXsMetadata();
+        warn("[BTBP_V24_DIAG_FILL] xsMeta prefetchSource=%d attemptId=%llu "
+             "decisionId=%llu eipDemandId=%llu l1iResidencyId=%llu "
+             "fdipEpoch=%llu traceIdentityValid=%d btbpRoiOrigin=%d\n",
+             (int)meta.prefetchSource,
+             (unsigned long long)meta.instPrefetchAttemptId,
+             (unsigned long long)meta.instPrefetchDecisionId,
+             (unsigned long long)meta.eipDemandId,
+             (unsigned long long)meta.l1iResidencyId,
+             (unsigned long long)meta.fdipEpoch,
+             (int)meta.traceIdentityValid, (int)meta.btbpRoiOrigin);
+    } else {
+        warn("[BTBP_V24_DIAG_FILL] xsMeta absent\n");
+    }
+    MSHR *mshr = mshrQueue.findMatch(pkt->getBlockAddr(blkSize),
+                                     pkt->isSecure());
+    if (mshr) {
+        warn("[BTBP_V24_DIAG_FILL] mshr=%#lx targets=%zu needsWritable=%d "
+             "hasFromDemand=%d\n",
+             (unsigned long long)(uintptr_t)mshr, mshr->targets.size(),
+             (int)mshr->needsWritable(), (int)mshr->hasFromDemand());
+        int index = 0;
+        for (const auto &target : mshr->targets) {
+            const PacketPtr &tpkt = target.pkt;
+            warn("[BTBP_V24_DIAG_FILL] target[%d] cmd=%s req{requestor=%u "
+                 "pf=%d pfSrc=%d instFetch=%d misaligned=%d reqNum=%d}\n",
+                 index++, tpkt->cmd.toString().c_str(),
+                 tpkt->req->requestorId(), tpkt->req->isPrefetch(),
+                 (int)tpkt->req->getPFSource(), tpkt->req->isInstFetch(),
+                 tpkt->req->isMisalignedFetch(), tpkt->req->getReqNum());
+        }
+    } else {
+        warn("[BTBP_V24_DIAG_FILL] no matching MSHR for blk=%#llx\n",
+             (unsigned long long)pkt->getBlockAddr(blkSize));
+    }
+}
+
 /////////////////////////////////////////////////////
 //
 // Access path: requests coming in from the CPU side
 //
 /////////////////////////////////////////////////////
+
 Cycles
 BaseCache::calculateTagOnlyLatency(const uint32_t delay,
                                    const Cycles lookup_lat) const
@@ -2842,6 +2912,11 @@ BaseCache::handleFill(PacketPtr pkt, CacheBlk *blk, PacketList &writebacks,
             // owners copy
             blk->setCoherenceBits(CacheBlk::DirtyBit);
 
+            // [BTBP_V24_DIAG] attempt-1 diagnostic (removed in the clean
+            // candidate): capture provenance before the assertion fires.
+            if (isReadOnly) {
+                btbpV24DiagReadOnlyDirtyFill(pkt, blk);
+            }
             gem5_assert(!isReadOnly, "Should never see dirty snoop response "
                         "in read-only cache %s\n", name());
 

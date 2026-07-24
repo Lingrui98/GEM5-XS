@@ -579,6 +579,22 @@ MSHR::handleSnoop(PacketPtr pkt, Counter _order)
         // the latter case the cache is responsible for deleting both
         // the packet and the request as part of handling the deferred
         // snoop.
+        // [BTBP_V24_DIAG] attempt-1 diagnostic (removed in the clean
+        // candidate): the deferred-snoop Request copy below drops
+        // misalignedFetch, reqNum, pfSource, pfDepth and firstReqAfterSquash;
+        // log when any of them is live on the snooped packet.
+        if (!will_respond &&
+            (pkt->req->isMisalignedFetch() || pkt->req->getReqNum() != 1 ||
+             pkt->req->getPFSource() != PF_NONE ||
+             pkt->req->isFirstReqAfterSquash())) {
+            warn("[BTBP_V24_DIAG_SNOOPCOPY] deferred snoop copy drops "
+                 "classification: misaligned=%d reqNum=%d pfSrc=%d "
+                 "firstAfterSquash=%d cmd=%s addr=%#llx\n",
+                 pkt->req->isMisalignedFetch(), pkt->req->getReqNum(),
+                 (int)pkt->req->getPFSource(), pkt->req->isFirstReqAfterSquash(),
+                 pkt->cmd.toString().c_str(),
+                 (unsigned long long)pkt->getAddr());
+        }
         PacketPtr cp_pkt = will_respond ? new Packet(pkt, true, true) :
             new Packet(std::make_shared<Request>(*pkt->req), pkt->cmd,
                        blkSize, pkt->id);
