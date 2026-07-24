@@ -28,6 +28,7 @@
 #include "cpu/pred/btb/microtage.hh"
 #include "cpu/pred/btb/pairtage.hh"
 #include "cpu/pred/btb/ras.hh"
+#include "cpu/pred/btb/sway_beta_controller.hh"
 #include "cpu/pred/btb/sway_realloc.hh"
 #include "cpu/pred/btb/timed_base_pred.hh"
 #include "cpu/pred/general_arch_db.hh"
@@ -300,7 +301,8 @@ class DecoupledBPUWithBTB : public BPredUnit
      * - Queue utilization
      * - Loop and jump-ahead prediction performance
      */
-    struct DBPBTBStats : public statistics::Group {
+    struct DBPBTBStats : public statistics::Group
+    {
         // Branch type statistics
         statistics::Scalar condNum;      ///< Number of conditional branches
         statistics::Scalar uncondNum;    ///< Number of unconditional branches
@@ -628,7 +630,8 @@ class DecoupledBPUWithBTB : public BPredUnit
     /**
      * @brief Types of control flow instruction mispredictions
      */
-    enum MispredType {
+    enum MispredType
+    {
         DIR_WRONG,      ///< Direction prediction error (predicted taken when not taken or vice versa)
         TARGET_WRONG,   ///< Target address prediction was wrong (branch taken but to the wrong address)
         NO_PRED,        ///< No prediction was made (branch wasn't predicted at all)
@@ -831,6 +834,23 @@ class DecoupledBPUWithBTB : public BPredUnit
         sway::PhaseCounterSnapshot counters;
     };
     std::vector<SwayPhaseBcRawRow> swayPhaseBcRawRows;
+
+    // Stage 4 debug: per-phase derived B-b/B-c values, the frozen reference
+    // (mean/std/count) per metric, and the sample-phase z-scores. Emitted to
+    // sway_beta_debug.csv only when enableSwayRealloc=True, to cross-check
+    // live derivation against util/xs_scripts/sway/replay_beta.py.
+    struct SwayBetaDebugRow
+    {
+        int phaseID{-1};
+        std::string segment;
+        std::array<double, sway::NumBetaMetrics> values{};
+        std::array<double, sway::NumBetaMetrics> refMean{};
+        std::array<double, sway::NumBetaMetrics> refStd{};
+        std::array<uint64_t, sway::NumBetaMetrics> refCount{};
+        std::array<double, sway::NumBetaMetrics> zScores{};
+        bool hasZ{false};
+    };
+    std::vector<SwayBetaDebugRow> swayBetaDebugRows;
 
     struct SwayF1Counters
     {
@@ -1079,6 +1099,21 @@ class DecoupledBPUWithBTB : public BPredUnit
     unsigned transferSwayWays(uint8_t donor, uint8_t donee, unsigned ways);
     void syncSwayBorrowedWayCounts();
 
+    // Stage 4 live beta controller wiring.
+    /** Derive the locked B-b/B-c metrics for one phase from the just-collected
+     *  raw pressure rows. Arithmetic matches util/xs_scripts/sway/replay_beta
+     *  _derive_phase_metrics exactly. */
+    sway::BetaPhaseMetrics deriveBetaPhaseMetrics(int phaseID) const;
+    /** Run the beta engine for one architectural phase and execute any fire or
+     *  return it produces (MBTB->TAGE real; ITTAGE->TAGE advisory-only). */
+    void executeSwayBetaPhase(int phaseID, const std::string &segment,
+                              bool replayEligible,
+                              uint64_t phaseStartInst,
+                              uint64_t phaseEndInst);
+    /** Resolve all still-pending borrows as active_at_end before dumping the
+     *  event log. */
+    void finalizeSwayBetaAtEnd();
+
     /**
      * @brief Next phase ID to dump statistics for
      */
@@ -1108,6 +1143,17 @@ class DecoupledBPUWithBTB : public BPredUnit
     sway::DoneeTableSet swayDoneeTables;
     bool swayEnableITTAGEDonor{false};
     bool swayEnableRelaxedSlot{false};
+    // Stage 4 live beta controller params (self-normalized z-score
+    // thresholds). Defaults to 1.5 per SWAY_METRIC_TAXONOMY.md §5.2.
+    double swayReallocThetaDonor{1.5};
+    double swayReallocThetaDonee{1.5};
+    // The live beta controller. Fires on the architectural phase clock
+    // (collectSwayPhasePressureForPhase) so live metrics match the Stage 3
+    // open-loop replay. MBTB->TAGE fires execute a real way transfer; ITTAGE
+    // ->TAGE fires are advisory-only (the relaxed table-level donate
+    // substrate is not implemented), logged to sway_realloc_events.csv but
+    // never mutating ownership. Dormant when enableSwayRealloc=False.
+    sway::BetaController swayBeta;
 
     /**
      * @brief Next sub-phase ID to dump statistics for

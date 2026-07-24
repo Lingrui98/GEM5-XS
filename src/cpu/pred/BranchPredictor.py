@@ -1278,6 +1278,14 @@ class DecoupledBPUWithBTB(BranchPredictor):
         "Minimum utility gap required before SWAY transfers a way")
     swayReallocTageDoneeHysteresis = Param.Float(0.0,
         "Deprecated: accepted for compatibility but ignored by D6 SWAY")
+    swayReallocThetaDonor = Param.Float(1.5,
+        "D6 SWAY beta z-score threshold for donor (b_b) cold detection. "
+        "Self-normalized per workload; the only donor-side tunable. See "
+        "SWAY_METRIC_TAXONOMY.md §5.2.")
+    swayReallocThetaDonee = Param.Float(1.5,
+        "D6 SWAY beta z-score threshold for donee (b_c) pressure detection. "
+        "Self-normalized per workload; the only donee-side tunable. See "
+        "SWAY_METRIC_TAXONOMY.md §5.2.")
     swayDoneeTableSet = Param.String("",
         "Comma-separated TAGE donee table ids for D6 SWAY, e.g. '3,7'")
     swayExtraBitSourcePerPair = Param.String("",

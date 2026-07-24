@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -440,6 +441,220 @@ DecoupledBPUWithBTB::syncSwayBorrowedWayCounts()
     }
 }
 
+sway::BetaPhaseMetrics
+DecoupledBPUWithBTB::deriveBetaPhaseMetrics(int phaseID) const
+{
+    // Faithful C++ port of util/xs_scripts/sway/replay_beta.py
+    // _derive_phase_metrics: derive the six locked B-b/B-c values from one
+    // phase's raw pressure rows. Zero denominators yield betaNA() (never 0).
+    sway::BetaPhaseMetrics m;
+    std::array<uint64_t, 8> mbtbHits{};
+    std::array<uint64_t, 5> ittageUpdates{};
+    struct TageRow
+    {
+        uint64_t updates = 0;
+        uint64_t alloc = 0;
+        uint64_t evicts = 0;
+        uint64_t resident = 0;
+        uint64_t capacity = 0;
+        bool seen = false;
+    };
+    std::array<TageRow, 8> tage{};
+
+    for (const auto &r : swayPhaseBcRawRows) {
+        if (r.phaseID != phaseID) {
+            continue;
+        }
+        const sway::PhaseCounterSnapshot &c = r.counters;
+        unsigned b = 0, w = 0, t = 0;
+        if (c.component == "MBTB" &&
+            std::sscanf(c.scope.c_str(), "mbtb_bank%u_way%u", &b, &w) == 2 &&
+            b < 2 && w < 4) {
+            if (c.hits) {
+                mbtbHits[b * 4 + w] = *c.hits;
+            }
+        } else if (c.component == "ITTAGE" &&
+                   std::sscanf(c.scope.c_str(), "ittage_t%u", &t) == 1 &&
+                   t < 5) {
+            if (c.updates) {
+                ittageUpdates[t] = *c.updates;
+            }
+        } else if (c.component == "TAGE" &&
+                   std::sscanf(c.scope.c_str(), "tage_t%u", &t) == 1 &&
+                   t < 8) {
+            tage[t].seen = true;
+            if (c.updates) {
+                tage[t].updates = *c.updates;
+            }
+            if (c.allocSuccess) {
+                tage[t].alloc = *c.allocSuccess;
+            }
+            if (c.evicts) {
+                tage[t].evicts = *c.evicts;
+            }
+            tage[t].resident = c.residentEntries;
+            tage[t].capacity = c.capacityEntries;
+        }
+    }
+
+    // B-b donors: candidate hits / mean(all sibling ways/tables in component).
+    double mbtbSum = 0.0;
+    for (unsigned i = 0; i < 8; ++i) {
+        mbtbSum += static_cast<double>(mbtbHits[i]);
+    }
+    const double mbtbMean = mbtbSum / 8.0;
+    if (mbtbMean != 0.0) {
+        m.values[static_cast<size_t>(sway::BetaMetric::MbtbBank0Way3)] =
+            static_cast<double>(mbtbHits[3]) / mbtbMean;
+        m.values[static_cast<size_t>(sway::BetaMetric::MbtbBank1Way3)] =
+            static_cast<double>(mbtbHits[7]) / mbtbMean;
+    }
+    double ittageSum = 0.0;
+    for (unsigned t = 0; t < 5; ++t) {
+        ittageSum += static_cast<double>(ittageUpdates[t]);
+    }
+    const double ittageMean = ittageSum / 5.0;
+    if (ittageMean != 0.0) {
+        m.values[static_cast<size_t>(sway::BetaMetric::IttageT2)] =
+            static_cast<double>(ittageUpdates[2]) / ittageMean;
+        m.values[static_cast<size_t>(sway::BetaMetric::IttageT3)] =
+            static_cast<double>(ittageUpdates[3]) / ittageMean;
+    }
+
+    // B-c donees for TAGE T3 and T7: (evicts/(updates+alloc)) * (resident/cap).
+    for (unsigned table : {3u, 7u}) {
+        if (!tage[table].seen || tage[table].capacity == 0) {
+            continue;
+        }
+        const double accesses =
+            static_cast<double>(tage[table].updates) +
+            static_cast<double>(tage[table].alloc);
+        if (accesses == 0.0) {
+            continue;
+        }
+        const double bc =
+            (static_cast<double>(tage[table].evicts) / accesses) *
+            (static_cast<double>(tage[table].resident) /
+             static_cast<double>(tage[table].capacity));
+        if (table == 3) {
+            m.values[static_cast<size_t>(sway::BetaMetric::TageT3)] = bc;
+        } else {
+            m.values[static_cast<size_t>(sway::BetaMetric::TageT7)] = bc;
+        }
+    }
+    return m;
+}
+
+void
+DecoupledBPUWithBTB::executeSwayBetaPhase(int phaseID,
+                                          const std::string &segment,
+                                          bool replayEligible,
+                                          uint64_t phaseStartInst,
+                                          uint64_t phaseEndInst)
+{
+    if (!enableSwayRealloc) {
+        return;
+    }
+    const sway::BetaPhaseMetrics metrics = deriveBetaPhaseMetrics(phaseID);
+    const sway::BetaDecision decision =
+        swayBeta.processPhase(phaseID, phaseStartInst, phaseEndInst,
+                              segment, replayEligible, metrics);
+
+    // Debug row: capture the derived values + frozen reference + z-scores for
+    // this phase (sample phases carry z; warmup/transition do not).
+    {
+        SwayBetaDebugRow dbg;
+        dbg.phaseID = phaseID;
+        dbg.segment = segment;
+        dbg.values = metrics.values;
+        const bool isSample = (segment == "sample" && replayEligible);
+        dbg.hasZ = isSample;
+        for (size_t i = 0; i < sway::NumBetaMetrics; ++i) {
+            const auto m = static_cast<sway::BetaMetric>(i);
+            const sway::BetaReference &ref = swayBeta.reference(m);
+            dbg.refMean[i] = ref.mean;
+            dbg.refStd[i] = ref.stddev;
+            dbg.refCount[i] = ref.sampleCount;
+            dbg.zScores[i] = isSample ? decision.zScores[i] : sway::betaNA();
+        }
+        swayBetaDebugRows.push_back(dbg);
+    }
+
+    if (decision.newFire) {
+        const bool isMbtb =
+            decision.fire.direction == sway::BetaDirection::MbtbToTage;
+        if (!isMbtb) {
+            // ITTAGE->TAGE advisory-only: the relaxed table-level donate
+            // substrate is not implemented, so no ownership mutation. The
+            // fire is recorded by swayBeta.fires() and emitted to
+            // sway_realloc_events.csv for live-vs-replay fire-count parity
+            // and false-fire accounting. No transfer, no reallocCount bump.
+            return;
+        }
+        // MBTB->TAGE real donation.
+        const unsigned sram =
+            decision.fire.donor == sway::BetaMetric::MbtbBank1Way3 ? 1 : 0;
+        const unsigned table =
+            decision.fire.donee == sway::BetaMetric::TageT7 ? 7 : 3;
+        const uint8_t donorOwner = sway::mbtbOwner(sram);
+        const uint8_t doneeOwner = sway::tageOwner(table);
+        constexpr unsigned minOwnedWays = 1;
+        const unsigned donorOwned = countSwayOwnedWays(donorOwner);
+        if (donorOwned <= minOwnedWays) {
+            return;
+        }
+        const unsigned requestWays =
+            std::min(swayReallocWays, donorOwned - minOwnedWays);
+        const unsigned moved =
+            transferSwayWays(donorOwner, doneeOwner, requestWays);
+        if (moved == 0) {
+            return;
+        }
+        syncSwayBorrowedWayCounts();
+        swayStats.reallocCount++;
+        swayStats.ownerOverrides[doneeOwner] += moved;
+        swayStats.slotOwnerTransitionsPerSlot[sway::mbtbSram(donorOwner)]++;
+        return;
+    }
+
+    if (decision.returnOccurred) {
+        const bool isMbtbReturn =
+            decision.returnDonor == sway::BetaMetric::MbtbBank0Way3 ||
+            decision.returnDonor == sway::BetaMetric::MbtbBank1Way3;
+        if (!isMbtbReturn) {
+            // ITTAGE->TAGE advisory borrow return: no transfer (no substrate).
+            return;
+        }
+        const unsigned table =
+            decision.returnDonee == sway::BetaMetric::TageT7 ? 7 : 3;
+        const unsigned sram =
+            decision.returnDonor == sway::BetaMetric::MbtbBank1Way3 ? 1 : 0;
+        // Return: donor = TAGE donee table (current holder), donee = native
+        // MBTB sram owner (matches the F1 ReturnMbtbTight convention).
+        const uint8_t donorOwner = sway::tageOwner(table);
+        const uint8_t doneeOwner = sway::mbtbOwner(sram);
+        const unsigned moved =
+            transferSwayWays(donorOwner, doneeOwner, swayReallocWays);
+        if (moved > 0) {
+            syncSwayBorrowedWayCounts();
+            swayStats.slotOwnerTransitionsPerSlot[sway::mbtbSram(doneeOwner)]++;
+        }
+    }
+}
+
+void
+DecoupledBPUWithBTB::finalizeSwayBetaAtEnd()
+{
+    int endPhase = -1;
+    uint64_t endInst = 0;
+    if (!swayPhaseBcRawRows.empty()) {
+        const auto &last = swayPhaseBcRawRows.back();
+        endPhase = last.phaseID;
+        endInst = last.phaseEndInst;
+    }
+    swayBeta.finalizeAtEnd(endPhase, endInst);
+}
+
 void
 DecoupledBPUWithBTB::trySwayReallocForPhase(
     const std::vector<SwayUtilityRow>& phaseRows,
@@ -656,6 +871,14 @@ DecoupledBPUWithBTB::collectSwayPhasePressureForPhase(int phaseID)
         append(tage->collectAndResetSwayPhaseCounters());
     }
 
+    // Stage 4 live beta controller: run the decision on the architectural
+    // phase clock (same counters the open-loop replay consumed). Dormant when
+    // enableSwayRealloc=False, preserving the bit-exact baseline.
+    if (enableSwayRealloc) {
+        executeSwayBetaPhase(phaseID, segment, replayEligible,
+                             phaseStartInst, phaseEndInst);
+    }
+
     swayPhaseStartInst = phaseEndInst;
     swayPhaseStartEpoch = statsEpochEnd;
 }
@@ -709,9 +932,10 @@ DecoupledBPUWithBTB::collectSwayWayVisitForPhase(int phaseID)
     // 2026-06 xs-dev merge, MicroTAGE no longer inherits from BTBTAGE and
     // therefore does not expose collectAndResetWayVisitCounts(); we skip it
     // here to keep the probe focused on MBTB + BTBTAGE.
-    if (enableSwayRealloc) {
-        trySwayReallocForPhase(phaseRows, ittagePhaseRows, mbtbSlotRows);
-    }
+    // Stage 4: the closed F1/F1' decision predicate is retired. The live
+    // beta controller now fires from collectSwayPhasePressureForPhase on the
+    // architectural phase clock; this legacy-clock visit probe is observation
+    // only and never mutates ownership.
 }
 
 void
@@ -1122,6 +1346,82 @@ DecoupledBPUWithBTB::dumpStats()
                 << ',' << row.movedWays
                 << ',' << row.reallocCount
                 << '\n';
+        }
+        simout.close(handle);
+    }
+
+    // 14. SWAY live beta realloc events (Stage 4). One row per fire with the
+    // donor/donee z-scores, theta pair, and the D-Return resolution tag
+    // (cooldown_expiry_return | t3_regression_return | t4_donor_pressure_return
+    // | active_at_end). MBTB->TAGE rows are real donations; ITTAGE->TAGE rows
+    // are advisory-only (substrate not implemented). Emitted only when
+    // enableSwayRealloc=True; absent (baseline) otherwise.
+    if (enableSwayRealloc) {
+        finalizeSwayBetaAtEnd();
+        auto handle = createOutputFile(
+            "sway_realloc_events.csv",
+            "phase_id,phase_start_inst,phase_end_inst,direction,donor,donee,"
+            "z_donor,z_donee,theta_donor,theta_donee,resolution,"
+            "return_phase_id,return_phase_start_inst,return_phase_end_inst,"
+            "is_new_donation");
+        auto& out = *handle->stream();
+        auto formatZ = [](double v) -> std::string {
+            if (!std::isfinite(v)) {
+                return "";
+            }
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.17g", v);
+            return std::string(buf);
+        };
+        for (const sway::BetaFire& f : swayBeta.fires()) {
+            out << f.phaseId << ',' << f.phaseStartInst << ','
+                << f.phaseEndInst << ','
+                << sway::betaDirectionLabel(f.direction) << ','
+                << sway::betaMetricLabel(f.donor) << ','
+                << sway::betaMetricLabel(f.donee) << ','
+                << formatZ(f.zDonor) << ',' << formatZ(f.zDonee) << ','
+                << formatZ(f.thetaDonor) << ',' << formatZ(f.thetaDonee)
+                << ',' << sway::betaResolutionLabel(f.resolution) << ','
+                << f.returnPhaseId << ',' << f.returnPhaseStartInst << ','
+                << f.returnPhaseEndInst << ','
+                << (f.isNewDonation ? "true" : "false")
+                << '\n';
+        }
+        simout.close(handle);
+    }
+
+    // 15. SWAY beta debug: per-phase derived B-b/B-c values, frozen reference
+    // (mean/std/count), and sample-phase z-scores, for cross-checking the live
+    // derivation against util/xs_scripts/sway/replay_beta.py. Debug only.
+    if (enableSwayRealloc && !swayBetaDebugRows.empty()) {
+        auto handle = createOutputFile(
+            "sway_beta_debug.csv",
+            "phase_id,segment,"
+            "b_b_mbtb_bank0_way3,b_b_mbtb_bank1_way3,b_b_ittage_t2,"
+            "b_b_ittage_t3,b_c_tage_t3,b_c_tage_t7,"
+            "ref_mean_t3,ref_std_t3,ref_count_t3,"
+            "ref_mean_t7,ref_std_t7,ref_count_t7,"
+            "z_mbtb_bank0_way3,z_mbtb_bank1_way3,z_ittage_t2,z_ittage_t3,"
+            "z_tage_t3,z_tage_t7");
+        auto& out = *handle->stream();
+        auto fmt = [](double v) -> std::string {
+            if (!std::isfinite(v)) return "";
+            char b[64]; std::snprintf(b, sizeof(b), "%.17g", v); return b;
+        };
+        for (const auto& d : swayBetaDebugRows) {
+            out << d.phaseID << ',' << d.segment;
+            for (size_t i = 0; i < sway::NumBetaMetrics; ++i) {
+                out << ',' << fmt(d.values[i]);
+            }
+            // T3 = index 4, T7 = index 5 reference.
+            out << ',' << fmt(d.refMean[4]) << ',' << fmt(d.refStd[4])
+                << ',' << d.refCount[4]
+                << ',' << fmt(d.refMean[5]) << ',' << fmt(d.refStd[5])
+                << ',' << d.refCount[5];
+            for (size_t i = 0; i < sway::NumBetaMetrics; ++i) {
+                out << ',' << fmt(d.zScores[i]);
+            }
+            out << '\n';
         }
         simout.close(handle);
     }
