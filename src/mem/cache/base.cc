@@ -2388,19 +2388,18 @@ BaseCache::btbpV24DiagReadOnlyDirtyFill(PacketPtr pkt, CacheBlk *blk)
     MSHR *mshr = mshrQueue.findMatch(pkt->getBlockAddr(blkSize),
                                      pkt->isSecure());
     if (mshr) {
-        warn("[BTBP_V24_DIAG_FILL] mshr=%#lx targets=%zu needsWritable=%d "
+        warn("[BTBP_V24_DIAG_FILL] mshr=%#lx numTargets=%d needsWritable=%d "
              "hasFromDemand=%d\n",
-             (unsigned long long)(uintptr_t)mshr, mshr->targets.size(),
+             (unsigned long long)(uintptr_t)mshr, mshr->getNumTargets(),
              (int)mshr->needsWritable(), (int)mshr->hasFromDemand());
-        int index = 0;
-        for (const auto &target : mshr->targets) {
-            const PacketPtr &tpkt = target.pkt;
-            warn("[BTBP_V24_DIAG_FILL] target[%d] cmd=%s req{requestor=%u "
+        if (mshr->hasTargets()) {
+            const PacketPtr &tpkt = mshr->getTarget()->pkt;
+            warn("[BTBP_V24_DIAG_FILL] firstTarget cmd=%s req{requestor=%u "
                  "pf=%d pfSrc=%d instFetch=%d misaligned=%d reqNum=%d}\n",
-                 index++, tpkt->cmd.toString().c_str(),
-                 tpkt->req->requestorId(), tpkt->req->isPrefetch(),
-                 (int)tpkt->req->getPFSource(), tpkt->req->isInstFetch(),
-                 tpkt->req->isMisalignedFetch(), tpkt->req->getReqNum());
+                 tpkt->cmd.toString().c_str(), tpkt->req->requestorId(),
+                 tpkt->req->isPrefetch(), (int)tpkt->req->getPFSource(),
+                 tpkt->req->isInstFetch(), tpkt->req->isMisalignedFetch(),
+                 tpkt->req->getReqNum());
         }
     } else {
         warn("[BTBP_V24_DIAG_FILL] no matching MSHR for blk=%#llx\n",
