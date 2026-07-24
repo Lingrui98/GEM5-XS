@@ -185,6 +185,12 @@ MBTB::setSwayReallocEnabled(bool enabled)
 }
 
 bool
+MBTB::hasActiveBorrows() const
+{
+    return swayActiveBorrowCount > 0;
+}
+
+bool
 MBTB::swayIsMbtbTightSlot(int sramId, unsigned way) const
 {
     return (sramId == 0 || sramId == 1) &&
@@ -571,6 +577,13 @@ MBTB::transferSwayWays(uint8_t donor, uint8_t donee, unsigned count)
     if (moved > 0) {
         for (auto &entry : victimCache) {
             entry.valid = false;
+        }
+        // Track active borrows so the SWAY substrate paths engage only while
+        // a way is actually donated out (donate +moved, return -moved).
+        if (donate_to_tage) {
+            swayActiveBorrowCount += static_cast<int>(moved);
+        } else {
+            swayActiveBorrowCount -= static_cast<int>(moved);
         }
     }
     return moved;
@@ -1284,7 +1297,10 @@ MBTB::updateBTBEntry(
     const BTBEntry &entry, bool actual_taken, Addr actual_target,
     const PredictionUpdateContext &stream)
 {
-    if (enableSwayRealloc) {
+    // Engage the SWAY-aware update path only while a borrow is actually
+    // active; with 0 donated ways the normal path is bit-identical and the
+    // borrowed-slot path must stay inert (no pre-fire pre-arming).
+    if (enableSwayRealloc && hasActiveBorrows()) {
         updateBTBEntrySway(entry, stream);
         return;
     }

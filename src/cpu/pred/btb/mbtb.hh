@@ -466,6 +466,11 @@ class MBTB : public TimedBaseBTBPredictor
     uint64_t getPredMissesPerWay(unsigned bank, unsigned way);
 
     void setSwayReallocEnabled(bool enabled);
+    /** True iff at least one MBTB way is currently donated out (an active
+     *  borrow exists). The SWAY substrate update/lookup paths engage only
+     *  when this is true, so enableSwayRealloc=True with 0 borrows is
+     *  bit-exact with the baseline (no pre-fire pre-arming). */
+    bool hasActiveBorrows() const;
     unsigned countSwayOwnedWays(uint8_t owner) const;
     unsigned transferSwayWays(uint8_t donor, uint8_t donee, unsigned count);
     void addSwayBorrowedWayCounts(sway::ScopeCounts &counts) const;
@@ -509,6 +514,10 @@ class MBTB : public TimedBaseBTBPredictor
     unsigned numBr;  // Number of branches seen
 
     bool enableSwayRealloc{false};
+    /** Count of MBTB ways currently donated out (signed to tolerate a
+     *  defensive underflow). >0 iff an active borrow exists. Adjusted in
+     *  transferSwayWays: +moved on donate, -moved on return. */
+    int swayActiveBorrowCount{0};
     std::vector<uint8_t> swayOwner0, swayOwner1;
     std::vector<BTBSet> swayExtra0, swayExtra1;
     std::vector<std::vector<uint32_t>> swayExtraVisit0, swayExtraVisit1;
