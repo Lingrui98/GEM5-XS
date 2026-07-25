@@ -42,6 +42,8 @@ Source('write_queue.cc')
 Source('write_queue_entry.cc')
 
 GTest('mshr_partition.test', 'mshr_partition.test.cc', '../../base/debug.cc')
+GTest('pf_source_propagation.test', 'pf_source_propagation.test.cc',
+      '../../base/debug.cc', '../../sim/cur_tick.cc')
 GTest('btbp_l1i_lifecycle.test', 'btbp_l1i_lifecycle.test.cc',
       'cache_blk.cc', '../../base/debug.cc', '../../sim/cur_tick.cc')
 

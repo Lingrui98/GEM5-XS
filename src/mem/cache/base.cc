@@ -71,6 +71,7 @@
 #include "debug/TagReadFail.hh"
 #include "mem/cache/compressors/base.hh"
 #include "mem/cache/mshr.hh"
+#include "mem/cache/pf_source_propagation.hh"
 #include "mem/cache/prefetch/associative_set_impl.hh"
 #include "mem/cache/queue_entry.hh"
 #include "mem/cache/tags/compressed_tags.hh"
@@ -1358,7 +1359,7 @@ BaseCache::recvTimingReq(PacketPtr pkt)
             // pass the pf source from block to req, it may be used by either load inst or L(n-1) cache
             // v2.5 §4.2 repair class 1: do not overwrite a real req pfSource from a (possibly
             // zero) block; block metadata is a fallback for unidentified requests only.
-            if (pkt->req->getPFSource() == PF_NONE) {
+            if (pfSourcePropagateFromBlock(pkt->req->getPFSource())) {
                 pkt->req->setPFSource(blk->getXsMetadata().prefetchSource);
             }
             DPRINTF(Cache, "Mark req %p pf source: %i\n", pkt->req, pkt->req->getPFSource());
