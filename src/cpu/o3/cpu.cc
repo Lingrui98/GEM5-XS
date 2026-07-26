@@ -648,16 +648,6 @@ CPU::tick()
     if (btbpRoiBeginPending && curTick() > btbpRoiBeginTick) {
         fetch.beginBtbpRoiTracking();
         btbpRoiTrackingStarted = true;
-        branch_prediction::btb_pred::BtbpTraceEvent event;
-        event.tick = btbpRoiBeginTick;
-        event.eventType =
-            branch_prediction::btb_pred::BtbpTraceEvent::RoiBegin;
-        event.threadId = btbpRoiBeginTid;
-        event.coreCycle = btbpRoiBeginCycle;
-        event.coreCycleValid = true;
-        event.committedInsts = btbpRoiBeginInsts;
-        event.committedInstsValid = true;
-        notifyBtbpTrace(event);
         fprintf(stderr,
                 "BTBP ROI_BEGIN_RESET tick=%llu core_cycle=%llu "
                 "committed_insts=%llu reset_mode=scheduled_dump_reset "
@@ -670,18 +660,6 @@ CPU::tick()
     }
 
     if (btbpRoiEndPending && curTick() > btbpRoiEndTick) {
-        branch_prediction::btb_pred::BtbpTraceEvent event;
-        event.tick = btbpRoiEndTick;
-        event.eventType =
-            branch_prediction::btb_pred::BtbpTraceEvent::RoiEnd;
-        event.threadId = btbpRoiEndTid;
-        event.coreCycle = btbpRoiEndCycle;
-        event.coreCycleValid = true;
-        event.committedInsts = btbpRoiEndInsts;
-        event.committedInstsValid = true;
-        event.roiInsts = btbpMeasuredRoiInsts;
-        event.roiInstsValid = true;
-        notifyBtbpTrace(event);
         fprintf(stderr,
                 "BTBP ROI_END_REQUEST tick=%llu core_cycle=%llu "
                 "committed_insts=%llu roi_insts=%llu "
@@ -710,6 +688,43 @@ CPU::tick()
     rename.tick();
     decode.tick();
     fetch.tick();
+
+    // v2.7 §4.2: emit roi_begin/roi_end trace records at the end of the
+    // request tick, after all pipeline stages have run, stamped with the
+    // request tick (curTick() == btbpRoi*Tick). The record is thereby written
+    // at the same tick it is stamped with (constraint a), after every CPU-side
+    // event of that tick (constraint b for the x264seek case), and with the
+    // request-tick stamp preserved (constraint c). beginBtbpRoiTracking,
+    // btbpRoiTrackingStarted, beginBtbpRoiDrain, and both BTBP ROI_* stderr
+    // lines remain deferred at the activation slot (curTick() > btbpRoi*Tick)
+    // above; pending stays true until the activation slot consumes it, so the
+    // record is emitted exactly once per boundary.
+    if (btbpRoiBeginPending && curTick() == btbpRoiBeginTick) {
+        branch_prediction::btb_pred::BtbpTraceEvent event;
+        event.tick = btbpRoiBeginTick;
+        event.eventType =
+            branch_prediction::btb_pred::BtbpTraceEvent::RoiBegin;
+        event.threadId = btbpRoiBeginTid;
+        event.coreCycle = btbpRoiBeginCycle;
+        event.coreCycleValid = true;
+        event.committedInsts = btbpRoiBeginInsts;
+        event.committedInstsValid = true;
+        notifyBtbpTrace(event);
+    }
+    if (btbpRoiEndPending && curTick() == btbpRoiEndTick) {
+        branch_prediction::btb_pred::BtbpTraceEvent event;
+        event.tick = btbpRoiEndTick;
+        event.eventType =
+            branch_prediction::btb_pred::BtbpTraceEvent::RoiEnd;
+        event.threadId = btbpRoiEndTid;
+        event.coreCycle = btbpRoiEndCycle;
+        event.coreCycleValid = true;
+        event.committedInsts = btbpRoiEndInsts;
+        event.committedInstsValid = true;
+        event.roiInsts = btbpMeasuredRoiInsts;
+        event.roiInstsValid = true;
+        notifyBtbpTrace(event);
+    }
 
     fetchTimebuffer.advance();
     decodeTimebuffer.advance();
