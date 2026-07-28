@@ -65,3 +65,12 @@ Run 矩阵：5 workloads × {base, T7+50%, T7+100%, T3+50%, T3+100%} × offset 0
 - E1 run 矩阵与判读规则的最终批准（Layer 3 收尾）。
 - 若设计点死亡：转向方向清单（预注册，防事后钓鱼）——Layer 4 议题。
 - frozen-z 守卫方案 (b) 与 T4 处置：挂起，待 E1 判生后才相关。
+
+## 6. Layer 3 收尾与 E1 终判（2026-07-28，Claude Code session）
+
+- E1 矩阵经 glr 批准按骨架执行：25 组（offset 0）+ 10 组自适应 round 2（offset +1M，2 个判据带 gcc）。
+- **终判：KILL**。best-arm geomean +0.385%，全局最大单点 +0.745%（gcc_pp_O2 t3p100 off+1M），两个 offset 一致 <1%。SWAY tight slot 交付量（1024 entries）仅为保守口径（+2048）的一半，动态机制恢复系数再高也够不到 1%。
+- 一致模式：T3 ≫ T7 donee（T7 普遍负收益）；mcf 对容量不敏感；gcc 效应跨 offset 可复现但结构性偏小。
+- 完整记录：`sway-paper/docs/experiments/2026-07-28-sway-stage4-e1-upper-bound.md`；run 契约 `runs/stage4_e1/README.md`。
+- 悬而未决关闭：E1 矩阵批准 ✓；frozen-z 守卫与 T4 处置随设计点死亡转为 archival。
+- **Layer 4 待 glr**：转向方向清单预注册（characterization fallback / BTBP 叙事合并 / SWAY 线封存），未注册前不开新机制工作。
