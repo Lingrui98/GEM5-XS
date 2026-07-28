@@ -1,20 +1,27 @@
 # CODEX_GOAL_PROMPT Stage 2 — B-b/B-c narrow stats + baseline sweep
 
-> **Prerequisite**: Stage 0 (`CODEX_GOAL_PROMPT_stage0.md`) verdict = PASS on both champsim + CBP trace modes. Do NOT start Stage 2 until glr has confirmed Stage 0 note and unblocked.
+> **Prerequisite**: Stage 0 UNBLOCKED by glr on 2026-07-03. Verdict is in `notes/2026-07-02-trace-mode-stat-sanity-rerun.md` (supersedes the earlier `2026-07-02-trace-mode-stat-sanity.md`):
+> - CBP int trace: PASS (all 6 sanity criteria met).
+> - Champsim `cvp1_public/compute_int_32` trace: FAIL, but reproducible on pristine `trace-new` HEAD → **pre-existing trace-new incompatibility, not SWAY-related**. glr confirms exactly one champsim trace is known-broken; treat all other champsim traces as usable.
+> - Bit-exact baseline (SWAY off) verified byte-identical to pristine trace-new on int_10_trace.
+>
+> Additionally, the FDIP-on baseline is certified: `docs/BASELINE_FDIP_MIGRATION_2026-07-02.md` reports 108/108 checkpoint jobs green with no aborts. This confirms cpt-mode is fully validated; trace-mode CBP is validated; trace-mode champsim is validated modulo the single known-broken trace.
 >
 > **Scope**: (a) add narrow per-way / per-table stats needed to compute B-b (stranded/imbalance) and B-c (evict × utilization) offline; (b) run baseline (no SWAY) across an expanded workload set covering SPEC17 + champsim BTB-intensive + CBP int, so we can offline-verify the Stage-3 decision procedure (`self-normalized β with warm-up half`) before wiring controller changes.
 >
 > **Effort**: 1-2 days (stat plumbing ~half day + sweep scheduling + first-pass QA).
 >
-> **Deliverables**: (i) minimal-diff stat additions on `sway/d6-substrate-rework`; (ii) baseline stats.txt for ~70-80 workloads under `runs/stage2_baseline_expanded/`; (iii) per-workload W0' analysis CSV; (iv) one note per workload family + one aggregated verdict note.
+> **Deliverables**: (i) minimal-diff stat additions on `sway/d6-substrate-rework` (HEAD `6dfd0e1b3a`, rebased onto `my/trace-new` `c7be4bd32a`); (ii) baseline stats.txt for ~70-80 workloads under `runs/stage2_baseline_expanded/`; (iii) per-workload W0' analysis CSV; (iv) one note per workload family + one aggregated verdict note.
 
 ## Context (read first)
 
-- `~/project/papers/sway-paper/docs/SESSION_RESUME_2026-07-02.md`
-- `~/project/papers/sway-paper/docs/SWAY_MECHANISM_SPEC_v2.md` §1 (P1/P2/P3'), §2.1 (donor slots), §2.2 (donee tables)
+- `~/project/papers/sway-paper/docs/SESSION_RESUME_2026-07-02.md` (updated 2026-07-02 EOD third refresh)
+- `~/project/papers/sway-paper/docs/SWAY_METRIC_TAXONOMY.md` — pressure taxonomy, Hybrid C2+C1 story, B-b + B-c, β decision procedure. **MUST read §3 (physical constraints) and §4 (metric definitions) before touching Task A.**
+- `~/project/papers/sway-paper/docs/BASELINE_FDIP_MIGRATION_2026-07-02.md` — certifies the rebased FDIP-on baseline; §5 retires archived +0.774% (do NOT re-cite).
+- `~/project/papers/sway-paper/docs/SWAY_MECHANISM_SPEC_v2.md` §1 (P1/P2/P3'), §2.1 (donor slots), §2.2 (donee tables) — but §4.2 utility formula is superseded by taxonomy §4.
 - `~/project/papers/sway-paper/docs/DESIGN_DECISIONS_PENDING_2026-07-01.md`
-- `~/project/GEM5-sway/.trellis/tasks/06-30-sway-d6-poc-rework/CODEX_GOAL_PROMPT_v4.md` and its verdict note
-- `~/project/GEM5-sway/.trellis/tasks/06-30-sway-d6-poc-rework/notes/2026-07-XX-trace-mode-stat-sanity.md` (Stage 0 output)
+- `~/project/GEM5-sway/.trellis/tasks/06-30-sway-d6-poc-rework/CODEX_GOAL_PROMPT_v4.md` (closed, F1' verdict Case C) — audit trail; do NOT resurrect F1/F1'.
+- `~/project/GEM5-sway/.trellis/tasks/06-30-sway-d6-poc-rework/notes/2026-07-02-trace-mode-stat-sanity-rerun.md` — Stage 0 verdict.
 
 Key SPEC v2 facts you must respect:
 
@@ -118,21 +125,22 @@ If any test fails, STOP and open a follow-up note; do NOT proceed to Task B.
 
 Assemble the following list in `runs/stage2_baseline_expanded/workload_manifest.tsv` (columns: family, id, source_path, inst_count, format):
 
-- **SPEC17** (target: full 35): iterate `/nfs/home/share/zyy/spec17-rv64gcb-O3-20m-gcc12.2.0-mix-with-special_wrf/checkpoint-0-0-0/*/` — one representative simpoint per workload directory. If multiple simpoints exist (e.g. `gcc_pp_O2/1869/`, `gcc_pp_O2/xxxx/`), pick the one already used in `~/project/papers/sway-paper/runs/eval_baseline_W100K/main_W100K/` if present, else pick numerically lowest. Format = `cpt` (checkpoint mode).
-- **Champsim BTB-intensive** (target: top 30): `/nfs/home/share/glr/champsim_traces/champsim_traces_btb_intensive.lst`, take first 30. Format = `champsim`.
-- **CBP int** (target: 10-15): `/nfs/home/share/glr/cbp_traces/int/` — pick 12-15 by increasing filename. Format = `cbp2025`.
+- **SPEC17** (target: full 36): reuse `~/project/papers/sway-paper/runs/baseline_fdip_migration_2026-07-02/spec17_36_top.lst` (36 workloads, highest-weight simpoint per workload). This list is already verified working across 108/108 jobs. Format = `cpt` (checkpoint mode).
+- **Champsim BTB-intensive** (target: top 30): `/nfs/home/share/glr/champsim_traces/champsim_traces_btb_intensive.lst`, take first 30. **Exclude `cvp1_public/compute_int_32`** — known-broken trace on current trace-new (aborts in `Fetch::lookupAndUpdateNextPC` at tick 3330, reproducible on pristine trace-new; not SWAY-related). Skip that specific trace and take the next entry to keep 30 total. Format = `champsim`. If any other champsim trace aborts, log it in `_failures.tsv` and continue — glr only knows about the one broken trace, others should work.
+- **CBP int** (target: 10-15): `/nfs/home/share/glr/cbp_traces/int/` — pick 12-15 by increasing filename. Format = `cbp2025`. Stage 0 verified int_10_trace works PASS on rebased binary, so this family should have zero failures.
 
-Log actual final counts in the manifest.
+Log actual final counts + excluded traces in the manifest.
 
 ### B.2 Run parameters
 
 Uniform across all workloads:
 
 - Baseline: `enableSwayRealloc=False`. No SWAY.
-- Instructions: 20M (checkpoint) or 30M (trace, of which half = warmup per convention). If a specific trace is shorter, use its native length.
-- `phaseSizeByInst = 100000`
-- Binary: freshly built `build/RISCV/gem5.opt` (after Task A).
-- Output dir: `runs/stage2_baseline_expanded/<family>/<workload_id>/`
+- Checkpoint mode (SPEC17): `XS_MAX_INSTS=20000000` (20M sample; 20M warmup is default via `--warmup-insts-no-switch` per `configs/common/Options.py:340`). Total = 40M inst per workload.
+- Trace mode (champsim + CBP): `XS_MAX_INSTS=<half_of_trace_inst_count>` + `XS_WARMUP_INSTS_NO_SWITCH=<same_half>` — traces are pre-annotated with warmup=first-half convention. If a trace's inst count is < 30M, run whole trace (warmup=inst_count/2).
+- `XS_PHASE_SIZE_BY_INST=100000` (do NOT change)
+- Binary: freshly built `build/RISCV/gem5.opt` on `sway/d6-substrate-rework` after Task A.
+- Output dir: `runs/stage2_baseline_expanded/<family>/<workload_id>/` (`family` ∈ {spec17, champsim_btb, cbp_int})
 - One `stats.txt` per workload.
 
 ### B.3 Scheduler
@@ -142,13 +150,15 @@ Use `~/project/mytools/tools/distributed-trace-scheduler/distributed_trace_sched
 - Traces → `run_trace_gem5.sh` (already in `~/project/mytools/tools/distributed-trace-scheduler/scripts/`).
 - Checkpoints → `run_cpt_gem5.sh` (same dir).
 
-Concurrency: whatever the scheduler defaults to for this host inventory. If ssh multi-host is enabled per user's global config, use it; else local `-j` = min(host_cpu / 8, num_workloads).
+Concurrency: use `--max-global 96 --max-threads-per-host 16 --poll-seconds 30` (proven on the 108-job baseline sweep 2026-07-02). Server list: `~/project/papers/sway-paper/runs/configs/servers.lst` (19 nodes, `node020..node042`). Scheduler's built-in load-aware capacity check (`get_host_capacity`, uses `half = logical/2 - load1`) is sufficient to enforce glr's "keep ≥ 32 cores free per host" rule on 128-core and 384-core nodes.
 
-If a workload run fails (crash / timeout / non-zero exit), log to `runs/stage2_baseline_expanded/_failures.tsv` and continue. Do NOT retry silently; note failure list at end.
+Launch each scheduler with `nohup ... > scheduler.log 2>&1 </dev/null & disown` so the python process survives shell exit; the plain-background `&` mode from Claude Bash tool proved fragile but nohup+disown works. Verify with `pgrep -af distributed_trace_scheduler` after launch that all schedulers are alive.
+
+If a workload run fails (crash / timeout / non-zero exit), log to `runs/stage2_baseline_expanded/<family>/_failures.tsv` and continue. Do NOT retry silently; note failure list at end. Expected fail: `cvp1_public/compute_int_32` (already excluded per B.1) — should NOT appear in results. Any other fail is unexpected and must be flagged.
 
 ### B.4 Time budget
 
-Expected 8-16 hours wall-clock end-to-end depending on host availability. If wall-clock exceeds 24h, STOP the sweep and report progress.
+Expected 2-4 hours wall-clock end-to-end (108-job baseline sweep on 2026-07-02 completed in ~25 min for SPEC17 cpt mode; trace mode expected similar throughput; total ~72 workloads adds ≤ 1× more). If wall-clock exceeds 8h, STOP the sweep and report progress.
 
 ## Task C — offline W0' analysis
 

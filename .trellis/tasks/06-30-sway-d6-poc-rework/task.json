@@ -3,7 +3,7 @@
   "name": "sway-d6-poc-rework",
   "title": "SWAY Phase 1 Task C: D6 heterogeneous-substrate PoC rework",
   "description": "Rework the SWAY PoC under the locked physical-implementability design captured in docs/SWAY_MECHANISM_SPEC_v2.md: component-level ownership (P1), donee-history-scaled cool-down (P2), TAGE-only-donee (P3'), D6 4-slot heterogeneous substrate (MBTB tight ×2 + ITTAGE table-level relaxed ×2), R1-R5 index/packing rules with parameterized design-time-fixed extra-bit source, parameterized donee_set sweep, Fix 1/2/3 useful-bit lifecycle, and the over-provisioning upper-bound comparison against the archived 06-XX-sway-realloc-controller-poc PoC.",
-  "status": "blocked",
+  "status": "in_progress",
   "dev_type": "impl",
   "scope": "src+eval+paper",
   "package": "gem5-sway",
@@ -15,7 +15,7 @@
   "branch": "sway/d6-substrate-rework",
   "base_branch": "sway/phase-stranded-probe",
   "worktree_path": "/nfs/home/goulingrui/project/GEM5-sway",
-  "current_phase": "v4 F1' Case C STOP after gcc smoke",
+  "current_phase": "Stage 4 E1 static upper-bound gate (pre-4B kill-gate, 2026-07-26 socratic skeleton)",
   "next_action": [
     {
       "phase": "D0-prep",
