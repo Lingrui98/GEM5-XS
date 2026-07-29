@@ -74,3 +74,12 @@ Run 矩阵：5 workloads × {base, T7+50%, T7+100%, T3+50%, T3+100%} × offset 0
 - 完整记录：`sway-paper/docs/experiments/2026-07-28-sway-stage4-e1-upper-bound.md`；run 契约 `runs/stage4_e1/README.md`。
 - 悬而未决关闭：E1 矩阵批准 ✓；frozen-z 守卫与 T4 处置随设计点死亡转为 archival。
 - **Layer 4 待 glr**：转向方向清单预注册（characterization fallback / BTBP 叙事合并 / SWAY 线封存），未注册前不开新机制工作。
+
+## 7. CORRIGENDUM（2026-07-29）：§6 的 KILL 判词作废，降为"判局执行无效"
+
+GPT-5.6 (xhigh) 独立复核发现两个执行错误（Claude Code 已逐项盘证属实）：
+
+1. **t3p100 张量下标 off-by-one**：实际改的是 index 2（T2）而非 index 3（T3）。预注册的 T3+100% **从未执行**；§6 中全部"t3p100"数字实为 T2+100%。
+2. **tight slot 交付量低估 3×**：packing factor = ⌊70/19⌋ = 3（sway_realloc.hh + btb.test.cc:239），单 slot 实际交付 **3072** TAGE subentries（非 1024）。§4 骨架与 §6 判词中"+2048 = 2× 交付"实为 0.67×（欠交付，不构成上界）。
+
+**修正后状态**：T7 kill 依然成立（两臂 ≤0）；T3 无有效过交付测量，+2048 时 +0.41~0.65% 且随容量上升——T3+100% 必须补跑才能终判。T2+100%（误标）+0.745% 是意外发现（T2 在 frozen donee_set 之外，归 Layer 4 候选）。**判词降级为"高度悲观，判局需一次性 E1′ 纠错（正确 T3+100%）"**，详见实验记录 CORRIGENDUM 段。§6 的"动态机制数学上不可能够到 1%"论证随错误 #2 一并失效。
