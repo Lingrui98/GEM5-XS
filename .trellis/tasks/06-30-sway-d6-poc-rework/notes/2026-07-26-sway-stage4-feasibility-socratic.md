@@ -83,3 +83,19 @@ GPT-5.6 (xhigh) 独立复核发现两个执行错误（Claude Code 已逐项盘�
 2. **tight slot 交付量低估 3×**：packing factor = ⌊70/19⌋ = 3（sway_realloc.hh + btb.test.cc:239），单 slot 实际交付 **3072** TAGE subentries（非 1024）。§4 骨架与 §6 判词中"+2048 = 2× 交付"实为 0.67×（欠交付，不构成上界）。
 
 **修正后状态**：T7 kill 依然成立（两臂 ≤0）；T3 无有效过交付测量，+2048 时 +0.41~0.65% 且随容量上升——T3+100% 必须补跑才能终判。T2+100%（误标）+0.745% 是意外发现（T2 在 frozen donee_set 之外，归 Layer 4 候选）。**判词降级为"高度悲观，判局需一次性 E1′ 纠错（正确 T3+100%）"**，详见实验记录 CORRIGENDUM 段。§6 的"动态机制数学上不可能够到 1%"论证随错误 #2 一并失效。
+
+## 8. E1′ 终判（2026-07-29）：设计点**勉强存活**——单 workload 过线，进入 DA-2 动态恢复判定
+
+E1′（正确 T3 `tableSizes[3]=4096`，config.ini 逐项盘证下标无误）× 5 workloads × offset 0 + 判据带补 offset +1M：
+
+| workload | T3+100% (off 0) | off +1M |
+|---|---:|---:|
+| gcc_pp_O2_1869 | **+1.074%** | **+1.032%** ✅ |
+| gcc_pp_O3_2441 | +0.580% | +0.384% |
+| perlbench_spam_16137 | +0.050% | — |
+| perlbench_diff_20021 | +0.107% | — |
+| mcf_17135 | −0.414% | — |
+
+- **kill 判据不成立**：gcc_pp_O2 两个 offset 均 ≥1%（+1.074 / +1.032），按预注册进入 live 路径：frozen-z 守卫（方案 b）→ DA-2 动态恢复测试（≥70%）。
+- **但效应集中于单一 workload**（gcc 家族），修正后 best-arm geomean ≈ +0.42%，Layer-1 的 "≥1% geomean" 仍未达；非单调性确认（perlbench_spam T3+50% > T3+100%；mcf 负单调）。
+- **Layer 4 待 glr**：是否投入 frozen-z 守卫 + gcc_pp_O2 最小闭环动态恢复测试（预计 SWAY 实际交付 3072 entries < 静态 +4096，70% 恢复 ≈ +0.75% 单 workload），还是按"geomean 不达"就此止步。两条路都符合预注册；方向清单预注册要求不变。
