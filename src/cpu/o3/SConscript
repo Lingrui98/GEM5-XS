@@ -114,6 +114,8 @@ if env['CONF']['TARGET_ISA'] == 'null':
     GTest('entangling_prefetcher.test',
           'entangling_prefetcher.test.cc',
           'entangling_prefetcher.cc')
+    GTest('trace_l1i_identity.test',
+          'trace/TraceL1iIdentity.test.cc')
     GTest('champsim_trace_reader.test',
           'trace/ChampSimTraceReader.test.cc',
           'trace/TraceReader.cc',
@@ -138,6 +140,8 @@ else:
     GTest('entangling_prefetcher.test',
           'entangling_prefetcher.test.cc',
           'entangling_prefetcher.cc')
+    GTest('trace_l1i_identity.test',
+          'trace/TraceL1iIdentity.test.cc')
     GTest('champsim_trace_reader.test',
           'trace/ChampSimTraceReader.test.cc',
           'trace/TraceReader.cc',

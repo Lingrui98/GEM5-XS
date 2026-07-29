@@ -402,6 +402,15 @@ class Request
         bool fdipSelectedWayValid;
         uint8_t fdipSelectedWay;
         Tick fdipSelectedWayTick;
+        uint64_t traceRequestUid;
+        uint64_t traceLookupUid;
+        uint64_t traceFetchEpoch;
+        uint64_t traceInstructionOrdinal;
+        uint32_t traceDemandAttemptOrdinal;
+        bool traceDemandTerminalEmitted;
+        uint32_t traceDemandOutcome;
+        Tick traceL1iVisibilityTick;
+        bool tracePathWrong;
 
         XsMetadata() :
             validXsMetadata(false),
@@ -424,7 +433,16 @@ class Request
             traceFtqId(0),
             fdipSelectedWayValid(false),
             fdipSelectedWay(0),
-            fdipSelectedWayTick(0) {}
+            fdipSelectedWayTick(0),
+            traceRequestUid(0),
+            traceLookupUid(0),
+            traceFetchEpoch(0),
+            traceInstructionOrdinal(0),
+            traceDemandAttemptOrdinal(0),
+            traceDemandTerminalEmitted(false),
+            traceDemandOutcome(0),
+            traceL1iVisibilityTick(0),
+            tracePathWrong(false) {}
 
         XsMetadata(o3::XsDynInstMetaPtr instMeta) :
             validXsMetadata(true),
@@ -447,7 +465,16 @@ class Request
             traceFtqId(0),
             fdipSelectedWayValid(false),
             fdipSelectedWay(0),
-            fdipSelectedWayTick(0) {}
+            fdipSelectedWayTick(0),
+            traceRequestUid(0),
+            traceLookupUid(0),
+            traceFetchEpoch(0),
+            traceInstructionOrdinal(0),
+            traceDemandAttemptOrdinal(0),
+            traceDemandTerminalEmitted(false),
+            traceDemandOutcome(0),
+            traceL1iVisibilityTick(0),
+            tracePathWrong(false) {}
 
         XsMetadata(PrefetchSourceType pfSource) :
             validXsMetadata(true),
@@ -470,7 +497,16 @@ class Request
             traceFtqId(0),
             fdipSelectedWayValid(false),
             fdipSelectedWay(0),
-            fdipSelectedWayTick(0) {}
+            fdipSelectedWayTick(0),
+            traceRequestUid(0),
+            traceLookupUid(0),
+            traceFetchEpoch(0),
+            traceInstructionOrdinal(0),
+            traceDemandAttemptOrdinal(0),
+            traceDemandTerminalEmitted(false),
+            traceDemandOutcome(0),
+            traceL1iVisibilityTick(0),
+            tracePathWrong(false) {}
 
         XsMetadata(PrefetchSourceType pfSource,int pfDepth) :
             validXsMetadata(true),
@@ -493,7 +529,16 @@ class Request
             traceFtqId(0),
             fdipSelectedWayValid(false),
             fdipSelectedWay(0),
-            fdipSelectedWayTick(0) {}
+            fdipSelectedWayTick(0),
+            traceRequestUid(0),
+            traceLookupUid(0),
+            traceFetchEpoch(0),
+            traceInstructionOrdinal(0),
+            traceDemandAttemptOrdinal(0),
+            traceDemandTerminalEmitted(false),
+            traceDemandOutcome(0),
+            traceL1iVisibilityTick(0),
+            tracePathWrong(false) {}
 
         bool isFdip() const { return prefetchSource == PF_FDIP; }
 
@@ -526,6 +571,15 @@ class Request
             fdipSelectedWayValid = false;
             fdipSelectedWay = 0;
             fdipSelectedWayTick = 0;
+            traceRequestUid = 0;
+            traceLookupUid = 0;
+            traceFetchEpoch = 0;
+            traceInstructionOrdinal = 0;
+            traceDemandAttemptOrdinal = 0;
+            traceDemandTerminalEmitted = false;
+            traceDemandOutcome = 0;
+            traceL1iVisibilityTick = 0;
+            tracePathWrong = false;
         }
     } XsMetadata;
 

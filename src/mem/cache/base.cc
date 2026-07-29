@@ -156,6 +156,43 @@ populateBtbpRequestIdentity(
         event.ftqId = xs_meta.traceFtqId;
         event.ftqIdValid = true;
     }
+    if (xs_meta.traceRequestUid != 0) {
+        event.requestUid = xs_meta.traceRequestUid;
+        event.requestUidValid = true;
+    }
+    if (xs_meta.traceLookupUid != 0) {
+        event.lookupUid = xs_meta.traceLookupUid;
+        event.lookupUidValid = true;
+    }
+    if (xs_meta.traceFetchEpoch != 0) {
+        event.fetchEpoch = xs_meta.traceFetchEpoch;
+        event.fetchEpochValid = true;
+    }
+    if (xs_meta.traceInstructionOrdinal != 0) {
+        event.traceInstructionOrdinal = xs_meta.traceInstructionOrdinal;
+        event.traceInstructionOrdinalValid = true;
+    }
+    if (xs_meta.traceDemandAttemptOrdinal != 0) {
+        event.demandAttemptOrdinal =
+            xs_meta.traceDemandAttemptOrdinal - 1;
+        event.demandAttemptOrdinalValid = true;
+    }
+    if (xs_meta.traceL1iVisibilityTick != 0) {
+        event.visibilityTick = xs_meta.traceL1iVisibilityTick;
+        event.visibilityTickValid = true;
+    }
+    if (xs_meta.l1iResidencyId != 0) {
+        event.residencyId = xs_meta.l1iResidencyId;
+        event.residencyIdValid = true;
+    }
+    event.pathState = xs_meta.tracePathWrong ?
+        branch_prediction::btb_pred::BtbpTraceEvent::WrongPath :
+        branch_prediction::btb_pred::BtbpTraceEvent::CorrectPath;
+    event.pathStateValid = xs_meta.traceRequestUid != 0;
+    if (xs_meta.instPrefetchDecisionId != 0) {
+        event.ownerPrefetchDecisionIds.push_back(
+            xs_meta.instPrefetchDecisionId);
+    }
     if (xs_meta.isFdip()) {
         event.fdipEpoch = xs_meta.fdipEpoch;
         event.fdipEpochValid = true;
@@ -232,6 +269,14 @@ BaseCache::emitL1ILineEvict(CacheBlk *blk)
     event.lifecycleKind = static_cast<uint32_t>(
         branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind::Evict);
     event.lifecycleKindValid = true;
+    event.terminalReason = static_cast<uint32_t>(
+        kind == branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind::
+                    SameLineRefill ?
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                Invalidated :
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                Evicted);
+    event.terminalReasonValid = true;
     event.residencyId = xs_meta.l1iResidencyId;
     event.residencyIdValid = true;
     event.requestKind = isInstPrefetchSource(xs_meta.prefetchSource) ?
@@ -242,6 +287,10 @@ BaseCache::emitL1ILineEvict(CacheBlk *blk)
         event.prefetchSource =
             static_cast<uint32_t>(xs_meta.prefetchSource);
         event.prefetchSourceValid = true;
+    }
+    if (xs_meta.instPrefetchDecisionId != 0) {
+        event.ownerPrefetchDecisionIds.push_back(
+            xs_meta.instPrefetchDecisionId);
     }
     if (xs_meta.traceIdentityValid) {
         event.addressSpaceId = xs_meta.traceAddressSpaceId;
@@ -257,14 +306,26 @@ BaseCache::emitL1ILineEvict(CacheBlk *blk)
 void
 BaseCache::beginBtbpRoiTracking()
 {
-    btbpRoiResidencies.clear();
+    panic_if(btbpLifecycleLedger.size() != btbpRoiResidencies.size(),
+             "BTBP ROI begin ledger/map size mismatch: %zu != %zu",
+             btbpLifecycleLedger.size(), btbpRoiResidencies.size());
 }
 
 unsigned
 BaseCache::closeBtbpRoiResidencies()
 {
-    const unsigned closed = btbpRoiResidencies.size();
-    for (auto &[residency_id, residency] : btbpRoiResidencies) {
+    const auto drained = btbpLifecycleLedger.drainAll();
+    panic_if(drained.size() != btbpRoiResidencies.size(),
+             "BTBP ROI drain ledger/map size mismatch: %zu != %zu",
+             drained.size(), btbpRoiResidencies.size());
+    for (const auto &[line, ledger_residency] : drained) {
+        const uint64_t residency_id = ledger_residency.id;
+        const auto tracked = btbpRoiResidencies.find(residency_id);
+        panic_if(tracked == btbpRoiResidencies.end(),
+                 "BTBP ROI residency %llu at %#llx (%s) lacks trace state",
+                 residency_id, line.lineAddr,
+                 line.secure ? "secure" : "non-secure");
+        auto &residency = tracked->second;
         auto *cpu = resolveO3Cpu(system, residency.contextId);
         if (!cpu) {
             continue;
@@ -277,6 +338,10 @@ BaseCache::closeBtbpRoiResidencies()
             branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind::
                 RoiDrainClose);
         event.lifecycleKindValid = true;
+        event.terminalReason = static_cast<uint32_t>(
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                RetainedAtDrain);
+        event.terminalReasonValid = true;
         event.fillBytesTickValid = false;
         event.l1iReadyTickValid = false;
         event.scanCompleteTickValid = false;
@@ -1079,6 +1144,48 @@ BaseCache::recvTimingReq(PacketPtr pkt)
         }
     }
 
+    MSHR *btbp_existing_mshr = nullptr;
+    if (!satisfied && isL1I() && pkt->req && pkt->req->isInstFetch() &&
+        !pkt->req->isPrefetch()) {
+        btbp_existing_mshr = mshrQueue.findMatch(
+            pkt->getBlockAddr(blkSize), pkt->isSecure());
+    }
+    if (isL1I() && pkt->req && pkt->req->isInstFetch() &&
+        !pkt->req->isPrefetch() && pkt->req->hasXsMetadata()) {
+        using TerminalReason = branch_prediction::btb_pred::BtbpTraceEvent::
+            TerminalReason;
+        auto xs_meta = pkt->req->getXsMetadata();
+        if (satisfied) {
+            xs_meta.traceDemandOutcome = static_cast<uint32_t>(
+                TerminalReason::CacheHit);
+            if (blk) {
+                const auto blk_meta = blk->getXsMetadata();
+                xs_meta.l1iResidencyId = blk_meta.l1iResidencyId;
+                if (blk_meta.instPrefetchDecisionId != 0) {
+                    xs_meta.instPrefetchDecisionId =
+                        blk_meta.instPrefetchDecisionId;
+                    xs_meta.prefetchSource = blk_meta.prefetchSource;
+                }
+            }
+        } else if (btbp_existing_mshr) {
+            if (btbp_existing_mshr->allocatedByInstPrefetch()) {
+                xs_meta.traceDemandOutcome = static_cast<uint32_t>(
+                    TerminalReason::MergeWithPrefetch);
+                xs_meta.instPrefetchDecisionId =
+                    btbp_existing_mshr->getInstPrefetchDecisionId();
+                xs_meta.prefetchSource =
+                    btbp_existing_mshr->getInstPrefetchSource();
+            } else {
+                xs_meta.traceDemandOutcome = static_cast<uint32_t>(
+                    TerminalReason::MergeWithDemand);
+            }
+        } else {
+            xs_meta.traceDemandOutcome = static_cast<uint32_t>(
+                TerminalReason::Fill);
+        }
+        pkt->req->setXsMetadata(xs_meta);
+    }
+
     if (satisfied) {
         // notify before anything else as later handleTimingReqHit might turn
         // the packet in a response
@@ -1164,6 +1271,36 @@ BaseCache::recvTimingReq(PacketPtr pkt)
 
         handleTimingReqMiss(pkt, blk, forward_time, request_time);
 
+        if (isL1I() && pkt->req && pkt->req->isInstFetch() &&
+            !pkt->req->isPrefetch() && pkt->req->hasXsMetadata() &&
+            (pkt->mshrArbFailed() || pkt->mshrAliasFailed())) {
+            auto xs_meta = pkt->req->getXsMetadata();
+            xs_meta.traceDemandOutcome = static_cast<uint32_t>(
+                branch_prediction::btb_pred::BtbpTraceEvent::
+                    TerminalReason::Blocked);
+            pkt->req->setXsMetadata(xs_meta);
+        }
+
+        if (btbp_demand_event_valid) {
+            const auto *owner_mshr = mshrQueue.findMatch(
+                pkt->getBlockAddr(blkSize), pkt->isSecure());
+            btbp_demand_event.prefetchOwnedMshr = owner_mshr &&
+                owner_mshr->allocatedByInstPrefetch();
+            btbp_demand_event.prefetchOwnedMshrValid = true;
+            if (owner_mshr && owner_mshr->allocatedByInstPrefetch()) {
+                const uint64_t decision_id =
+                    owner_mshr->getInstPrefetchDecisionId();
+                const auto source = owner_mshr->getInstPrefetchSource();
+                panic_if(decision_id == 0 || !isInstPrefetchSource(source),
+                         "prefetch-owned L1I MSHR lacks decision identity");
+                btbp_demand_event.prefetchDecisionId = decision_id;
+                btbp_demand_event.prefetchDecisionIdValid = true;
+                btbp_demand_event.prefetchSource =
+                    static_cast<uint32_t>(source);
+                btbp_demand_event.prefetchSourceValid = true;
+            }
+        }
+
         ppMiss->notify(pkt);
     }
 
@@ -1171,6 +1308,9 @@ BaseCache::recvTimingReq(PacketPtr pkt)
         !pkt->mshrArbFailed() && !pkt->mshrAliasFailed() &&
         !pkt->isHitInWriteBuffer();
     if (btbp_demand_accepted) {
+        btbp_demand_event.ownerPrefetchDecisionIds.clear();
+        populateBtbpRequestIdentity(
+            btbp_demand_event, pkt->req, blkSize);
         btbp_demand_cpu->notifyBtbpTrace(btbp_demand_event);
 
         if (pkt->req->hasXsMetadata()) {
@@ -2542,7 +2682,29 @@ BaseCache::handleFill(PacketPtr pkt, CacheBlk *blk, PacketList &writebacks,
             blk_meta.l1iResidencyId = nextL1iResidencyId++;
         }
     }
-    blk->setXsMetadata(blk_meta);
+    if (isL1I() && blk != tempBlock) {
+        const BtbpL1iLifecycleLedger::LineKey key{addr, is_secure};
+        transitionBtbpL1iFillMetadata(
+            btbpLifecycleLedger, key, *blk, blk_meta, has_old_data,
+            isInstPrefetchSource(blk_meta.prefetchSource),
+            [&](const Request::XsMetadata &old_metadata) {
+                emitL1ILineEvict(
+                    blk,
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        LifecycleKind::SameLineRefill,
+                    pkt);
+                btbpRoiResidencies.erase(
+                    old_metadata.l1iResidencyId);
+            });
+    } else {
+        blk->setXsMetadata(blk_meta);
+    }
+    if (isL1I() && pkt->req && pkt->req->isInstFetch() &&
+        pkt->req->hasXsMetadata() && blk_meta.l1iResidencyId != 0) {
+        auto request_meta = pkt->req->getXsMetadata();
+        request_meta.l1iResidencyId = blk_meta.l1iResidencyId;
+        pkt->req->setXsMetadata(request_meta);
+    }
     if (isL1I() && isFdipSource(pkt->req->getPFSource())) {
         stats.fdipInstalled++;
     }
@@ -2586,18 +2748,20 @@ BaseCache::handleFill(PacketPtr pkt, CacheBlk *blk, PacketList &writebacks,
                     branch_prediction::btb_pred::BtbpTraceEvent::
                         LifecycleKind::DemandFill);
             lifecycle_event.lifecycleKindValid = true;
+            lifecycle_event.supplySource =
+                isInstPrefetchSource(pkt->req->getPFSource()) ?
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        PrefetchFillSupply :
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        DemandFillSupply;
+            lifecycle_event.supplySourceValid = true;
             if (blk_meta.l1iResidencyId != 0) {
                 lifecycle_event.residencyId = blk_meta.l1iResidencyId;
                 lifecycle_event.residencyIdValid = true;
             }
             populateBtbpRequestIdentity(lifecycle_event, pkt->req, blkSize);
             cpu->notifyBtbpTrace(lifecycle_event);
-            if (lifecycle_event.lifecycleKind == static_cast<uint32_t>(
-                    branch_prediction::btb_pred::BtbpTraceEvent::
-                        LifecycleKind::PrefetchFill) &&
-                pkt->req->hasXsMetadata() &&
-                pkt->req->getXsMetadata().btbpRoiOrigin &&
-                lifecycle_event.residencyIdValid) {
+            if (lifecycle_event.residencyIdValid) {
                 btbpRoiResidencies[lifecycle_event.residencyId] = {
                     pkt->req->contextId(), lifecycle_event};
             }
