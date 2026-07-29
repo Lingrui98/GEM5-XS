@@ -188,5 +188,31 @@ TEST(BtbpL1iLifecycleTest, DrainClosesOnlyRoiOriginPrefetchResidencies)
     roi_demand.invalidate();
 }
 
+TEST(BtbpL1iLifecycleTest, TerminalDrainClosesEveryActiveResidency)
+{
+    Ledger ledger;
+    CacheBlk prefetch;
+    CacheBlk demand;
+    prefetch.insert(0x1000, false);
+    demand.insert(0x2000, false);
+    const auto no_close = [](const Request::XsMetadata &) {
+        ADD_FAILURE();
+    };
+    transitionBtbpL1iFillMetadata(
+        ledger, {0x1000, false}, prefetch,
+        makeMetadata(1, true, false), false, true, no_close);
+    transitionBtbpL1iFillMetadata(
+        ledger, {0x2000, false}, demand,
+        makeMetadata(2, false, true), false, false, no_close);
+
+    const auto drained = ledger.drainAll();
+    ASSERT_EQ(drained.size(), 2);
+    EXPECT_EQ(ledger.size(), 0);
+    EXPECT_FALSE(ledger.isCurrent({0x1000, false}, 1));
+    EXPECT_FALSE(ledger.isCurrent({0x2000, false}, 2));
+    prefetch.invalidate();
+    demand.invalidate();
+}
+
 } // namespace
 } // namespace gem5

@@ -383,6 +383,8 @@ TraceFetch::resetStage()
     for (ThreadID tid = 0; tid < fetch.numThreads; ++tid) {
         // 正确路径的期望 trace 索引从 1 开始
         traceFetchExpectedCorrectIdx[tid] = 1;
+        traceSupplyPendingValid[tid] = false;
+        nextWrongPathInstructionOrdinal[tid] = 1;
     }
 
     // Reset trace consumption counter for precise seqNum→trace index mapping
@@ -446,14 +448,42 @@ TraceFetch::fetchTraceInstruction(ThreadID tid, PCStateBase &this_pc)
     if (wrong_path) {
         const unsigned nop_size =
             chooseWrongPathNopSize(tid, this_pc.instAddr());
+        const Addr instruction_pc = this_pc.instAddr();
+        if (!traceSupplyPendingValid[tid] ||
+            traceSupplyPendingPc[tid] != instruction_pc ||
+            traceSupplyPendingSize[tid] != nop_size ||
+            !traceSupplyPendingWrongPath[tid]) {
+            traceSupplyPendingValid[tid] = true;
+            traceSupplyPendingPc[tid] = instruction_pc;
+            traceSupplyPendingSize[tid] = nop_size;
+            traceSupplyPendingOrdinal[tid] =
+                (uint64_t{1} << 63) |
+                nextWrongPathInstructionOrdinal[tid]++;
+            traceSupplyPendingWrongPath[tid] = true;
+        }
+        fetch.pendingTraceInstructionOrdinal[tid] =
+            traceSupplyPendingOrdinal[tid];
+        fetch.pendingTraceInstructionPc[tid] = instruction_pc;
+        fetch.pendingTracePathWrong[tid] = true;
+        fetch.pendingTraceSupplyValid[tid] = true;
+        if (!fetch.traceInstructionBytesReady(
+                tid, instruction_pc, nop_size)) {
+            if (fetch.threads[tid].valid) {
+                fetch.threads[tid].valid = false;
+            }
+            return StallReason::IcacheStall;
+        }
         // RISC-V 32b nop: 0x00000013; 16b compressed nop: 0x0001
         TheISA::MachInst nop = (nop_size == 2)
             ? static_cast<TheISA::MachInst>(0x0001u)
             : static_cast<TheISA::MachInst>(0x00000013u);
         supplyTraceToDecoder(
-            tid, this_pc, nop, this_pc.instAddr(),
+            tid, this_pc, nop, instruction_pc, nop_size,
+            traceSupplyPendingOrdinal[tid], true,
             nop_size == 2 ? "supplied 2B NOP without advancing reader"
                           : "supplied 4B NOP without advancing reader (pred takenPC)");
+        traceSupplyPendingValid[tid] = false;
+        fetch.pendingTraceSupplyValid[tid] = false;
         return StallReason::NoStall;
     }
 
@@ -485,22 +515,48 @@ TraceFetch::fetchTraceInstruction(ThreadID tid, PCStateBase &this_pc)
     }
     pendingTraceInstr = head;
     pendingTraceValid = true;
+    const unsigned instruction_size =
+        head.getInstSizeBytes() ? head.getInstSizeBytes() : 4;
+    const uint64_t instruction_ordinal = head.getSeqNum() + 1;
+    traceSupplyPendingValid[tid] = true;
+    traceSupplyPendingPc[tid] = head.getPC();
+    traceSupplyPendingSize[tid] = instruction_size;
+    traceSupplyPendingOrdinal[tid] = instruction_ordinal;
+    traceSupplyPendingWrongPath[tid] = false;
+    fetch.pendingTraceInstructionOrdinal[tid] = instruction_ordinal;
+    fetch.pendingTraceInstructionPc[tid] = head.getPC();
+    fetch.pendingTracePathWrong[tid] = false;
+    fetch.pendingTraceSupplyValid[tid] = true;
+    if (!fetch.traceInstructionBytesReady(
+            tid, head.getPC(), instruction_size)) {
+        if (fetch.threads[tid].valid) {
+            fetch.threads[tid].valid = false;
+        }
+        return StallReason::IcacheStall;
+    }
     TheISA::MachInst machInst = createMachInstFromTrace(head);
     supplyTraceToDecoder(tid, this_pc, machInst, head.getPC(),
-                         "supplied 4B to decoder (from expected stream head)");
+                         instruction_size, instruction_ordinal, false,
+                         instruction_size == 2 ?
+                             "supplied 2B to decoder (from expected stream head)" :
+                             "supplied 4B to decoder (from expected stream head)");
+    traceSupplyPendingValid[tid] = false;
+    fetch.pendingTraceSupplyValid[tid] = false;
     return StallReason::NoStall;
 }
 
 void
 TraceFetch::supplyTraceToDecoder(ThreadID tid, const PCStateBase &this_pc,
                                  TheISA::MachInst machInst, Addr instrPC,
-                                 const char *tag)
+                                 unsigned instrSize,
+                                 uint64_t traceInstructionOrdinal,
+                                 bool wrongPath, const char *tag)
 {
     auto *dec_ptr = fetch.decoder[tid];
     memcpy(dec_ptr->moreBytesPtr(), &machInst, sizeof(machInst));
     fetch.decoder[tid]->moreBytes(this_pc, instrPC);
-    fetch.threads[tid].startPC = instrPC;
-    fetch.threads[tid].valid = true;
+    fetch.emitTraceDecodeConsume(
+        tid, instrPC, instrSize, traceInstructionOrdinal, wrongPath);
     DPRINTF(Fetch, "[tid:%i] Trace on-demand: %s at PC=0x%llx\n",
             tid, tag, (unsigned long long)instrPC);
 }
@@ -976,6 +1032,8 @@ TraceFetch::handleTraceSquash(ThreadID tid, const PCStateBase &new_pc,
     if (!traceMode) {
         return;
     }
+
+    traceSupplyPendingValid[tid] = false;
 
     TraceRecoveryAction action;
     if (traceWrongPathActive) {

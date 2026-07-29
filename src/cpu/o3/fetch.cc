@@ -61,6 +61,7 @@
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/trace/TraceFetch.hh"
+#include "cpu/o3/trace/TraceL1iIdentity.hh"
 #include "cpu/pred/btb/decoupled_bpred.hh"
 #include "cpu/pred/btb/probe/btbp_trace_field_helpers.hh"
 #include "debug/Activity.hh"
@@ -644,8 +645,15 @@ Fetch::clearStates(ThreadID tid)
     set(threads[tid].fetchpc, cpu->pcState(tid));
     macroop[tid] = NULL;
     delayedCommit[tid] = false;
+    closeOutstandingTraceFetch(
+        tid, branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                 ResetCanceled);
     threads[tid].cacheReq.reset();
     threads[tid].reset();
+    pendingTraceInstructionOrdinal[tid] = 0;
+    pendingTraceInstructionPc[tid] = 0;
+    pendingTracePathWrong[tid] = false;
+    pendingTraceSupplyValid[tid] = false;
     resetFdipPartialState(tid);
     resetFdipTracking(tid);
     if (eipEnabled()) {
@@ -691,9 +699,16 @@ Fetch::resetStage()
         macroop[tid] = NULL;
 
         delayedCommit[tid] = false;
+        closeOutstandingTraceFetch(
+            tid, branch_prediction::btb_pred::BtbpTraceEvent::
+                     TerminalReason::ResetCanceled);
         threads[tid].cacheReq.reset();
 
         threads[tid].reset();
+        pendingTraceInstructionOrdinal[tid] = 0;
+        pendingTraceInstructionPc[tid] = 0;
+        pendingTracePathWrong[tid] = false;
+        pendingTraceSupplyValid[tid] = false;
         resetFdipPartialState(tid);
         resetFdipTracking(tid);
         fdipEpoch[tid] = 0;
@@ -942,6 +957,356 @@ Fetch::emitInstPrefetchTrace(
     }
 
     cpu->notifyBtbpTrace(event);
+}
+
+void
+Fetch::emitTraceFetchRequest(
+    branch_prediction::btb_pred::BtbpTraceEvent::EventType event_type,
+    ThreadID tid,
+    branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason)
+{
+    using Event = branch_prediction::btb_pred::BtbpTraceEvent;
+
+    auto &cache_req = threads[tid].cacheReq;
+    if (!isTraceMode() || cache_req.traceRequestUid == 0) {
+        return;
+    }
+
+    Event event;
+    event.tick = curTick();
+    event.eventType = event_type;
+    event.threadId = tid;
+    event.requestUid = cache_req.traceRequestUid;
+    event.requestUidValid = true;
+    event.lookupUid = cache_req.traceLookupUid;
+    event.lookupUidValid = cache_req.traceLookupUid != 0;
+    event.fetchEpoch = cache_req.traceFetchEpoch;
+    event.fetchEpochValid = cache_req.traceFetchEpoch != 0;
+    event.ftqId = cache_req.traceFtqId;
+    event.ftqIdValid = true;
+    event.traceInstructionOrdinal = cache_req.traceInstructionOrdinal;
+    event.traceInstructionOrdinalValid =
+        cache_req.traceInstructionOrdinal != 0;
+    event.virtualLineAddr = cache_req.baseAddr -
+        cache_req.baseAddr % cacheBlkSize;
+    event.virtualLineAddrValid = true;
+    event.lineSize = cacheBlkSize;
+    event.lineSizeValid = true;
+    event.requestKind = Event::DemandRequest;
+    event.requestKindValid = true;
+    event.pathState = cache_req.tracePathWrong ?
+        Event::WrongPath : Event::CorrectPath;
+    event.pathStateValid = true;
+    event.addressSpaceId = cache_req.traceAddressSpaceId;
+    event.addressSpaceIdValid = true;
+    event.asidHash = cache_req.traceAsidHash;
+    event.asidHashValid = true;
+
+    if (!cache_req.requests.empty() &&
+        cache_req.requests.front()->hasXsMetadata()) {
+        const auto meta = cache_req.requests.front()->getXsMetadata();
+        event.addressSpaceId = meta.traceAddressSpaceId;
+        event.addressSpaceIdValid = meta.traceIdentityValid;
+        event.asidHash = meta.traceAsidHash;
+        event.asidHashValid = meta.traceIdentityValid;
+    }
+    if (event_type == Event::FetchRequestTerminal) {
+        event.terminalReason = static_cast<uint32_t>(reason);
+        event.terminalReasonValid = true;
+    }
+    cpu->notifyBtbpTrace(event);
+}
+
+void
+Fetch::emitTraceDemandEvent(
+    branch_prediction::btb_pred::BtbpTraceEvent::EventType event_type,
+    ThreadID tid, const RequestPtr &req,
+    branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason)
+{
+    using Event = branch_prediction::btb_pred::BtbpTraceEvent;
+
+    if (!isTraceMode() || !req || !req->hasXsMetadata()) {
+        return;
+    }
+    const auto meta = req->getXsMetadata();
+    if (meta.traceRequestUid == 0 || meta.eipDemandId == 0) {
+        return;
+    }
+
+    Event event;
+    event.tick = curTick();
+    event.eventType = event_type;
+    event.threadId = tid;
+    event.requestKind = Event::DemandRequest;
+    event.requestKindValid = true;
+    event.requestUid = meta.traceRequestUid;
+    event.requestUidValid = true;
+    event.lookupUid = meta.traceLookupUid;
+    event.lookupUidValid = meta.traceLookupUid != 0;
+    event.fetchEpoch = meta.traceFetchEpoch;
+    event.fetchEpochValid = meta.traceFetchEpoch != 0;
+    event.demandUid = meta.eipDemandId;
+    event.demandUidValid = true;
+    event.ftqId = meta.traceFtqId;
+    event.ftqIdValid = meta.traceIdentityValid;
+    event.addressSpaceId = meta.traceAddressSpaceId;
+    event.addressSpaceIdValid = meta.traceIdentityValid;
+    event.asidHash = meta.traceAsidHash;
+    event.asidHashValid = meta.traceIdentityValid;
+    event.traceInstructionOrdinal = meta.traceInstructionOrdinal;
+    event.traceInstructionOrdinalValid =
+        meta.traceInstructionOrdinal != 0;
+    event.pathState = meta.tracePathWrong ?
+        Event::WrongPath : Event::CorrectPath;
+    event.pathStateValid = true;
+    event.lineSize = cacheBlkSize;
+    event.lineSizeValid = true;
+    if (req->hasVaddr()) {
+        event.virtualLineAddr = req->getVaddr() -
+            req->getVaddr() % cacheBlkSize;
+        event.virtualLineAddrValid = true;
+    }
+    if (req->hasPaddr()) {
+        event.lineAddr = req->getPaddr() - req->getPaddr() % cacheBlkSize;
+        event.lineAddrValid = true;
+    } else if (event.virtualLineAddrValid) {
+        event.lineAddr = event.virtualLineAddr;
+        event.lineAddrValid = true;
+    }
+    if (event_type == Event::L1IDemandAttempt &&
+        meta.traceDemandAttemptOrdinal != 0) {
+        event.demandAttemptOrdinal =
+            meta.traceDemandAttemptOrdinal - 1;
+        event.demandAttemptOrdinalValid = true;
+    }
+    if (event_type == Event::L1IDemandTerminal) {
+        event.terminalReason = static_cast<uint32_t>(reason);
+        event.terminalReasonValid = true;
+        switch (reason) {
+          case Event::TerminalReason::CacheHit:
+            event.supplySource = Event::CacheHitSupply;
+            event.supplySourceValid = true;
+            break;
+          case Event::TerminalReason::MergeWithPrefetch:
+            event.supplySource = Event::PrefetchFillSupply;
+            event.supplySourceValid = true;
+            break;
+          case Event::TerminalReason::Fill:
+          case Event::TerminalReason::MergeWithDemand:
+            event.supplySource = Event::DemandFillSupply;
+            event.supplySourceValid = true;
+            break;
+          default:
+            break;
+        }
+    }
+    if (meta.traceL1iVisibilityTick != 0) {
+        event.visibilityTick = meta.traceL1iVisibilityTick;
+        event.visibilityTickValid = true;
+    }
+    if (meta.l1iResidencyId != 0) {
+        event.residencyId = meta.l1iResidencyId;
+        event.residencyIdValid = true;
+    }
+    if (meta.instPrefetchDecisionId != 0) {
+        event.prefetchDecisionId = meta.instPrefetchDecisionId;
+        event.prefetchDecisionIdValid = true;
+        event.ownerPrefetchDecisionIds.push_back(
+            meta.instPrefetchDecisionId);
+    }
+    cpu->notifyBtbpTrace(event);
+}
+
+uint32_t
+Fetch::beginTraceDemandAttempt(ThreadID tid, const RequestPtr &req)
+{
+    using Event = branch_prediction::btb_pred::BtbpTraceEvent;
+
+    if (!isTraceMode() || !req || !req->hasXsMetadata()) {
+        return 0;
+    }
+    auto meta = req->getXsMetadata();
+    o3::TraceL1iDemandIdentity identity{
+        meta.traceRequestUid, meta.eipDemandId,
+        meta.traceDemandAttemptOrdinal, meta.traceDemandTerminalEmitted};
+    const uint32_t ordinal = identity.beginAttempt();
+    meta.traceDemandAttemptOrdinal = identity.attempts;
+    req->setXsMetadata(meta);
+    emitTraceDemandEvent(Event::L1IDemandAttempt, tid, req);
+    return ordinal;
+}
+
+void
+Fetch::closeTraceDemand(
+    ThreadID tid, const RequestPtr &req,
+    branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason)
+{
+    using Event = branch_prediction::btb_pred::BtbpTraceEvent;
+
+    if (!isTraceMode() || !req || !req->hasXsMetadata()) {
+        return;
+    }
+    auto meta = req->getXsMetadata();
+    o3::TraceL1iDemandIdentity identity{
+        meta.traceRequestUid, meta.eipDemandId,
+        meta.traceDemandAttemptOrdinal, meta.traceDemandTerminalEmitted};
+    if (!identity.close()) {
+        return;
+    }
+    meta.traceDemandTerminalEmitted = true;
+    meta.traceDemandOutcome = static_cast<uint32_t>(reason);
+    req->setXsMetadata(meta);
+    emitTraceDemandEvent(Event::L1IDemandTerminal, tid, req, reason);
+}
+
+void
+Fetch::closeTraceFetchRequest(
+    ThreadID tid,
+    branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason)
+{
+    using Event = branch_prediction::btb_pred::BtbpTraceEvent;
+
+    auto &cache_req = threads[tid].cacheReq;
+    if (!isTraceMode() || !cache_req.traceRequestOpened ||
+        cache_req.traceRequestTerminalEmitted) {
+        return;
+    }
+    emitTraceFetchRequest(Event::FetchRequestTerminal, tid, reason);
+    cache_req.traceRequestTerminalEmitted = true;
+}
+
+void
+Fetch::closeOutstandingTraceFetch(
+    ThreadID tid,
+    branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason)
+{
+    if (!isTraceMode()) {
+        return;
+    }
+    for (const auto &req : threads[tid].cacheReq.requests) {
+        closeTraceDemand(tid, req, reason);
+    }
+    closeTraceFetchRequest(tid, reason);
+}
+
+bool
+Fetch::traceInstructionBytesReady(
+    ThreadID tid, Addr instruction_pc, unsigned instruction_size) const
+{
+    const auto &buffer = threads[tid];
+    const auto &cache_req = buffer.cacheReq;
+    if (!buffer.valid || instruction_size == 0 ||
+        cache_req.getOverallStatus() != AccessComplete ||
+        instruction_pc < buffer.startPC ||
+        instruction_pc + instruction_size > buffer.startPC + fetchBufferSize) {
+        return false;
+    }
+
+    for (Addr byte = instruction_pc;
+         byte < instruction_pc + instruction_size; ++byte) {
+        bool covered = false;
+        for (size_t index = 0; index < cache_req.requests.size(); ++index) {
+            const auto &req = cache_req.requests[index];
+            if (!req || !req->hasVaddr() || !req->hasXsMetadata() ||
+                cache_req.requestStatus[index] != AccessComplete) {
+                continue;
+            }
+            const Addr begin = req->getVaddr();
+            const Addr end = begin + req->getSize();
+            const auto meta = req->getXsMetadata();
+            if (byte >= begin && byte < end &&
+                meta.traceL1iVisibilityTick != 0) {
+                covered = true;
+                break;
+            }
+        }
+        if (!covered) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void
+Fetch::emitTraceDecodeConsume(
+    ThreadID tid, Addr instruction_pc, unsigned instruction_size,
+    uint64_t trace_instruction_ordinal, bool wrong_path)
+{
+    using Event = branch_prediction::btb_pred::BtbpTraceEvent;
+
+    panic_if(!traceInstructionBytesReady(
+                 tid, instruction_pc, instruction_size),
+             "trace decode at %#llx lacks complete L1I supply provenance",
+             static_cast<unsigned long long>(instruction_pc));
+
+    unsigned emitted = 0;
+    const Addr instruction_end = instruction_pc + instruction_size;
+    for (const auto &req : threads[tid].cacheReq.requests) {
+        if (!req || !req->hasVaddr() || !req->hasXsMetadata()) {
+            continue;
+        }
+        const Addr request_begin = req->getVaddr();
+        const Addr request_end = request_begin + req->getSize();
+        if (instruction_end <= request_begin || instruction_pc >= request_end) {
+            continue;
+        }
+        const auto meta = req->getXsMetadata();
+        Event event;
+        event.tick = curTick();
+        event.eventType = Event::DecodeConsume;
+        event.threadId = tid;
+        event.requestKind = Event::DemandRequest;
+        event.requestKindValid = true;
+        event.requestUid = meta.traceRequestUid;
+        event.requestUidValid = meta.traceRequestUid != 0;
+        event.lookupUid = meta.traceLookupUid;
+        event.lookupUidValid = meta.traceLookupUid != 0;
+        event.fetchEpoch = meta.traceFetchEpoch;
+        event.fetchEpochValid = meta.traceFetchEpoch != 0;
+        event.demandUid = meta.eipDemandId;
+        event.demandUidValid = meta.eipDemandId != 0;
+        event.ftqId = meta.traceFtqId;
+        event.ftqIdValid = meta.traceIdentityValid;
+        event.addressSpaceId = meta.traceAddressSpaceId;
+        event.addressSpaceIdValid = meta.traceIdentityValid;
+        event.asidHash = meta.traceAsidHash;
+        event.asidHashValid = meta.traceIdentityValid;
+        event.traceInstructionOrdinal = trace_instruction_ordinal;
+        event.traceInstructionOrdinalValid =
+            trace_instruction_ordinal != 0;
+        event.visibilityTick = meta.traceL1iVisibilityTick;
+        event.visibilityTickValid = meta.traceL1iVisibilityTick != 0;
+        event.supplySource = Event::FetchBufferSupply;
+        event.supplySourceValid = true;
+        event.pathState = wrong_path ? Event::WrongPath : Event::CorrectPath;
+        event.pathStateValid = true;
+        event.lineSize = cacheBlkSize;
+        event.lineSizeValid = true;
+        event.virtualLineAddr = request_begin - request_begin % cacheBlkSize;
+        event.virtualLineAddrValid = true;
+        if (req->hasPaddr()) {
+            event.lineAddr = req->getPaddr() -
+                req->getPaddr() % cacheBlkSize;
+        } else {
+            event.lineAddr = event.virtualLineAddr;
+        }
+        event.lineAddrValid = true;
+        if (meta.l1iResidencyId != 0) {
+            event.residencyId = meta.l1iResidencyId;
+            event.residencyIdValid = true;
+        }
+        if (meta.instPrefetchDecisionId != 0) {
+            event.prefetchDecisionId = meta.instPrefetchDecisionId;
+            event.prefetchDecisionIdValid = true;
+            event.ownerPrefetchDecisionIds.push_back(
+                meta.instPrefetchDecisionId);
+        }
+        cpu->notifyBtbpTrace(event);
+        ++emitted;
+    }
+    panic_if(emitted == 0,
+             "trace decode at %#llx emitted no L1I supply event",
+             static_cast<unsigned long long>(instruction_pc));
 }
 
 void
@@ -1966,11 +2331,48 @@ Fetch::handleMultiCacheLineFetch(Addr vaddr, ThreadID tid, Addr pc)
     threads[tid].cacheReq.totalSize = fetchBufferSize;
 
     const auto &fetch_target = dbpbtb->ftqFetchingTarget(tid);
+    if (isTraceMode()) {
+        const auto request_identity =
+            dbpbtb->claimTraceRequestIdentity(tid);
+        panic_if(request_identity.fetchEpoch !=
+                     fetch_target.traceFetchEpoch,
+                 "trace fetch request epoch %llu differs from lookup epoch "
+                 "%llu for FTQ %llu",
+                 static_cast<unsigned long long>(
+                     request_identity.fetchEpoch),
+                 static_cast<unsigned long long>(
+                     fetch_target.traceFetchEpoch),
+                 static_cast<unsigned long long>(dbpbtb->ftqHeadId(tid)));
+        auto &cache_req = threads[tid].cacheReq;
+        cache_req.traceRequestUid = request_identity.requestUid;
+        cache_req.traceLookupUid = request_identity.lookupUid;
+        cache_req.traceFetchEpoch = request_identity.fetchEpoch;
+        cache_req.traceInstructionOrdinal =
+            pendingTraceInstructionOrdinal[tid];
+        cache_req.traceFtqId = dbpbtb->ftqHeadId(tid);
+        cache_req.traceAddressSpaceId = fetch_target.addressSpaceId;
+        cache_req.traceAsidHash = fetch_target.asidHash;
+        cache_req.tracePathWrong = pendingTracePathWrong[tid];
+        cache_req.traceRequestOpened = true;
+        emitTraceFetchRequest(
+            branch_prediction::btb_pred::BtbpTraceEvent::FetchRequestOpen,
+            tid);
+    }
     Request::XsMetadata trace_meta;
     trace_meta.traceIdentityValid = true;
     trace_meta.traceAddressSpaceId = fetch_target.addressSpaceId;
     trace_meta.traceAsidHash = fetch_target.asidHash;
     trace_meta.traceFtqId = dbpbtb->ftqHeadId(tid);
+    if (isTraceMode()) {
+        trace_meta.traceRequestUid =
+            threads[tid].cacheReq.traceRequestUid;
+        trace_meta.traceLookupUid = fetch_target.traceLookupUid;
+        trace_meta.traceFetchEpoch =
+            threads[tid].cacheReq.traceFetchEpoch;
+        trace_meta.traceInstructionOrdinal =
+            pendingTraceInstructionOrdinal[tid];
+        trace_meta.tracePathWrong = pendingTracePathWrong[tid];
+    }
 
     Addr fetchPC = vaddr;
     unsigned fetchSize = cacheBlkSize - fetchPC % cacheBlkSize;  // Size for first cache line
@@ -1993,6 +2395,9 @@ Fetch::handleMultiCacheLineFetch(Addr vaddr, ThreadID tid, Addr pc)
     first_mem_req->setReqNum(1);
 
     threads[tid].cacheReq.addRequest(first_mem_req); // packet will be created later
+    emitTraceDemandEvent(
+        branch_prediction::btb_pred::BtbpTraceEvent::L1IDemandIssue,
+        tid, first_mem_req);
 
     // Initiate translation for first request
     updateCacheRequestStatusByRequest(tid, first_mem_req, TlbWait);
@@ -2024,6 +2429,9 @@ Fetch::handleMultiCacheLineFetch(Addr vaddr, ThreadID tid, Addr pc)
     second_mem_req->setReqNum(2);
 
     threads[tid].cacheReq.addRequest(second_mem_req);  // Add second request to cache request
+    emitTraceDemandEvent(
+        branch_prediction::btb_pred::BtbpTraceEvent::L1IDemandIssue,
+        tid, second_mem_req);
 
     DPRINTF(Fetch, "[tid:%i] Initiating translation for second cache line\n", tid);
 
@@ -2052,7 +2460,23 @@ Fetch::processMultiCacheLineCompletion(ThreadID tid, PacketPtr pkt)
             DPRINTF(Fetch, "req[%d]=0x%lx ", i, threads[tid].cacheReq.requests[i]->getVaddr());
         }
         DPRINTF(Fetch, "\n");
+        delete pkt;
         return false;
+    }
+
+    if (isTraceMode() && pkt->req->hasXsMetadata()) {
+        auto meta = pkt->req->getXsMetadata();
+        meta.traceL1iVisibilityTick = curTick();
+        pkt->req->setXsMetadata(meta);
+        auto reason = static_cast<
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason>(
+                meta.traceDemandOutcome);
+        if (reason == branch_prediction::btb_pred::BtbpTraceEvent::
+                TerminalReason::Unknown) {
+            reason = branch_prediction::btb_pred::BtbpTraceEvent::
+                TerminalReason::Fill;
+        }
+        closeTraceDemand(tid, pkt->req, reason);
     }
 
     DPRINTF(Fetch, "[tid:%i] Packet successfully matched and stored. Current status: %s\n",
@@ -2078,6 +2502,9 @@ Fetch::processMultiCacheLineCompletion(ThreadID tid, PacketPtr pkt)
             const bool sameThreadRetry = queuedTid == tid &&
                 threads[tid].cacheReq.findRequestIndex(queuedPkt->req) != SIZE_MAX;
 
+            if (sameThreadRetry) {
+                beginTraceDemandAttempt(tid, queuedPkt->req);
+            }
             if (sameThreadRetry && icachePort.sendTimingReq(queuedPkt)) {
                 DPRINTF(Fetch,
                         "[tid:%i] Retrying matching queued I-cache packet %#lx "
@@ -2117,6 +2544,31 @@ Fetch::processMultiCacheLineCompletion(ThreadID tid, PacketPtr pkt)
     memcpy(threads[tid].data, firstPkt->getConstPtr<uint8_t>(), firstPkt->getSize());
     memcpy(threads[tid].data + firstPkt->getSize(), secondPkt->getConstPtr<uint8_t>(), secondPkt->getSize());
     threads[tid].valid = true;
+
+    if (isTraceMode()) {
+        using TerminalReason = branch_prediction::btb_pred::BtbpTraceEvent::
+            TerminalReason;
+        TerminalReason request_reason = TerminalReason::CacheHit;
+        for (const auto &req : threads[tid].cacheReq.requests) {
+            if (!req || !req->hasXsMetadata()) {
+                request_reason = TerminalReason::Fill;
+                break;
+            }
+            const auto reason = static_cast<TerminalReason>(
+                req->getXsMetadata().traceDemandOutcome);
+            if (reason == TerminalReason::MergeWithPrefetch) {
+                request_reason = reason;
+                break;
+            }
+            if (reason == TerminalReason::MergeWithDemand) {
+                request_reason = reason;
+            } else if (reason != TerminalReason::CacheHit &&
+                       request_reason == TerminalReason::CacheHit) {
+                request_reason = TerminalReason::Fill;
+            }
+        }
+        closeTraceFetchRequest(tid, request_reason);
+    }
 
     // Clean up the packets
     delete firstPkt;
@@ -2486,7 +2938,9 @@ Fetch::handleSuccessfulTranslation(ThreadID tid, const RequestPtr &mem_req, Addr
         return;
     }
 
-    // Access the cache.
+    // Access the cache. Each sendTimingReq call is one attempt of the same
+    // logical demand; retries keep the request and demand UIDs.
+    beginTraceDemandAttempt(tid, mem_req);
     if (!icachePort.sendTimingReq(data_pkt)) {
         DPRINTF(Fetch, "[tid:%i] Out of MSHRs!\n", tid);
 
@@ -2537,7 +2991,21 @@ Fetch::handleTranslationFault(ThreadID tid, const RequestPtr &mem_req, const Fau
     updateCacheRequestStatusByRequest(tid, mem_req, AccessFailed);
 
     // Translation faulted, icache request won't be sent.
+    if (isTraceMode()) {
+        using TerminalReason = branch_prediction::btb_pred::BtbpTraceEvent::
+            TerminalReason;
+        for (const auto &req : threads[tid].cacheReq.requests) {
+            closeTraceDemand(
+                tid, req, req == mem_req ? TerminalReason::TranslationFault :
+                                            TerminalReason::Dropped);
+        }
+        closeTraceFetchRequest(tid, TerminalReason::TranslationFault);
+    }
     threads[tid].cacheReq.reset();
+    pendingTraceInstructionOrdinal[tid] = 0;
+    pendingTraceInstructionPc[tid] = 0;
+    pendingTracePathWrong[tid] = false;
+    pendingTraceSupplyValid[tid] = false;
 
     // Send the fault to commit.  This thread will not do anything
     // until commit handles the fault.  The only other way it can
@@ -2680,12 +3148,19 @@ Fetch::doSquash(PCStateBase &new_pc, const DynInstPtr squashInst, const InstSeqN
     DPRINTF(Fetch, "[tid:%i] Squash: clear cacheReq, current fetchStatus[tid]=%d\n", tid, fetchStatus[tid]);
 
     // Cancel all active cache requests in new status system
+    closeOutstandingTraceFetch(
+        tid,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::Squash);
     threads[tid].cacheReq.cancelAllRequests();
     DPRINTF(Fetch, "[tid:%i] Squash: cancelled all cache requests, status: %s\n",
             tid, threads[tid].cacheReq.getStatusSummary().c_str());
 
     // Reset the cache request after cancelling
     threads[tid].cacheReq.reset();
+    pendingTraceInstructionOrdinal[tid] = 0;
+    pendingTraceInstructionPc[tid] = 0;
+    pendingTracePathWrong[tid] = false;
+    pendingTraceSupplyValid[tid] = false;
     ++fdipEpoch[tid];
     resetFdipPartialState(tid);
 
@@ -2831,6 +3306,12 @@ Fetch::tick()
     if (btbpRoiDrainMode && !btbpRoiDrainExitRequested &&
         curTick() > btbpRoiDrainBeginTick &&
         instPrefetchOutstandingLines == 0) {
+        for (ThreadID tid = 0; tid < numThreads; ++tid) {
+            closeOutstandingTraceFetch(
+                tid, branch_prediction::btb_pred::BtbpTraceEvent::
+                         TerminalReason::RetainedAtDrain);
+            dbpbtb->closeTraceLookupsAtRoiEnd(tid);
+        }
         const unsigned closed = fdipIcacheAccessor ?
             fdipIcacheAccessor->closeBtbpRoiResidencies() : 0;
         inform("BTBP ROI_DRAIN_CLOSED_RESIDENCIES count=%u", closed);
@@ -3733,6 +4214,10 @@ Fetch::sendNextCacheRequest(ThreadID tid, const PCStateBase &pc_state) {
         return;
     }
 
+    if (isTraceMode() && !pendingTraceSupplyValid[tid]) {
+        return;
+    }
+
     if (ftqEmpty(tid)) {
         ++fetchStats.smtftqempty[tid];
         DPRINTF(Fetch, "[tid:%i] No FSQ entry available for next fetch\n", tid);
@@ -3743,6 +4228,17 @@ Fetch::sendNextCacheRequest(ThreadID tid, const PCStateBase &pc_state) {
     const auto &stream = dbpbtb->ftqFetchingTarget(tid);
     const Addr start_pc = stream.startPC;
     const Addr current_pc = pc_state.instAddr();
+    if (isTraceMode()) {
+        panic_if(pendingTraceInstructionPc[tid] < stream.startPC ||
+                     pendingTraceInstructionPc[tid] >= stream.predEndPC,
+                 "trace supply PC %#llx is outside FTQ %llu range "
+                 "[%#llx, %#llx)",
+                 static_cast<unsigned long long>(
+                     pendingTraceInstructionPc[tid]),
+                 static_cast<unsigned long long>(dbpbtb->ftqHeadId(tid)),
+                 static_cast<unsigned long long>(stream.startPC),
+                 static_cast<unsigned long long>(stream.predEndPC));
+    }
     threads[tid].startPC = start_pc;
 
     if (current_pc < stream.startPC ||
@@ -3782,11 +4278,12 @@ Fetch::retryPendingIcacheRequests()
 {
     while (!retryPkt.empty()) {
         PacketPtr pkt = retryPkt.front();
+        const ThreadID tid = cpu->contextToThread(pkt->req->contextId());
+        beginTraceDemandAttempt(tid, pkt->req);
         if (!icachePort.sendTimingReq(pkt)) {
             return;
         }
 
-        const ThreadID tid = cpu->contextToThread(pkt->req->contextId());
         updateCacheRequestStatusByRequest(tid, pkt->req, CacheWaitResponse);
         ppFetchRequestSent->notify(pkt->req);
         retryPkt.erase(retryPkt.begin());

@@ -183,6 +183,33 @@ buildBtbpTraceEntry(const BtbpTraceEvent &event, uint64_t eventSeq)
     if (event.replacementValid) {
         entry.set_replacement(event.replacement);
     }
+    if (event.requestUidValid) {
+        entry.set_request_uid(event.requestUid);
+    }
+    if (event.lookupUidValid) {
+        entry.set_lookup_uid(event.lookupUid);
+    }
+    if (event.fetchEpochValid) {
+        entry.set_fetch_epoch(event.fetchEpoch);
+    }
+    if (event.demandAttemptOrdinalValid) {
+        entry.set_demand_attempt_ordinal(event.demandAttemptOrdinal);
+    }
+    if (event.traceInstructionOrdinalValid) {
+        entry.set_trace_instruction_ordinal(event.traceInstructionOrdinal);
+    }
+    if (event.visibilityTickValid) {
+        entry.set_visibility_tick(event.visibilityTick);
+    }
+    if (event.supplySourceValid) {
+        entry.set_supply_source(event.supplySource);
+    }
+    if (event.pathStateValid) {
+        entry.set_path_state(event.pathState);
+    }
+    for (const uint64_t owner : event.ownerPrefetchDecisionIds) {
+        entry.add_owner_prefetch_decision_ids(owner);
+    }
     return entry;
 }
 

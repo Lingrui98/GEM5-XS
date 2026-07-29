@@ -14,6 +14,7 @@
 #include "base/types.hh"
 #include "cpu/o3/cpu_def.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/trace/TraceL1iIdentity.hh"
 #include "cpu/pred/bpred_unit.hh"
 #include "cpu/pred/btb/abtb.hh"
 #include "cpu/pred/btb/btb_ittage.hh"
@@ -137,6 +138,7 @@ class DecoupledBPUWithBTB : public BPredUnit
     unsigned smtFTQThreshold;
 
     FetchTargetQueue ftq;
+    o3::TraceL1iIdentityGenerator traceL1iIdentityGenerator;
 
     struct
     {
@@ -185,6 +187,26 @@ class DecoupledBPUWithBTB : public BPredUnit
     void processNewPrediction(ThreadID tid);
 
     FetchTarget createFetchTargetEntry(ThreadID tid);
+
+    void emitTraceLookupTerminal(
+        FetchTarget &target, FetchTargetId ftqId,
+        BtbpTraceEvent::TerminalReason reason,
+        BtbpTraceEvent::PathState pathState);
+
+    void emitPendingTraceLookupTerminal(
+        ThreadID tid, BtbpTraceEvent::TerminalReason reason,
+        BtbpTraceEvent::PathState pathState);
+
+    void emitUnissuedTraceRequestClosure(
+        ThreadID tid, uint64_t requestUid, uint64_t lookupUid,
+        uint64_t fetchEpoch, FetchTargetId ftqId, Addr startPc,
+        uint64_t addressSpaceId, uint8_t asidHash,
+        BtbpTraceEvent::PathState pathState);
+
+    void closeTraceLookupsFrom(
+        ThreadID tid, FetchTargetId firstId,
+        BtbpTraceEvent::TerminalReason reason,
+        BtbpTraceEvent::PathState pathState);
 
     void updateHistoryForPrediction(FetchTarget &entry);
 
@@ -385,6 +407,7 @@ class DecoupledBPUWithBTB : public BPredUnit
 
     void setCpu(CPU *_cpu);
     uint64_t getThreadAddressSpaceId(ThreadID tid) const;
+    o3::TraceL1iFetchIdentity claimTraceRequestIdentity(ThreadID tid);
 
     void consumeFetchTarget(unsigned fetched_inst_num, ThreadID tid);
 
@@ -454,6 +477,8 @@ class DecoupledBPUWithBTB : public BPredUnit
                     const PCStateBase &inst_pc, ThreadID tid, const unsigned &currentLoopIter);
 
     void commit(unsigned fsqID, ThreadID tid);
+
+    void closeTraceLookupsAtRoiEnd(ThreadID tid);
 
     bool fdipEnabled() const
     {

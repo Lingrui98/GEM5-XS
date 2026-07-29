@@ -2,15 +2,21 @@ syntax = "proto2";
 
 package ProtoMessage;
 
-// Schema v6 event type:
+// Schema v7 event type:
 // 1=mbtb_lookup, 2=mbtb_fill, 3=iprefetch_issue, 4=line_lifecycle,
 // 5=l1i_demand_access, 6=decode_branch, 7=branch_demand,
 // 8=iprefetch_decision_accepted, 9=iprefetch_terminal,
 // 10=l1i_mshr_occupancy, 11=l1i_line_evict, 12=roi_begin, 13=roi_end,
-// 14=iprefetch_gate_attempt.
+// 14=iprefetch_gate_attempt, 15=fetch_request_open,
+// 16=fetch_request_terminal, 17=l1i_demand_issue,
+// 18=l1i_demand_attempt, 19=l1i_demand_terminal,
+// 20=decode_consume, 21=lookup_terminal.
 // terminal_reason: 0=unknown, 1=completed, 2=translation_fault,
 // 3=uncacheable, 4=cache_or_merge_completion, 5=queue_full_completion,
-// 6=reset_canceled, 7=policy_filtered.
+// 6=reset_canceled, 7=policy_filtered, 8=commit, 9=squash,
+// 10=roi_end, 11=cache_hit, 12=fill, 13=merge_with_demand,
+// 14=merge_with_prefetch, 15=dropped, 16=blocked, 17=evicted,
+// 18=invalidated, 19=retained_at_drain, 20=not_applicable.
 // lifecycle_kind: 0=unknown, 1=prefetch_fill, 2=demand_fill,
 // 3=demand_use, 4=evict_or_invalidate, 5=roi_drain_close,
 // 6=same_line_refill.
@@ -66,4 +72,13 @@ message BtbpTraceEntry {
   optional uint32 incoming_prefetch_source = 47;
   optional bool prefetch_owned_mshr = 48;
   optional bool replacement = 49;
+  optional uint64 request_uid = 50;
+  optional uint64 lookup_uid = 51;
+  optional uint64 fetch_epoch = 52;
+  optional uint32 demand_attempt_ordinal = 53;
+  optional uint64 trace_instruction_ordinal = 54;
+  optional uint64 visibility_tick = 55;
+  optional uint32 supply_source = 56;
+  optional uint32 path_state = 57;
+  repeated uint64 owner_prefetch_decision_ids = 58;
 }

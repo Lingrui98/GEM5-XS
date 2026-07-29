@@ -73,6 +73,7 @@ btbpTraceRouteClass(uint32_t eventType)
 {
     switch (eventType) {
       case BtbpTraceEvent::MbtbLookup:
+      case BtbpTraceEvent::LookupTerminal:
         return BtbpTraceRouteClass::MbtbLookup;
       case BtbpTraceEvent::MbtbFill:
         return BtbpTraceRouteClass::MbtbFill;
@@ -88,6 +89,12 @@ btbpTraceRouteClass(uint32_t eventType)
       case BtbpTraceEvent::RoiEnd:
         return BtbpTraceRouteClass::LineLifecycle;
       case BtbpTraceEvent::L1IDemandAccess:
+      case BtbpTraceEvent::FetchRequestOpen:
+      case BtbpTraceEvent::FetchRequestTerminal:
+      case BtbpTraceEvent::L1IDemandIssue:
+      case BtbpTraceEvent::L1IDemandAttempt:
+      case BtbpTraceEvent::L1IDemandTerminal:
+      case BtbpTraceEvent::DecodeConsume:
         return BtbpTraceRouteClass::L1IDemandAccess;
       case BtbpTraceEvent::DecodeBranch:
         return BtbpTraceRouteClass::DecodeBranch;

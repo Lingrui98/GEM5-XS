@@ -647,6 +647,33 @@ class Fetch
         branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason =
             branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
                 Unknown);
+    void emitTraceFetchRequest(
+        branch_prediction::btb_pred::BtbpTraceEvent::EventType eventType,
+        ThreadID tid,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason =
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                Unknown);
+    void emitTraceDemandEvent(
+        branch_prediction::btb_pred::BtbpTraceEvent::EventType eventType,
+        ThreadID tid, const RequestPtr &req,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason =
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                Unknown);
+    uint32_t beginTraceDemandAttempt(ThreadID tid, const RequestPtr &req);
+    void closeTraceDemand(
+        ThreadID tid, const RequestPtr &req,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason);
+    void closeTraceFetchRequest(
+        ThreadID tid,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason);
+    void closeOutstandingTraceFetch(
+        ThreadID tid,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason);
+    void emitTraceDecodeConsume(
+        ThreadID tid, Addr instructionPc, unsigned instructionSize,
+        uint64_t traceInstructionOrdinal, bool wrongPath);
+    bool traceInstructionBytesReady(
+        ThreadID tid, Addr instructionPc, unsigned instructionSize) const;
     bool acceptEipCandidate(
         ThreadID tid, const EntanglingPrefetcher::Candidate &candidate,
         const Request::XsMetadata &triggerMeta);
@@ -944,8 +971,26 @@ class Fetch
         /** Number of completed packets received */
         unsigned completedPackets;
 
+        uint64_t traceRequestUid;
+        uint64_t traceLookupUid;
+        uint64_t traceFetchEpoch;
+        uint64_t traceInstructionOrdinal;
+        uint64_t traceFtqId;
+        uint64_t traceAddressSpaceId;
+        uint8_t traceAsidHash;
+        bool tracePathWrong;
+        bool traceRequestOpened;
+        bool traceRequestTerminalEmitted;
+
         /** Constructor */
-        CacheRequest() : baseAddr(0), totalSize(0), completedPackets(0) {}
+        CacheRequest()
+            : baseAddr(0), totalSize(0), completedPackets(0),
+              traceRequestUid(0), traceLookupUid(0), traceFetchEpoch(0),
+              traceInstructionOrdinal(0), traceFtqId(0),
+              traceAddressSpaceId(0), traceAsidHash(0),
+              tracePathWrong(false), traceRequestOpened(false),
+              traceRequestTerminalEmitted(false)
+        {}
 
         /** Check if all packets have been completed */
         bool allCompleted() const {
@@ -995,6 +1040,16 @@ class Fetch
             baseAddr = 0;
             totalSize = 0;
             completedPackets = 0;
+            traceRequestUid = 0;
+            traceLookupUid = 0;
+            traceFetchEpoch = 0;
+            traceInstructionOrdinal = 0;
+            traceFtqId = 0;
+            traceAddressSpaceId = 0;
+            traceAsidHash = 0;
+            tracePathWrong = false;
+            traceRequestOpened = false;
+            traceRequestTerminalEmitted = false;
         }
 
         /** Add a new request */
@@ -1230,6 +1285,10 @@ class Fetch
     uint64_t nextInstPrefetchAttemptId = 1;
     uint64_t nextInstPrefetchDecisionId = 1;
     uint64_t nextL1iDemandUid = 1;
+    uint64_t pendingTraceInstructionOrdinal[MaxThreads]{};
+    Addr pendingTraceInstructionPc[MaxThreads]{};
+    bool pendingTracePathWrong[MaxThreads]{};
+    bool pendingTraceSupplyValid[MaxThreads]{};
     CacheAccessor *fdipIcacheAccessor = nullptr;
     bool btbpRoiActive = false;
     bool btbpRoiDrainMode = false;

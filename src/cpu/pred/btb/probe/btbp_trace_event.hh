@@ -1,6 +1,8 @@
 #ifndef __CPU_PRED_BTB_PROBE_BTBP_TRACE_EVENT_HH__
 #define __CPU_PRED_BTB_PROBE_BTBP_TRACE_EVENT_HH__
 
+#include <vector>
+
 #include "base/types.hh"
 
 namespace gem5
@@ -12,7 +14,7 @@ namespace btb_pred
 
 struct BtbpTraceEvent
 {
-    static constexpr uint32_t SchemaVersion = 6;
+    static constexpr uint32_t SchemaVersion = 7;
 
     enum EventType : uint32_t
     {
@@ -30,6 +32,13 @@ struct BtbpTraceEvent
         RoiBegin = 12,
         RoiEnd = 13,
         IPrefetchGateAttempt = 14,
+        FetchRequestOpen = 15,
+        FetchRequestTerminal = 16,
+        L1IDemandIssue = 17,
+        L1IDemandAttempt = 18,
+        L1IDemandTerminal = 19,
+        DecodeConsume = 20,
+        LookupTerminal = 21,
     };
 
     enum class TerminalReason : uint32_t
@@ -42,6 +51,19 @@ struct BtbpTraceEvent
         QueueFullCompletion = 5,
         ResetCanceled = 6,
         PolicyFiltered = 7,
+        Commit = 8,
+        Squash = 9,
+        RoiEnd = 10,
+        CacheHit = 11,
+        Fill = 12,
+        MergeWithDemand = 13,
+        MergeWithPrefetch = 14,
+        Dropped = 15,
+        Blocked = 16,
+        Evicted = 17,
+        Invalidated = 18,
+        RetainedAtDrain = 19,
+        NotApplicable = 20,
     };
 
     enum class LifecycleKind : uint32_t
@@ -83,6 +105,23 @@ struct BtbpTraceEvent
         DirectBranch = 1,
         IndirectBranch = 2,
         ReturnBranch = 3,
+    };
+
+    enum SupplySource : uint32_t
+    {
+        UnknownSupply = 0,
+        DemandFillSupply = 1,
+        PrefetchFillSupply = 2,
+        FetchBufferSupply = 3,
+        CacheHitSupply = 4,
+    };
+
+    enum PathState : uint32_t
+    {
+        UnresolvedPath = 0,
+        CorrectPath = 1,
+        WrongPath = 2,
+        NotApplicablePath = 3,
     };
 
     Tick tick = 0;
@@ -175,6 +214,23 @@ struct BtbpTraceEvent
     bool prefetchOwnedMshrValid = false;
     bool replacement = false;
     bool replacementValid = false;
+    uint64_t requestUid = 0;
+    bool requestUidValid = false;
+    uint64_t lookupUid = 0;
+    bool lookupUidValid = false;
+    uint64_t fetchEpoch = 0;
+    bool fetchEpochValid = false;
+    uint32_t demandAttemptOrdinal = 0;
+    bool demandAttemptOrdinalValid = false;
+    uint64_t traceInstructionOrdinal = 0;
+    bool traceInstructionOrdinalValid = false;
+    Tick visibilityTick = 0;
+    bool visibilityTickValid = false;
+    uint32_t supplySource = UnknownSupply;
+    bool supplySourceValid = false;
+    uint32_t pathState = UnresolvedPath;
+    bool pathStateValid = false;
+    std::vector<uint64_t> ownerPrefetchDecisionIds;
 };
 
 } // namespace btb_pred

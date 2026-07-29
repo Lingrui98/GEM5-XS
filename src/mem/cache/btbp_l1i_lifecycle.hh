@@ -129,6 +129,18 @@ class BtbpL1iLifecycleLedger
         return drained;
     }
 
+    std::vector<std::pair<LineKey, Residency>> drainAll()
+    {
+        std::vector<std::pair<LineKey, Residency>> drained;
+        drained.reserve(activeByLine.size());
+        for (const auto &current : activeByLine) {
+            drained.emplace_back(current.first, current.second);
+        }
+        activeByLine.clear();
+        lineByResidency.clear();
+        return drained;
+    }
+
     std::size_t size() const
     {
         return activeByLine.size();

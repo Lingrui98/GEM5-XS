@@ -152,7 +152,9 @@ class TraceFetch
     StallReason fetchTraceInstruction(ThreadID tid, PCStateBase &this_pc);
     void supplyTraceToDecoder(ThreadID tid, const PCStateBase &this_pc,
                               TheISA::MachInst machInst, Addr instrPC,
-                              const char *tag);
+                              unsigned instrSize,
+                              uint64_t traceInstructionOrdinal,
+                              bool wrongPath, const char *tag);
 
     void enterTraceWrongPath(ThreadID tid, InstSeqNum branchSeqNum, Addr predPC,
                              Addr corrPC, bool forceMinStep,
@@ -251,6 +253,13 @@ class TraceFetch
 
     bool pendingTraceValid = false;
     o3::TraceInstruction pendingTraceInstr;
+
+    bool traceSupplyPendingValid[MaxThreads]{};
+    Addr traceSupplyPendingPc[MaxThreads]{};
+    unsigned traceSupplyPendingSize[MaxThreads]{};
+    uint64_t traceSupplyPendingOrdinal[MaxThreads]{};
+    bool traceSupplyPendingWrongPath[MaxThreads]{};
+    uint64_t nextWrongPathInstructionOrdinal[MaxThreads]{};
 
     std::vector<o3::TraceReader::TraceCheckpoint> traceCheckpoints;
     std::vector<InstSeqNum> checkpointSeqNums;

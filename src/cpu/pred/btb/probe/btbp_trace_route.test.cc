@@ -86,6 +86,20 @@ TEST(BtbpTraceRouteTest, EveryOtherDeclaredTypeHasItsOwnRouteClass)
               Route::DecodeBranch);
     EXPECT_EQ(btbpTraceRouteClass(BtbpTraceEvent::BranchDemand),
               Route::BranchDemand);
+    EXPECT_EQ(btbpTraceRouteClass(BtbpTraceEvent::LookupTerminal),
+              Route::MbtbLookup);
+    EXPECT_EQ(btbpTraceRouteClass(BtbpTraceEvent::FetchRequestOpen),
+              Route::L1IDemandAccess);
+    EXPECT_EQ(btbpTraceRouteClass(BtbpTraceEvent::FetchRequestTerminal),
+              Route::L1IDemandAccess);
+    EXPECT_EQ(btbpTraceRouteClass(BtbpTraceEvent::L1IDemandIssue),
+              Route::L1IDemandAccess);
+    EXPECT_EQ(btbpTraceRouteClass(BtbpTraceEvent::L1IDemandAttempt),
+              Route::L1IDemandAccess);
+    EXPECT_EQ(btbpTraceRouteClass(BtbpTraceEvent::L1IDemandTerminal),
+              Route::L1IDemandAccess);
+    EXPECT_EQ(btbpTraceRouteClass(BtbpTraceEvent::DecodeConsume),
+              Route::L1IDemandAccess);
 }
 
 // Contract §4.2/§5.3: an unsupported or uninitialized eventType must not be
@@ -98,7 +112,7 @@ TEST(BtbpTraceRouteTest, UnsupportedValuesAreNotRoutable)
 {
     EXPECT_EQ(btbpTraceRouteClass(0), Route::Unsupported);
     EXPECT_EQ(btbpTraceRouteClass(99), Route::Unsupported);
-    EXPECT_EQ(btbpTraceRouteClass(15), Route::Unsupported);
+    EXPECT_EQ(btbpTraceRouteClass(22), Route::Unsupported);
 }
 
 // Contract §4.3 + §5.4: FDIP issue attempt-identity repair.

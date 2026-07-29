@@ -1145,7 +1145,7 @@ class BaseCache : public ClockedObject, public CacheAccessor
         branch_prediction::btb_pred::BtbpTraceEvent event;
     };
 
-    /** Prefetch residencies whose accepting decisions originated in ROI. */
+    /** Trace records for every active physical L1I residency. */
     std::unordered_map<uint64_t, BtbpRoiResidency> btbpRoiResidencies;
 
     /** Measurement-only source of truth for active physical L1I lines. */

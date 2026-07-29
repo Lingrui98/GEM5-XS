@@ -311,6 +311,19 @@ MBTB::putPCHistory(Addr startAddr,
     lookup_event.tick = curTick();
     lookup_event.eventType = BtbpTraceEvent::MbtbLookup;
     lookup_event.threadId = stagePreds.empty() ? 0 : stagePreds.front().tid;
+    if (!stagePreds.empty()) {
+        lookup_event.requestUid = stagePreds.front().traceRequestUid;
+        lookup_event.requestUidValid =
+            stagePreds.front().traceRequestUid != 0;
+        lookup_event.lookupUid = stagePreds.front().traceLookupUid;
+        lookup_event.lookupUidValid =
+            stagePreds.front().traceLookupUid != 0;
+        lookup_event.fetchEpoch = stagePreds.front().traceFetchEpoch;
+        lookup_event.fetchEpochValid =
+            stagePreds.front().traceFetchEpoch != 0;
+        lookup_event.pathState = BtbpTraceEvent::UnresolvedPath;
+        lookup_event.pathStateValid = true;
+    }
     lookup_event.hit = !processed_entries.empty();
     lookup_event.hitValid = true;
     if (!processed_entries.empty()) {
