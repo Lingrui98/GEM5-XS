@@ -15,7 +15,7 @@
   "branch": "sway/d6-substrate-rework",
   "base_branch": "sway/phase-stranded-probe",
   "worktree_path": "/nfs/home/goulingrui/project/GEM5-sway",
-  "current_phase": "Stage 4 E1-prime closed 2026-07-29: kill predicate NOT met (gcc_pp_O2 T3+100% +1.074/+1.032 on 2 offsets); geomean +0.42%. Awaiting glr: DA-2 dynamic recovery vs stop (Layer 4)",
+  "current_phase": "Stage 4 E1-trace closed 2026-07-29: srv regime flat too (1/30 crosser, geomean +0.173%); total evidence 2/35 workloads >=1%. Layer-4 decision pending glr (stop favored)",
   "next_action": [
     {
       "phase": "D0-prep",

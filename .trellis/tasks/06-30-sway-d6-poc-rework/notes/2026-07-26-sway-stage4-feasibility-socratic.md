@@ -99,3 +99,12 @@ E1′（正确 T3 `tableSizes[3]=4096`，config.ini 逐项盘证下标无误）�
 - **kill 判据不成立**：gcc_pp_O2 两个 offset 均 ≥1%（+1.074 / +1.032），按预注册进入 live 路径：frozen-z 守卫（方案 b）→ DA-2 动态恢复测试（≥70%）。
 - **但效应集中于单一 workload**（gcc 家族），修正后 best-arm geomean ≈ +0.42%，Layer-1 的 "≥1% geomean" 仍未达；非单调性确认（perlbench_spam T3+50% > T3+100%；mcf 负单调）。
 - **Layer 4 待 glr**：是否投入 frozen-z 守卫 + gcc_pp_O2 最小闭环动态恢复测试（预计 SWAY 实际交付 3072 entries < 静态 +4096，70% 恢复 ≈ +0.75% 单 workload），还是按"geomean 不达"就此止步。两条路都符合预注册；方向清单预注册要求不变。
+
+## 9. E1-trace（2026-07-29）：srv regime 同样不给设计点一个家
+
+glr 指出数据集多样性不足（= codex MAJOR-4），批准 30 srv × 5 arms（150 runs，taskpool tag `sway-stage4-e1trace-20260729`，全部 succeeded，契约 `runs/stage4_e1trace/README.md`）：
+
+- ≥1% trace：**1/30**（srv_11 t3p50 +1.558%，且非单调 t3p100 +0.003%——阈值伪影）；冻结判读需 ≥3 → 未达
+- family geomean of best-arm：**+0.173%**；median +0.114%；T3/T7 胜场 17/13（T7 在 server regime 同样无主场）
+- **全证据链**：SPEC 1/5 过线（gcc_pp_O2 +1.07/+1.03 复现）+ srv 1/30 过线 = **2/35（5.7%），geomean ~+0.2-0.4%**。TAGE 容量故事无可防御宽基，T7 两 regime 皆死。
+- 对 Layer-4 的含义：效应不泛化。DA-2 即使满分（gcc_pp_O2 单点 ~+0.75%）也救不了 geomean——"DA-2 vs 止步"的权衡向**止步**倾斜。
