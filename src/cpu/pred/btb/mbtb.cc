@@ -304,7 +304,45 @@ MBTB::putPCHistory(Addr startAddr,
 
     // Process BTB entries
     auto processed_entries = processEntries(find_entries, startAddr);
-    
+    meta->lookupTick = curTick();
+
+#ifndef UNIT_TEST
+    BtbpTraceEvent lookup_event;
+    lookup_event.tick = curTick();
+    lookup_event.eventType = BtbpTraceEvent::MbtbLookup;
+    lookup_event.threadId = stagePreds.empty() ? 0 : stagePreds.front().tid;
+    if (!stagePreds.empty()) {
+        lookup_event.requestUid = stagePreds.front().traceRequestUid;
+        lookup_event.requestUidValid =
+            stagePreds.front().traceRequestUid != 0;
+        lookup_event.lookupUid = stagePreds.front().traceLookupUid;
+        lookup_event.lookupUidValid =
+            stagePreds.front().traceLookupUid != 0;
+        lookup_event.fetchEpoch = stagePreds.front().traceFetchEpoch;
+        lookup_event.fetchEpochValid =
+            stagePreds.front().traceFetchEpoch != 0;
+        lookup_event.pathState = BtbpTraceEvent::UnresolvedPath;
+        lookup_event.pathStateValid = true;
+    }
+    lookup_event.hit = !processed_entries.empty();
+    lookup_event.hitValid = true;
+    if (!processed_entries.empty()) {
+        lookup_event.branchPc = processed_entries.front().pc;
+        lookup_event.branchPcValid = true;
+        lookup_event.target = processed_entries.front().target;
+        lookup_event.targetValid = true;
+    }
+    lookup_event.streamStartPc = startAddr;
+    lookup_event.streamStartPcValid = true;
+    if (!stagePreds.empty()) {
+        lookup_event.addressSpaceId = stagePreds.front().addressSpaceId;
+        lookup_event.addressSpaceIdValid = true;
+        lookup_event.asidHash = stagePreds.front().asidHash;
+        lookup_event.asidHashValid = true;
+    }
+    notifyBtbpTrace(lookup_event);
+#endif
+
     // Fill predictions for each pipeline stage
     fillStagePredictions(processed_entries, stagePreds);
     

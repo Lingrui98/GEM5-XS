@@ -60,7 +60,8 @@ MSHRQueue::MSHRQueue(const std::string &_label,
       demandReserve(demand_reserve),
       occupancyStartTick(curTick()),
       occupancyLastUpdate(curTick()),
-      occupancyEntryTicks(0)
+      occupancyEntryTicks(0),
+      occupancyFullTicks(0)
 {}
 
 void
@@ -70,6 +71,9 @@ MSHRQueue::updateOccupancyStats(Tick now)
         occupancyEntryTicks +=
             static_cast<Counter>(allocated) *
             static_cast<Counter>(now - occupancyLastUpdate);
+        if (allocated == numEntries) {
+            occupancyFullTicks += now - occupancyLastUpdate;
+        }
     }
     occupancyLastUpdate = now;
 }
@@ -112,6 +116,7 @@ MSHRQueue::resetOccupancyStats(Tick now)
     occupancyStartTick = now;
     occupancyLastUpdate = now;
     occupancyEntryTicks = 0;
+    occupancyFullTicks = 0;
 }
 
 Counter
@@ -121,6 +126,16 @@ MSHRQueue::getOccupancyEntryTicks(Tick now) const
     if (now > occupancyLastUpdate) {
         total += static_cast<Counter>(allocated) *
             static_cast<Counter>(now - occupancyLastUpdate);
+    }
+    return total;
+}
+
+Counter
+MSHRQueue::getOccupancyFullTicks(Tick now) const
+{
+    Counter total = occupancyFullTicks;
+    if (now > occupancyLastUpdate && allocated == numEntries) {
+        total += now - occupancyLastUpdate;
     }
     return total;
 }

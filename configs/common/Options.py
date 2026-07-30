@@ -340,6 +340,15 @@ def addCommonOptions(parser, configure_xiangshan=False):
     parser.add_argument("--warmup-insts-no-switch", action="store", type=int,
         default=20*10**6,
         help="Warmup period in total instructions, reset stats without switch")
+    parser.add_argument("--roi-insts", action="store", type=int, default=None,
+        help="Measured committed instructions after warmup, then dump stats and exit")
+    parser.add_argument(
+        "--btbp-roi-drain-ticks", type=int, default=50_000_000,
+        help=(
+            "Maximum ticks allowed to terminalize accepted BTBP requests "
+            "after ROI_END; no post-ROI prefetch decisions are admitted"
+        ),
+    )
 
     parser.add_argument(
         "--stats-root", action="append", default=[],
@@ -719,3 +728,78 @@ def addXiangshanTraceOptions(parser):
                 action.required = False
                 action.default = "trace_mode_dummy"
                 break
+
+
+def addXiangshanFDIPOptions(parser):
+    parser.add_argument(
+        "--eip-algorithm",
+        type=str,
+        default="disabled",
+        choices=["disabled", "tc24", "isca21"],
+        help=(
+            "Enable one frozen Entangling instruction-prefetcher bundle; "
+            "isca21 is the non-voting same-port regression"
+        ),
+    )
+    parser.add_argument(
+        "--enable-fdip",
+        action="store_true",
+        default=False,
+        help="Enable FTQ-directed ICache prefetch in DecoupledBPUWithBTB",
+    )
+    parser.add_argument(
+        "--bpu-runahead-entries",
+        type=int,
+        default=8,
+        help="Maximum BPU next-alloc-fetchPtr distance in FTQ entries when FDIP is enabled (0 disables, default: 8)",
+    )
+    parser.add_argument(
+        "--fdip-lookahead-entries",
+        type=int,
+        default=1,
+        help="Maximum prefetchPtr-fetchPtr distance in FTQ entries (default: 1)",
+    )
+    parser.add_argument(
+        "--fdip-issue-bandwidth",
+        type=int,
+        default=1,
+        help="Maximum FDIP issue bandwidth in cachelines per cycle (default: 1)",
+    )
+    parser.add_argument(
+        "--fdip-max-outstanding",
+        type=int,
+        default=8,
+        help="Maximum FDIP outstanding cacheline requests (default: 8)",
+    )
+    parser.add_argument(
+        "--prefetch-lines-per-ftq",
+        type=str,
+        default="cover_actual_fetch_range",
+        choices=["start_line_only", "cover_actual_fetch_range"],
+        help="FDIP cacheline coverage policy for each FTQ entry",
+    )
+    parser.add_argument(
+        "--fdip-flush-partial-on-epoch-change",
+        dest="fdip_flush_partial_on_epoch_change",
+        action="store_true",
+        default=True,
+        help="Flush FDIP partial per-entry state on redirect/epoch change (default: on)",
+    )
+    parser.add_argument(
+        "--no-fdip-flush-partial-on-epoch-change",
+        dest="fdip_flush_partial_on_epoch_change",
+        action="store_false",
+        help="Keep FDIP partial per-entry state across redirect/epoch change",
+    )
+    parser.add_argument(
+        "--fdip-drop-refill-on-epoch-mismatch",
+        action="store_true",
+        default=False,
+        help="Drop old-path FDIP refill installation on epoch mismatch",
+    )
+    parser.add_argument(
+        "--fdip-recent-unused-cycles",
+        type=int,
+        default=0,
+        help="Suppress FDIP issue for recently-unused lines for N cycles (default: 0)",
+    )

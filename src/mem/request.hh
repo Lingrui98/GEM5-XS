@@ -85,6 +85,8 @@ enum PrefetchSourceType
     CDP,
     SOpt,
     DespacitoStream,
+    PF_FDIP,
+    PF_EIP,
     NUM_PF_SOURCES
 };
 
@@ -383,35 +385,201 @@ class Request
         o3::XsDynInstMetaPtr instXsMetadata;
         PrefetchSourceType prefetchSource;
         int prefetchDepth;
+        uint64_t fdipEpoch;
+        uint64_t fdipFtqId;
+        Addr fdipStartPC;
+        uint64_t eipDemandId;
+        uint64_t instPrefetchDecisionId;
+        Addr eipTriggerPC;
+        ContextID eipContextId;
+        bool eipDemandObserved;
+        uint64_t l1iResidencyId;
+        bool btbpRoiOrigin;
+        bool traceIdentityValid;
+        uint64_t traceAddressSpaceId;
+        uint8_t traceAsidHash;
+        uint64_t traceFtqId;
+        bool fdipSelectedWayValid;
+        uint8_t fdipSelectedWay;
+        Tick fdipSelectedWayTick;
+        uint64_t traceRequestUid;
+        uint64_t traceLookupUid;
+        uint64_t traceFetchEpoch;
+        uint64_t traceInstructionOrdinal;
+        uint32_t traceDemandAttemptOrdinal;
+        bool traceDemandTerminalEmitted;
+        uint32_t traceDemandOutcome;
+        Tick traceL1iVisibilityTick;
+        bool tracePathWrong;
 
         XsMetadata() :
             validXsMetadata(false),
             instXsMetadata(nullptr),
             prefetchSource(PF_NONE),
-            prefetchDepth(0) {}
+            prefetchDepth(0),
+            fdipEpoch(0),
+            fdipFtqId(0),
+            fdipStartPC(0),
+            eipDemandId(0),
+            instPrefetchDecisionId(0),
+            eipTriggerPC(0),
+            eipContextId(InvalidContextID),
+            eipDemandObserved(false),
+            l1iResidencyId(0),
+            btbpRoiOrigin(false),
+            traceIdentityValid(false),
+            traceAddressSpaceId(0),
+            traceAsidHash(0),
+            traceFtqId(0),
+            fdipSelectedWayValid(false),
+            fdipSelectedWay(0),
+            fdipSelectedWayTick(0),
+            traceRequestUid(0),
+            traceLookupUid(0),
+            traceFetchEpoch(0),
+            traceInstructionOrdinal(0),
+            traceDemandAttemptOrdinal(0),
+            traceDemandTerminalEmitted(false),
+            traceDemandOutcome(0),
+            traceL1iVisibilityTick(0),
+            tracePathWrong(false) {}
 
         XsMetadata(o3::XsDynInstMetaPtr instMeta) :
             validXsMetadata(true),
             instXsMetadata(instMeta),
-            prefetchSource(PF_NONE) ,
-            prefetchDepth(0) {}
+            prefetchSource(PF_NONE),
+            prefetchDepth(0),
+            fdipEpoch(0),
+            fdipFtqId(0),
+            fdipStartPC(0),
+            eipDemandId(0),
+            instPrefetchDecisionId(0),
+            eipTriggerPC(0),
+            eipContextId(InvalidContextID),
+            eipDemandObserved(false),
+            l1iResidencyId(0),
+            btbpRoiOrigin(false),
+            traceIdentityValid(false),
+            traceAddressSpaceId(0),
+            traceAsidHash(0),
+            traceFtqId(0),
+            fdipSelectedWayValid(false),
+            fdipSelectedWay(0),
+            fdipSelectedWayTick(0),
+            traceRequestUid(0),
+            traceLookupUid(0),
+            traceFetchEpoch(0),
+            traceInstructionOrdinal(0),
+            traceDemandAttemptOrdinal(0),
+            traceDemandTerminalEmitted(false),
+            traceDemandOutcome(0),
+            traceL1iVisibilityTick(0),
+            tracePathWrong(false) {}
 
         XsMetadata(PrefetchSourceType pfSource) :
             validXsMetadata(true),
             instXsMetadata(nullptr),
-            prefetchSource(pfSource) ,
-            prefetchDepth(0) {}
+            prefetchSource(pfSource),
+            prefetchDepth(0),
+            fdipEpoch(0),
+            fdipFtqId(0),
+            fdipStartPC(0),
+            eipDemandId(0),
+            instPrefetchDecisionId(0),
+            eipTriggerPC(0),
+            eipContextId(InvalidContextID),
+            eipDemandObserved(false),
+            l1iResidencyId(0),
+            btbpRoiOrigin(false),
+            traceIdentityValid(false),
+            traceAddressSpaceId(0),
+            traceAsidHash(0),
+            traceFtqId(0),
+            fdipSelectedWayValid(false),
+            fdipSelectedWay(0),
+            fdipSelectedWayTick(0),
+            traceRequestUid(0),
+            traceLookupUid(0),
+            traceFetchEpoch(0),
+            traceInstructionOrdinal(0),
+            traceDemandAttemptOrdinal(0),
+            traceDemandTerminalEmitted(false),
+            traceDemandOutcome(0),
+            traceL1iVisibilityTick(0),
+            tracePathWrong(false) {}
 
         XsMetadata(PrefetchSourceType pfSource,int pfDepth) :
             validXsMetadata(true),
             instXsMetadata(nullptr),
-            prefetchSource(pfSource) ,
-            prefetchDepth(pfDepth) {}
+            prefetchSource(pfSource),
+            prefetchDepth(pfDepth),
+            fdipEpoch(0),
+            fdipFtqId(0),
+            fdipStartPC(0),
+            eipDemandId(0),
+            instPrefetchDecisionId(0),
+            eipTriggerPC(0),
+            eipContextId(InvalidContextID),
+            eipDemandObserved(false),
+            l1iResidencyId(0),
+            btbpRoiOrigin(false),
+            traceIdentityValid(false),
+            traceAddressSpaceId(0),
+            traceAsidHash(0),
+            traceFtqId(0),
+            fdipSelectedWayValid(false),
+            fdipSelectedWay(0),
+            fdipSelectedWayTick(0),
+            traceRequestUid(0),
+            traceLookupUid(0),
+            traceFetchEpoch(0),
+            traceInstructionOrdinal(0),
+            traceDemandAttemptOrdinal(0),
+            traceDemandTerminalEmitted(false),
+            traceDemandOutcome(0),
+            traceL1iVisibilityTick(0),
+            tracePathWrong(false) {}
+
+        bool isFdip() const { return prefetchSource == PF_FDIP; }
+
+        bool isEip() const { return prefetchSource == PF_EIP; }
+
+        bool isInstPrefetch() const
+        {
+            return isFdip() || isEip();
+        }
 
         void invalidate() {
             validXsMetadata = false;
             instXsMetadata = nullptr;
             prefetchSource = PF_NONE;
+            prefetchDepth = 0;
+            fdipEpoch = 0;
+            fdipFtqId = 0;
+            fdipStartPC = 0;
+            eipDemandId = 0;
+            instPrefetchDecisionId = 0;
+            eipTriggerPC = 0;
+            eipContextId = InvalidContextID;
+            eipDemandObserved = false;
+            l1iResidencyId = 0;
+            btbpRoiOrigin = false;
+            traceIdentityValid = false;
+            traceAddressSpaceId = 0;
+            traceAsidHash = 0;
+            traceFtqId = 0;
+            fdipSelectedWayValid = false;
+            fdipSelectedWay = 0;
+            fdipSelectedWayTick = 0;
+            traceRequestUid = 0;
+            traceLookupUid = 0;
+            traceFetchEpoch = 0;
+            traceInstructionOrdinal = 0;
+            traceDemandAttemptOrdinal = 0;
+            traceDemandTerminalEmitted = false;
+            traceDemandOutcome = 0;
+            traceL1iVisibilityTick = 0;
+            tracePathWrong = false;
         }
     } XsMetadata;
 

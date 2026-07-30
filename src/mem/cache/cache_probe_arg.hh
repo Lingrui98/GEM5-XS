@@ -76,6 +76,16 @@ struct CacheAccessor
     virtual bool coalesce() const = 0;
 
     virtual const uint8_t* findBlock(Addr addr, bool is_secure) const = 0;
+
+    /** Best-effort suppress query for recently-unused FDIP lines. */
+    virtual bool shouldSuppressFdipLine(Addr addr, bool is_secure,
+                                        uint64_t cooldown_cycles) const = 0;
+
+    /** Start tracking prefetch residencies created in the measured ROI. */
+    virtual void beginBtbpRoiTracking() {}
+
+    /** Close ROI-origin prefetch residencies at the accounting boundary. */
+    virtual unsigned closeBtbpRoiResidencies() { return 0; }
 };
 
 /**
