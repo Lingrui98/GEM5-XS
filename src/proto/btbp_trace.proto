@@ -1,0 +1,84 @@
+syntax = "proto2";
+
+package ProtoMessage;
+
+// Schema v7 event type:
+// 1=mbtb_lookup, 2=mbtb_fill, 3=iprefetch_issue, 4=line_lifecycle,
+// 5=l1i_demand_access, 6=decode_branch, 7=branch_demand,
+// 8=iprefetch_decision_accepted, 9=iprefetch_terminal,
+// 10=l1i_mshr_occupancy, 11=l1i_line_evict, 12=roi_begin, 13=roi_end,
+// 14=iprefetch_gate_attempt, 15=fetch_request_open,
+// 16=fetch_request_terminal, 17=l1i_demand_issue,
+// 18=l1i_demand_attempt, 19=l1i_demand_terminal,
+// 20=decode_consume, 21=lookup_terminal.
+// terminal_reason: 0=unknown, 1=completed, 2=translation_fault,
+// 3=uncacheable, 4=cache_or_merge_completion, 5=queue_full_completion,
+// 6=reset_canceled, 7=policy_filtered, 8=commit, 9=squash,
+// 10=roi_end, 11=cache_hit, 12=fill, 13=merge_with_demand,
+// 14=merge_with_prefetch, 15=dropped, 16=blocked, 17=evicted,
+// 18=invalidated, 19=retained_at_drain, 20=not_applicable.
+// lifecycle_kind: 0=unknown, 1=prefetch_fill, 2=demand_fill,
+// 3=demand_use, 4=evict_or_invalidate, 5=roi_drain_close,
+// 6=same_line_refill.
+// gate_outcome: 0=unknown, 1=accepted, 2=bandwidth_rejected,
+// 3=outstanding_rejected, 4=drain_rejected.
+message BtbpTraceEntry {
+  required uint64 tick = 1;
+  required uint32 event_type = 2;
+  optional uint32 thread_id = 3;
+  optional uint64 branch_pc = 4;
+  reserved 5;
+  optional bool hit = 6;
+  optional uint64 target = 7;
+  optional uint32 fill_source = 8;
+  optional uint64 line_addr = 9;
+  optional uint64 trigger_pc = 10;
+  optional bool taken_hint = 11;
+  reserved 12;
+  optional uint64 virtual_line_addr = 13;
+  optional uint32 line_size = 14;
+  optional uint64 address_space_id = 15;
+  optional uint32 asid_hash = 16;
+  optional uint64 ftq_id = 17;
+  optional uint64 lookup_tick = 18;
+  optional uint32 inst_bytes = 19;
+  optional uint64 stream_start_pc = 20;
+  optional bool structural_miss = 21;
+  required uint32 schema_version = 22;
+  required uint64 event_seq = 23;
+  optional uint64 fdip_epoch = 24;
+  optional uint64 fill_bytes_tick = 25;
+  optional uint64 l1i_ready_tick = 26;
+  optional uint64 scan_complete_tick = 27;
+  optional uint32 request_kind = 28;
+  optional uint32 branch_kind = 29;
+  optional uint64 demand_uid = 30;
+  optional uint64 prefetch_decision_id = 31;
+  optional uint32 prefetch_source = 32;
+  optional uint32 terminal_reason = 33;
+  optional uint32 mshr_demand_owned = 34;
+  optional uint32 mshr_inst_prefetch_owned = 35;
+  optional uint32 mshr_total = 36;
+  optional uint32 lifecycle_kind = 37;
+  optional uint64 residency_id = 38;
+  optional uint64 core_cycle = 39;
+  optional uint64 committed_insts = 40;
+  optional uint64 roi_insts = 41;
+  optional bool secure = 42;
+  optional uint64 prefetch_attempt_id = 43;
+  optional uint32 gate_outcome = 44;
+  optional uint32 incoming_request_kind = 45;
+  optional uint64 incoming_prefetch_decision_id = 46;
+  optional uint32 incoming_prefetch_source = 47;
+  optional bool prefetch_owned_mshr = 48;
+  optional bool replacement = 49;
+  optional uint64 request_uid = 50;
+  optional uint64 lookup_uid = 51;
+  optional uint64 fetch_epoch = 52;
+  optional uint32 demand_attempt_ordinal = 53;
+  optional uint64 trace_instruction_ordinal = 54;
+  optional uint64 visibility_tick = 55;
+  optional uint32 supply_source = 56;
+  optional uint32 path_state = 57;
+  repeated uint64 owner_prefetch_decision_ids = 58;
+}

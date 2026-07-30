@@ -1,6 +1,8 @@
 #ifndef __CPU_PRED_BTB_TIMED_BASE_PRED_HH__
 #define __CPU_PRED_BTB_TIMED_BASE_PRED_HH__
 
+#include <functional>
+#include <utility>
 
 #include <boost/dynamic_bitset.hpp>
 
@@ -14,6 +16,7 @@
     #include "cpu/inst_seq.hh"
     #include "cpu/o3/dyn_inst_ptr.hh"
     #include "cpu/pred/btb/common.hh"
+    #include "cpu/pred/btb/probe/btbp_trace_event.hh"
     #include "sim/sim_object.hh"
     #include "params/TimedBaseBTBPredictor.hh"
 #endif
@@ -87,6 +90,11 @@ class TimedBaseBTBPredictor: public SimObject
 #ifndef UNIT_TEST
     // do some statistics on a per-branch and per-predictor basis
     virtual void commitBranch(const FetchTarget &entry, const DynInstPtr &inst) {}
+    using BtbpTraceNotify = std::function<void(const BtbpTraceEvent &)>;
+    void setBtbpTraceNotify(BtbpTraceNotify notify)
+    {
+        btbpTraceNotify = std::move(notify);
+    }
 #endif
 
     int componentIdx{0};
@@ -111,10 +119,23 @@ class TimedBaseBTBPredictor: public SimObject
     // Check if this component is enabled
     bool isEnabled() const { return enabled; }
 
+protected:
+#ifndef UNIT_TEST
+    void notifyBtbpTrace(const BtbpTraceEvent &event) const
+    {
+        if (btbpTraceNotify) {
+            btbpTraceNotify(event);
+        }
+    }
+#endif
+
 private:
     unsigned numDelay;
     bool resolvedUpdate;
     bool enabled;
+#ifndef UNIT_TEST
+    BtbpTraceNotify btbpTraceNotify;
+#endif
 };
 
 // Close conditional namespace wrapper for testing

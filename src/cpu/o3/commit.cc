@@ -1235,13 +1235,18 @@ Commit::commitInsts()
 
     // Commit each thread independently for up to its local commit window.
     for (ThreadID commit_thread : *activeThreads) {
+        if (cpu->stopCommitAtBoundary()) {
+            break;
+        }
+
         if (commitStatus[commit_thread] != Running &&
             commitStatus[commit_thread] != Idle &&
             commitStatus[commit_thread] != FetchTrapPending) {
             continue;
         }
 
-            while (num_committed < commit_width &&
+            while (!cpu->stopCommitAtBoundary() &&
+                num_committed < commit_width &&
                 num_committed_per_thread[commit_thread] <
                     commit_width_per_thread[commit_thread]) {
             // hardware transactionally memory
@@ -2148,10 +2153,20 @@ Commit::updateComInstStats(const DynInstPtr &inst)
         stats.instsCommitted[tid]++;
     stats.opsCommitted[tid]++;
 
-    // To match the old model, don't count nops and instruction
-    // prefetches towards the total commit count.
-    if (!inst->isNop() &&
-        !inst->isInstPrefetch()) {
+    // Trace-mode ROI boundaries follow the source-record catalog, not the
+    // architectural commit counter. Wrong-path and injected prefetch
+    // instructions have no trace metadata and must not advance that boundary.
+    const bool is_trace_record =
+        cpu->isTraceMode() && cpu->isTraceInstruction(inst->seqNum);
+    if (is_trace_record) {
+        const uint64_t trace_record_index =
+            cpu->getTraceIndexForSeqNum(inst->seqNum);
+        panic_if(trace_record_index == 0,
+                 "Committed trace instruction [sn:%llu] has no source index",
+                 inst->seqNum);
+        cpu->instDone(tid, inst, trace_record_index);
+    } else if (!cpu->isTraceMode() && !inst->isNop() &&
+               !inst->isInstPrefetch()) {
         cpu->instDone(tid, inst);
     }
 

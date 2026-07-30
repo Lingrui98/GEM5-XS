@@ -1,0 +1,240 @@
+#ifndef __CPU_PRED_BTB_PROBE_BTBP_TRACE_EVENT_HH__
+#define __CPU_PRED_BTB_PROBE_BTBP_TRACE_EVENT_HH__
+
+#include <vector>
+
+#include "base/types.hh"
+
+namespace gem5
+{
+namespace branch_prediction
+{
+namespace btb_pred
+{
+
+struct BtbpTraceEvent
+{
+    static constexpr uint32_t SchemaVersion = 7;
+
+    enum EventType : uint32_t
+    {
+        MbtbLookup = 1,
+        MbtbFill = 2,
+        IPrefetchIssue = 3,
+        LineLifecycle = 4,
+        L1IDemandAccess = 5,
+        DecodeBranch = 6,
+        BranchDemand = 7,
+        IPrefetchDecisionAccepted = 8,
+        IPrefetchTerminal = 9,
+        L1IMshrOccupancy = 10,
+        L1ILineEvict = 11,
+        RoiBegin = 12,
+        RoiEnd = 13,
+        IPrefetchGateAttempt = 14,
+        FetchRequestOpen = 15,
+        FetchRequestTerminal = 16,
+        L1IDemandIssue = 17,
+        L1IDemandAttempt = 18,
+        L1IDemandTerminal = 19,
+        DecodeConsume = 20,
+        LookupTerminal = 21,
+    };
+
+    enum class TerminalReason : uint32_t
+    {
+        Unknown = 0,
+        Completed = 1,
+        TranslationFault = 2,
+        Uncacheable = 3,
+        CacheOrMergeCompletion = 4,
+        QueueFullCompletion = 5,
+        ResetCanceled = 6,
+        PolicyFiltered = 7,
+        Commit = 8,
+        Squash = 9,
+        RoiEnd = 10,
+        CacheHit = 11,
+        Fill = 12,
+        MergeWithDemand = 13,
+        MergeWithPrefetch = 14,
+        Dropped = 15,
+        Blocked = 16,
+        Evicted = 17,
+        Invalidated = 18,
+        RetainedAtDrain = 19,
+        NotApplicable = 20,
+    };
+
+    enum class LifecycleKind : uint32_t
+    {
+        Unknown = 0,
+        PrefetchFill = 1,
+        DemandFill = 2,
+        DemandUse = 3,
+        Evict = 4,
+        RoiDrainClose = 5,
+        SameLineRefill = 6,
+    };
+
+    enum class GateOutcome : uint32_t
+    {
+        Unknown = 0,
+        Accepted = 1,
+        BandwidthRejected = 2,
+        OutstandingRejected = 3,
+        DrainRejected = 4,
+    };
+
+    enum FillSource : uint32_t
+    {
+        ExecWriteback = 1,
+        InternalVictimMove = 3,
+    };
+
+    enum RequestKind : uint32_t
+    {
+        UnknownRequest = 0,
+        DemandRequest = 1,
+        PrefetchRequest = 2,
+    };
+
+    enum BranchKind : uint32_t
+    {
+        UnknownBranch = 0,
+        DirectBranch = 1,
+        IndirectBranch = 2,
+        ReturnBranch = 3,
+    };
+
+    enum SupplySource : uint32_t
+    {
+        UnknownSupply = 0,
+        DemandFillSupply = 1,
+        PrefetchFillSupply = 2,
+        FetchBufferSupply = 3,
+        CacheHitSupply = 4,
+    };
+
+    enum PathState : uint32_t
+    {
+        UnresolvedPath = 0,
+        CorrectPath = 1,
+        WrongPath = 2,
+        NotApplicablePath = 3,
+    };
+
+    Tick tick = 0;
+    uint32_t eventType = 0;
+    ThreadID threadId = 0;
+
+    Addr branchPc = 0;
+    bool branchPcValid = false;
+    bool hit = false;
+    bool hitValid = false;
+    Addr target = 0;
+    bool targetValid = false;
+    uint32_t fillSource = 0;
+    bool fillSourceValid = false;
+    Addr lineAddr = 0;
+    bool lineAddrValid = false;
+    Addr virtualLineAddr = 0;
+    bool virtualLineAddrValid = false;
+    Addr triggerPc = 0;
+    bool triggerPcValid = false;
+    bool takenHint = false;
+    bool takenHintValid = false;
+    uint32_t lineSize = 0;
+    bool lineSizeValid = false;
+    uint64_t addressSpaceId = 0;
+    bool addressSpaceIdValid = false;
+    uint32_t asidHash = 0;
+    bool asidHashValid = false;
+    uint64_t ftqId = 0;
+    bool ftqIdValid = false;
+    uint64_t fdipEpoch = 0;
+    bool fdipEpochValid = false;
+    Tick lookupTick = 0;
+    bool lookupTickValid = false;
+    Tick fillBytesTick = 0;
+    bool fillBytesTickValid = false;
+    Tick l1iReadyTick = 0;
+    bool l1iReadyTickValid = false;
+    Tick scanCompleteTick = 0;
+    bool scanCompleteTickValid = false;
+    uint32_t instBytes = 0;
+    bool instBytesValid = false;
+    Addr streamStartPc = 0;
+    bool streamStartPcValid = false;
+    bool structuralMiss = false;
+    bool structuralMissValid = false;
+    uint32_t requestKind = UnknownRequest;
+    bool requestKindValid = false;
+    uint32_t branchKind = UnknownBranch;
+    bool branchKindValid = false;
+    uint64_t demandUid = 0;
+    bool demandUidValid = false;
+    uint64_t prefetchDecisionId = 0;
+    bool prefetchDecisionIdValid = false;
+    uint32_t prefetchSource = 0;
+    bool prefetchSourceValid = false;
+    uint32_t terminalReason =
+        static_cast<uint32_t>(TerminalReason::Unknown);
+    bool terminalReasonValid = false;
+    uint32_t mshrDemandOwned = 0;
+    bool mshrDemandOwnedValid = false;
+    uint32_t mshrInstPrefetchOwned = 0;
+    bool mshrInstPrefetchOwnedValid = false;
+    uint32_t mshrTotal = 0;
+    bool mshrTotalValid = false;
+    uint32_t lifecycleKind =
+        static_cast<uint32_t>(LifecycleKind::Unknown);
+    bool lifecycleKindValid = false;
+    uint64_t residencyId = 0;
+    bool residencyIdValid = false;
+    uint64_t coreCycle = 0;
+    bool coreCycleValid = false;
+    uint64_t committedInsts = 0;
+    bool committedInstsValid = false;
+    uint64_t roiInsts = 0;
+    bool roiInstsValid = false;
+    bool secure = false;
+    bool secureValid = false;
+    uint64_t prefetchAttemptId = 0;
+    bool prefetchAttemptIdValid = false;
+    uint32_t gateOutcome = static_cast<uint32_t>(GateOutcome::Unknown);
+    bool gateOutcomeValid = false;
+    uint32_t incomingRequestKind = UnknownRequest;
+    bool incomingRequestKindValid = false;
+    uint64_t incomingPrefetchDecisionId = 0;
+    bool incomingPrefetchDecisionIdValid = false;
+    uint32_t incomingPrefetchSource = 0;
+    bool incomingPrefetchSourceValid = false;
+    bool prefetchOwnedMshr = false;
+    bool prefetchOwnedMshrValid = false;
+    bool replacement = false;
+    bool replacementValid = false;
+    uint64_t requestUid = 0;
+    bool requestUidValid = false;
+    uint64_t lookupUid = 0;
+    bool lookupUidValid = false;
+    uint64_t fetchEpoch = 0;
+    bool fetchEpochValid = false;
+    uint32_t demandAttemptOrdinal = 0;
+    bool demandAttemptOrdinalValid = false;
+    uint64_t traceInstructionOrdinal = 0;
+    bool traceInstructionOrdinalValid = false;
+    Tick visibilityTick = 0;
+    bool visibilityTickValid = false;
+    uint32_t supplySource = UnknownSupply;
+    bool supplySourceValid = false;
+    uint32_t pathState = UnresolvedPath;
+    bool pathStateValid = false;
+    std::vector<uint64_t> ownerPrefetchDecisionIds;
+};
+
+} // namespace btb_pred
+} // namespace branch_prediction
+} // namespace gem5
+
+#endif // __CPU_PRED_BTB_PROBE_BTBP_TRACE_EVENT_HH__

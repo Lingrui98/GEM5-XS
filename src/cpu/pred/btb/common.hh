@@ -359,7 +359,14 @@ struct PathHistoryUpdate
 struct FetchTarget
 {
     ThreadID tid;
+    uint64_t addressSpaceId;
     uint8_t asidHash;
+    uint64_t traceRequestUid;
+    uint64_t traceLookupUid;
+    uint64_t traceFetchEpoch;
+    bool traceRequestOpened;
+    bool traceLookupTerminalEmitted;
+    unsigned lineSize;
     Addr startPC;       // start pc of the stream
     bool predTaken;     // whether the FetchTarget has taken branch
     Addr predEndPC;     // predicted stream end pc (fall through pc)
@@ -410,7 +417,14 @@ struct FetchTarget
 
    FetchTarget()
        : tid(0),
+         addressSpaceId(0),
          asidHash(0),
+         traceRequestUid(0),
+         traceLookupUid(0),
+         traceFetchEpoch(0),
+         traceRequestOpened(false),
+         traceLookupTerminalEmitted(false),
+         lineSize(0),
          startPC(0),
          predTaken(false),
          predEndPC(0),
@@ -553,7 +567,13 @@ struct FetchTarget
 struct FullBTBPrediction
 {
     ThreadID tid;
+    uint64_t addressSpaceId;
     uint8_t asidHash;
+    uint64_t traceRequestUid;
+    uint64_t traceLookupUid;
+    uint64_t traceFetchEpoch;
+    bool traceRequestOpened;
+    bool traceLookupTerminalEmitted;
     Addr bbStart;
     std::vector<BTBEntry> btbEntries; // for BTB, only assigned when hit, sorted by inst order
     // for conditional branch predictors, mapped with lowest bits of branches
@@ -575,7 +595,13 @@ struct FullBTBPrediction
 
     FullBTBPrediction() :
         tid(0),
+        addressSpaceId(0),
         asidHash(0),
+        traceRequestUid(0),
+        traceLookupUid(0),
+        traceFetchEpoch(0),
+        traceRequestOpened(false),
+        traceLookupTerminalEmitted(false),
         bbStart(0),
         btbEntries(),
         condTakens(),

@@ -43,6 +43,7 @@
 #ifndef __CPU_O3_CPU_HH__
 #define __CPU_O3_CPU_HH__
 
+#include <array>
 #include <iostream>
 #include <list>
 #include <queue>
@@ -69,6 +70,7 @@
 #include "cpu/o3/rob.hh"
 #include "cpu/o3/scoreboard.hh"
 #include "cpu/o3/thread_state.hh"
+#include "cpu/pred/btb/probe/btbp_trace_event.hh"
 #include "cpu/simple_thread.hh"
 #include "cpu/timebuf.hh"
 #include "cpu/valuepred/valuepred_unit.hh"
@@ -134,6 +136,22 @@ class CPU : public BaseCPU
 
     bool dump_done = false;
     bool warmup_done = false;
+    bool roi_done = false;
+    bool stopCommitAtBoundaryFlag = false;
+    bool btbpRoiTrackingStarted = false;
+    bool btbpRoiBeginPending = false;
+    bool btbpRoiEndPending = false;
+    Tick btbpRoiBeginTick = 0;
+    Tick btbpRoiEndTick = 0;
+    uint64_t btbpRoiBeginCycle = 0;
+    uint64_t btbpRoiEndCycle = 0;
+    ThreadID btbpRoiBeginTid = 0;
+    ThreadID btbpRoiEndTid = 0;
+    Counter btbpRoiBeginInsts = 0;
+    Counter btbpRoiEndInsts = 0;
+    Counter btbpMeasuredRoiInsts = 0;
+    std::array<Counter, MaxThreads> roiEndInstCounts = {};
+    std::array<bool, MaxThreads> roiEndInstCountSet = {};
 
 
     /** The tick event used for scheduling CPU ticks. */
@@ -193,9 +211,26 @@ class CPU : public BaseCPU
 
     ProbePointArg<PacketPtr> *ppInstAccessComplete;
     ProbePointArg<std::pair<DynInstPtr, PacketPtr> > *ppDataAccessComplete;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceMbtbLookup = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceMbtbFill = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceIPrefetchIssue = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceLineLifecycle = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceL1IDemandAccess = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceDecodeBranch = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceBranchDemand = nullptr;
 
     /** Register probe points. */
     void regProbePoints() override;
+
+    void notifyBtbpTrace(
+        const branch_prediction::btb_pred::BtbpTraceEvent &event);
 
     void
     demapPage(Addr vaddr, uint64_t asn)
@@ -383,6 +418,15 @@ class CPU : public BaseCPU
     bool shouldDropFdipRefill(ContextID contextId,
                               const Request::XsMetadata &xsMeta) const;
 
+    bool eipEnabled() const { return fetch.eipEnabled(); }
+    void notifyEipDemand(ContextID contextId, Addr virtualAddr,
+                         Addr physicalAddr, uint64_t demandId,
+                         bool cacheHit, bool prefetchHit, bool wrongPath,
+                         const Request::XsMetadata &requestMeta);
+    void notifyEipFill(ContextID contextId, Addr virtualAddr,
+                       Addr physicalAddr);
+    void notifyEipEvict(ContextID contextId, Addr physicalAddr);
+
     /**
      * Wrapper for internal drain check used by trace-mode helpers.
      * Keeps isCpuDrained() private while still allowing components
@@ -402,7 +446,11 @@ class CPU : public BaseCPU
     ListIt addInst(const DynInstPtr &inst);
 
     /** Function to tell the CPU that an instruction has completed. */
-    void instDone(ThreadID tid, const DynInstPtr &inst);
+    void instDone(ThreadID tid, const DynInstPtr &inst,
+                  Counter traceRecordIndex = 0);
+
+    /** Stop Commit after the current architectural instruction. */
+    bool stopCommitAtBoundary() const { return stopCommitAtBoundaryFlag; }
 
     /** Remove an instruction from the front end of the list.  There's
      *  no restriction on location of the instruction.

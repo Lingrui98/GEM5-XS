@@ -26,17 +26,15 @@ namespace branch_prediction
 namespace btb_pred
 {
 
-uint8_t
-DecoupledBPUWithBTB::getThreadAsidHash(ThreadID tid) const
+uint64_t
+DecoupledBPUWithBTB::getThreadAddressSpaceId(ThreadID tid) const
 {
     if (!cpu) {
         return 0;
     }
 
-    const RegVal satp =
-        cpu->readMiscRegNoEffect(RiscvISA::MiscRegIndex::MISCREG_SATP, tid);
-    const uint16_t asid = (satp >> 44) & mask(16);
-    return foldAsidHash16To4(asid);
+    return cpu->readMiscRegNoEffect(
+        RiscvISA::MiscRegIndex::MISCREG_SATP, tid);
 }
 
 void
@@ -44,6 +42,171 @@ DecoupledBPUWithBTB::consumeFetchTarget(unsigned fetched_inst_num, ThreadID tid)
 {
     ftq.fetching(tid).fetchInstNum = fetched_inst_num;
     ftq.finishTarget(tid);
+}
+
+o3::TraceL1iFetchIdentity
+DecoupledBPUWithBTB::claimTraceRequestIdentity(ThreadID tid)
+{
+    panic_if(!ftqHasFetching(tid),
+             "trace fetch tried to claim an absent FTQ target");
+    auto &target = ftq.get(ftq.fetchId(tid), tid);
+    panic_if(target.traceRequestOpened || target.traceRequestUid == 0 ||
+                 target.traceLookupUid == 0,
+             "trace FTQ %llu request identity is absent or already claimed",
+             static_cast<unsigned long long>(ftq.fetchId(tid)));
+    target.traceRequestOpened = true;
+    return {target.traceRequestUid, target.traceLookupUid,
+            target.traceFetchEpoch};
+}
+
+void
+DecoupledBPUWithBTB::emitTraceLookupTerminal(
+    FetchTarget &target, FetchTargetId ftq_id,
+    BtbpTraceEvent::TerminalReason reason,
+    BtbpTraceEvent::PathState path_state)
+{
+    if (target.traceLookupTerminalEmitted || target.traceLookupUid == 0 ||
+        target.traceRequestUid == 0) {
+        return;
+    }
+
+    if (!target.traceRequestOpened) {
+        emitUnissuedTraceRequestClosure(
+            target.tid, target.traceRequestUid, target.traceLookupUid,
+            target.traceFetchEpoch, ftq_id, target.startPC,
+            target.addressSpaceId, target.asidHash, path_state);
+        target.traceRequestOpened = true;
+    }
+
+    BtbpTraceEvent event;
+    event.tick = curTick();
+    event.eventType = BtbpTraceEvent::LookupTerminal;
+    event.threadId = target.tid;
+    event.requestUid = target.traceRequestUid;
+    event.requestUidValid = true;
+    event.lookupUid = target.traceLookupUid;
+    event.lookupUidValid = true;
+    event.fetchEpoch = target.traceFetchEpoch;
+    event.fetchEpochValid = true;
+    event.ftqId = ftq_id;
+    event.ftqIdValid = true;
+    event.streamStartPc = target.startPC;
+    event.streamStartPcValid = true;
+    event.addressSpaceId = target.addressSpaceId;
+    event.addressSpaceIdValid = true;
+    event.asidHash = target.asidHash;
+    event.asidHashValid = true;
+    event.terminalReason = static_cast<uint32_t>(reason);
+    event.terminalReasonValid = true;
+    event.pathState = static_cast<uint32_t>(path_state);
+    event.pathStateValid = true;
+    cpu->notifyBtbpTrace(event);
+    target.traceLookupTerminalEmitted = true;
+}
+
+void
+DecoupledBPUWithBTB::emitUnissuedTraceRequestClosure(
+    ThreadID tid, uint64_t request_uid, uint64_t lookup_uid,
+    uint64_t fetch_epoch, FetchTargetId ftq_id, Addr start_pc,
+    uint64_t address_space_id, uint8_t asid_hash,
+    BtbpTraceEvent::PathState path_state)
+{
+    BtbpTraceEvent event;
+    event.tick = curTick();
+    event.eventType = BtbpTraceEvent::FetchRequestOpen;
+    event.threadId = tid;
+    event.requestUid = request_uid;
+    event.requestUidValid = true;
+    event.lookupUid = lookup_uid;
+    event.lookupUidValid = true;
+    event.fetchEpoch = fetch_epoch;
+    event.fetchEpochValid = true;
+    event.ftqId = ftq_id;
+    event.ftqIdValid = true;
+    event.traceInstructionOrdinal = 0;
+    event.traceInstructionOrdinalValid = true;
+    event.virtualLineAddr = start_pc - start_pc % cpu->cacheLineSize();
+    event.virtualLineAddrValid = true;
+    event.lineSize = cpu->cacheLineSize();
+    event.lineSizeValid = true;
+    event.requestKind = BtbpTraceEvent::DemandRequest;
+    event.requestKindValid = true;
+    event.addressSpaceId = address_space_id;
+    event.addressSpaceIdValid = true;
+    event.asidHash = asid_hash;
+    event.asidHashValid = true;
+    event.pathState = static_cast<uint32_t>(path_state);
+    event.pathStateValid = true;
+    cpu->notifyBtbpTrace(event);
+
+    event.eventType = BtbpTraceEvent::FetchRequestTerminal;
+    event.terminalReason = static_cast<uint32_t>(
+        BtbpTraceEvent::TerminalReason::NotApplicable);
+    event.terminalReasonValid = true;
+    cpu->notifyBtbpTrace(event);
+}
+
+void
+DecoupledBPUWithBTB::emitPendingTraceLookupTerminal(
+    ThreadID tid, BtbpTraceEvent::TerminalReason reason,
+    BtbpTraceEvent::PathState path_state)
+{
+    auto &prediction = threads[tid].finalPred;
+    if (!threads[tid].validprediction ||
+        prediction.traceLookupTerminalEmitted ||
+        prediction.traceLookupUid == 0 ||
+        prediction.traceRequestUid == 0) {
+        return;
+    }
+
+    if (!prediction.traceRequestOpened) {
+        emitUnissuedTraceRequestClosure(
+            tid, prediction.traceRequestUid, prediction.traceLookupUid,
+            prediction.traceFetchEpoch, 0, prediction.bbStart,
+            prediction.addressSpaceId, prediction.asidHash, path_state);
+        prediction.traceRequestOpened = true;
+    }
+
+    BtbpTraceEvent event;
+    event.tick = curTick();
+    event.eventType = BtbpTraceEvent::LookupTerminal;
+    event.threadId = tid;
+    event.requestUid = prediction.traceRequestUid;
+    event.requestUidValid = true;
+    event.lookupUid = prediction.traceLookupUid;
+    event.lookupUidValid = true;
+    event.fetchEpoch = prediction.traceFetchEpoch;
+    event.fetchEpochValid = true;
+    event.streamStartPc = prediction.bbStart;
+    event.streamStartPcValid = true;
+    event.addressSpaceId = prediction.addressSpaceId;
+    event.addressSpaceIdValid = true;
+    event.asidHash = prediction.asidHash;
+    event.asidHashValid = true;
+    event.terminalReason = static_cast<uint32_t>(reason);
+    event.terminalReasonValid = true;
+    event.pathState = static_cast<uint32_t>(path_state);
+    event.pathStateValid = true;
+    cpu->notifyBtbpTrace(event);
+    prediction.traceLookupTerminalEmitted = true;
+}
+
+void
+DecoupledBPUWithBTB::closeTraceLookupsFrom(
+    ThreadID tid, FetchTargetId first_id,
+    BtbpTraceEvent::TerminalReason reason,
+    BtbpTraceEvent::PathState path_state)
+{
+    if (ftq.empty(tid)) {
+        return;
+    }
+    const FetchTargetId last_id = ftq.backId(tid);
+    for (FetchTargetId id = first_id; id <= last_id; ++id) {
+        if (ftq.hasTarget(id, tid)) {
+            emitTraceLookupTerminal(
+                ftq.get(id, tid), id, reason, path_state);
+        }
+    }
 }
 
 DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
@@ -158,6 +321,17 @@ DecoupledBPUWithBTB::DecoupledBPUWithBTB(const DecoupledBPUWithBTBParams &p)
 
     registerExitCallback([this]() {
         this->dumpStats();
+    });
+}
+
+void
+DecoupledBPUWithBTB::setCpu(CPU *_cpu)
+{
+    cpu = _cpu;
+    mbtb->setBtbpTraceNotify([this](const BtbpTraceEvent &event) {
+        if (cpu) {
+            cpu->notifyBtbpTrace(event);
+        }
     });
 }
 
@@ -296,6 +470,9 @@ DecoupledBPUWithBTB::tick()
             if (tid == curTid) {
                 squashOccurred = true;
             }
+            emitPendingTraceLookupTerminal(
+                tid, BtbpTraceEvent::TerminalReason::Squash,
+                BtbpTraceEvent::WrongPath);
             threads[tid].validprediction = false;
             threads[tid].numOverrideBubbles = 0;
             tage->dryRunCycle(threads[tid].s0PC);
@@ -352,15 +529,27 @@ DecoupledBPUWithBTB::requestNewPrediction(ThreadID tid)
 {
     auto& thread = threads[tid];
     auto& predsOfEachStage = threads[tid].predsOfEachStage;
-    const uint8_t asid_hash = getThreadAsidHash(tid);
+    const uint64_t address_space_id = getThreadAddressSpaceId(tid);
+    const uint16_t asid = (address_space_id >> 44) & mask(16);
+    const uint8_t asid_hash = foldAsidHash16To4(asid);
 
     DPRINTF(Override, "Requesting new prediction for PC %#lx\n", thread.s0PC);
 
     // Reset all stage-local prediction fields before components fill them.
     clearPreds(tid);
+    const auto lookup_identity =
+        traceL1iIdentityGenerator.allocateLookup(tid);
+    const auto request_identity =
+        traceL1iIdentityGenerator.allocateRequest(tid);
+    panic_if(lookup_identity.fetchEpoch != request_identity.fetchEpoch,
+             "trace prediction identity epoch mismatch");
     for (int i = 0; i < numStages; i++) {
         predsOfEachStage[i].tid = tid;
+        predsOfEachStage[i].addressSpaceId = address_space_id;
         predsOfEachStage[i].asidHash = asid_hash;
+        predsOfEachStage[i].traceRequestUid = request_identity.requestUid;
+        predsOfEachStage[i].traceLookupUid = lookup_identity.lookupUid;
+        predsOfEachStage[i].traceFetchEpoch = lookup_identity.fetchEpoch;
         predsOfEachStage[i].bbStart = thread.s0PC;
         predsOfEachStage[i].predSource = i;
     }
@@ -636,7 +825,15 @@ DecoupledBPUWithBTB::handleSquash(ThreadID tid, unsigned target_id,
                 "Ignore squash for tid %u on missing FTQ target %u; "
                 "recovering predictor state from redirect PC %#lx\n",
                 tid, target_id, redirect_pc);
+        emitPendingTraceLookupTerminal(
+            tid, BtbpTraceEvent::TerminalReason::Squash,
+            BtbpTraceEvent::WrongPath);
+        closeTraceLookupsFrom(
+            tid, ftq.empty(tid) ? 0 : ftq.frontId(tid),
+            BtbpTraceEvent::TerminalReason::Squash,
+            BtbpTraceEvent::WrongPath);
         ftq.clear(tid);
+        traceL1iIdentityGenerator.advanceEpoch(tid);
         clearPreds(tid);
         threads[tid].validprediction = false;
         threads[tid].s0PC = redirect_pc;
@@ -661,8 +858,15 @@ DecoupledBPUWithBTB::handleSquash(ThreadID tid, unsigned target_id,
         dumpFsq("Before control squash");
     }
 
+    // Close the original lookup identities before any numeric FTQ slots can
+    // be reused by the redirect prediction.
+    closeTraceLookupsFrom(
+        tid, target_id, BtbpTraceEvent::TerminalReason::Squash,
+        BtbpTraceEvent::WrongPath);
+
     // Remove targets after the squashed one
     ftq.squashAfter(target_id, tid);
+    traceL1iIdentityGenerator.advanceEpoch(tid);
 
     // Recover history using the extracted function
     recoverHistoryForSquash(target, target_id, squash_pc, is_conditional, actually_taken, squash_type, redirect_pc);
@@ -792,6 +996,11 @@ DecoupledBPUWithBTB::commit(unsigned target_id, ThreadID tid)
         // Update predictor components
         updatePredictorComponents(target);
 
+        emitTraceLookupTerminal(
+            target, ftq.frontId(tid),
+            BtbpTraceEvent::TerminalReason::Commit,
+            BtbpTraceEvent::CorrectPath);
+
         ftq.commitTarget(tid);
         dbpBtbStats.fsqEntryCommitted++;
     }
@@ -802,6 +1011,18 @@ DecoupledBPUWithBTB::commit(unsigned target_id, ThreadID tid)
         printTarget(ftq.front(tid));
 
     historyManagers[tid].commit(target_id);
+}
+
+void
+DecoupledBPUWithBTB::closeTraceLookupsAtRoiEnd(ThreadID tid)
+{
+    emitPendingTraceLookupTerminal(
+        tid, BtbpTraceEvent::TerminalReason::RoiEnd,
+        BtbpTraceEvent::UnresolvedPath);
+    closeTraceLookupsFrom(
+        tid, ftq.empty(tid) ? 0 : ftq.frontId(tid),
+        BtbpTraceEvent::TerminalReason::RoiEnd,
+        BtbpTraceEvent::UnresolvedPath);
 }
 
 bool
@@ -993,7 +1214,12 @@ DecoupledBPUWithBTB::createFetchTargetEntry(ThreadID tid)
     // Create a new fetch target entry
     FetchTarget entry;
     entry.tid = tid;
+    entry.addressSpaceId = finalPred.addressSpaceId;
     entry.asidHash = finalPred.asidHash;
+    entry.traceRequestUid = finalPred.traceRequestUid;
+    entry.traceLookupUid = finalPred.traceLookupUid;
+    entry.traceFetchEpoch = finalPred.traceFetchEpoch;
+    entry.lineSize = cpu->cacheLineSize();
     entry.startPC = s0PC;
 
     // Extract branch prediction information

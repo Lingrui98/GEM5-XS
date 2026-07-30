@@ -55,6 +55,7 @@
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/thread_context.hh"
 #include "cpu/o3/trace/TraceReader.hh"
+#include "cpu/pred/btb/probe/btbp_trace_route.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/simple_thread.hh"
 #include "cpu/thread_context.hh"
@@ -69,6 +70,7 @@
 #include "sim/cur_tick.hh"
 #include "sim/full_system.hh"
 #include "sim/process.hh"
+#include "sim/sim_exit.hh"
 #include "sim/stat_control.hh"
 #include "sim/system.hh"
 
@@ -334,11 +336,81 @@ CPU::regProbePoints()
     ppDataAccessComplete = new ProbePointArg<
         std::pair<DynInstPtr, PacketPtr>>(
                 getProbeManager(), "DataAccessComplete");
+    ppBtbpTraceMbtbLookup =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceMbtbLookup");
+    ppBtbpTraceMbtbFill =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceMbtbFill");
+    ppBtbpTraceIPrefetchIssue =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceIPrefetchIssue");
+    ppBtbpTraceLineLifecycle =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceLineLifecycle");
+    ppBtbpTraceL1IDemandAccess =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceL1IDemandAccess");
+    ppBtbpTraceDecodeBranch =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceDecodeBranch");
+    ppBtbpTraceBranchDemand =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceBranchDemand");
 
     fetch.regProbePoints();
     rename.regProbePoints();
     iew.regProbePoints();
     commit.regProbePoints();
+}
+
+void
+CPU::notifyBtbpTrace(
+    const branch_prediction::btb_pred::BtbpTraceEvent &event)
+{
+    using Route = branch_prediction::btb_pred::BtbpTraceRouteClass;
+    branch_prediction::btb_pred::requireBtbpTraceRouteable(event.eventType);
+
+    switch (branch_prediction::btb_pred::btbpTraceRouteClass(event.eventType)) {
+      case Route::MbtbLookup:
+        if (ppBtbpTraceMbtbLookup) {
+            ppBtbpTraceMbtbLookup->notify(event);
+        }
+        break;
+      case Route::MbtbFill:
+        if (ppBtbpTraceMbtbFill) {
+            ppBtbpTraceMbtbFill->notify(event);
+        }
+        break;
+      case Route::IPrefetchIssue:
+        if (ppBtbpTraceIPrefetchIssue) {
+            ppBtbpTraceIPrefetchIssue->notify(event);
+        }
+        break;
+      case Route::LineLifecycle:
+        if (ppBtbpTraceLineLifecycle) {
+            ppBtbpTraceLineLifecycle->notify(event);
+        }
+        break;
+      case Route::L1IDemandAccess:
+        if (ppBtbpTraceL1IDemandAccess) {
+            ppBtbpTraceL1IDemandAccess->notify(event);
+        }
+        break;
+      case Route::DecodeBranch:
+        if (ppBtbpTraceDecodeBranch) {
+            ppBtbpTraceDecodeBranch->notify(event);
+        }
+        break;
+      case Route::BranchDemand:
+        if (ppBtbpTraceBranchDemand) {
+            ppBtbpTraceBranchDemand->notify(event);
+        }
+        break;
+      default:
+        // Unreachable: requireBtbpTraceRouteable panicked on Unsupported.
+        break;
+    }
 }
 
 CPU::CPUStats::CPUStats(CPU *cpu)
@@ -566,6 +638,42 @@ CPU::tick()
     assert(!switchedOut());
     assert(drainState() != DrainState::Drained);
 
+    // Warmup resumes commit on the next tick, but ROI end is terminal: keep
+    // commit frozen while the delayed witness and prefetch drain complete.
+    stopCommitAtBoundaryFlag = roi_done;
+
+    // The stat event runs after the CPU tick that requests a boundary. Emit
+    // the trace witness and change ROI ownership on the following CPU tick,
+    // while retaining the original boundary timestamp and cycle.
+    if (btbpRoiBeginPending && curTick() > btbpRoiBeginTick) {
+        fetch.beginBtbpRoiTracking();
+        btbpRoiTrackingStarted = true;
+        fprintf(stderr,
+                "BTBP ROI_BEGIN_RESET tick=%llu core_cycle=%llu "
+                "committed_insts=%llu reset_mode=scheduled_dump_reset "
+                "activation_tick=%llu\n",
+                static_cast<unsigned long long>(btbpRoiBeginTick),
+                static_cast<unsigned long long>(btbpRoiBeginCycle),
+                static_cast<unsigned long long>(btbpRoiBeginInsts),
+                static_cast<unsigned long long>(curTick()));
+        btbpRoiBeginPending = false;
+    }
+
+    if (btbpRoiEndPending && curTick() > btbpRoiEndTick) {
+        fprintf(stderr,
+                "BTBP ROI_END_REQUEST tick=%llu core_cycle=%llu "
+                "committed_insts=%llu roi_insts=%llu "
+                "requested_roi_insts=%llu activation_tick=%llu\n",
+                static_cast<unsigned long long>(btbpRoiEndTick),
+                static_cast<unsigned long long>(btbpRoiEndCycle),
+                static_cast<unsigned long long>(btbpRoiEndInsts),
+                static_cast<unsigned long long>(btbpMeasuredRoiInsts),
+                static_cast<unsigned long long>(this->roiInstCount),
+                static_cast<unsigned long long>(curTick()));
+        fetch.beginBtbpRoiDrain();
+        btbpRoiEndPending = false;
+    }
+
     ++baseStats.numCycles;
     ipc_r.roll(1);
     cpi_r++;
@@ -580,6 +688,43 @@ CPU::tick()
     rename.tick();
     decode.tick();
     fetch.tick();
+
+    // v2.7 §4.2: emit roi_begin/roi_end trace records at the end of the
+    // request tick, after all pipeline stages have run, stamped with the
+    // request tick (curTick() == btbpRoi*Tick). The record is thereby written
+    // at the same tick it is stamped with (constraint a), after every CPU-side
+    // event of that tick (constraint b for the x264seek case), and with the
+    // request-tick stamp preserved (constraint c). beginBtbpRoiTracking,
+    // btbpRoiTrackingStarted, beginBtbpRoiDrain, and both BTBP ROI_* stderr
+    // lines remain deferred at the activation slot (curTick() > btbpRoi*Tick)
+    // above; pending stays true until the activation slot consumes it, so the
+    // record is emitted exactly once per boundary.
+    if (btbpRoiBeginPending && curTick() == btbpRoiBeginTick) {
+        branch_prediction::btb_pred::BtbpTraceEvent event;
+        event.tick = btbpRoiBeginTick;
+        event.eventType =
+            branch_prediction::btb_pred::BtbpTraceEvent::RoiBegin;
+        event.threadId = btbpRoiBeginTid;
+        event.coreCycle = btbpRoiBeginCycle;
+        event.coreCycleValid = true;
+        event.committedInsts = btbpRoiBeginInsts;
+        event.committedInstsValid = true;
+        notifyBtbpTrace(event);
+    }
+    if (btbpRoiEndPending && curTick() == btbpRoiEndTick) {
+        branch_prediction::btb_pred::BtbpTraceEvent event;
+        event.tick = btbpRoiEndTick;
+        event.eventType =
+            branch_prediction::btb_pred::BtbpTraceEvent::RoiEnd;
+        event.threadId = btbpRoiEndTid;
+        event.coreCycle = btbpRoiEndCycle;
+        event.coreCycleValid = true;
+        event.committedInsts = btbpRoiEndInsts;
+        event.committedInstsValid = true;
+        event.roiInsts = btbpMeasuredRoiInsts;
+        event.roiInstsValid = true;
+        notifyBtbpTrace(event);
+    }
 
     fetchTimebuffer.advance();
     decodeTimebuffer.advance();
@@ -643,6 +788,23 @@ CPU::startup()
     iew.startupStage();
     rename.startupStage();
     commit.startupStage();
+
+    if (roiInstCount && !warmupInstCount && !btbpRoiTrackingStarted) {
+        fetch.beginBtbpRoiTracking();
+        btbpRoiTrackingStarted = true;
+        branch_prediction::btb_pred::BtbpTraceEvent event;
+        event.tick = curTick();
+        event.eventType = branch_prediction::btb_pred::BtbpTraceEvent::RoiBegin;
+        event.coreCycle = curCycle();
+        event.coreCycleValid = true;
+        event.committedInstsValid = true;
+        notifyBtbpTrace(event);
+        fprintf(stderr,
+                "BTBP ROI_BEGIN_RESET tick=%llu core_cycle=%llu "
+                "committed_insts=0 reset_mode=simulation_start\n",
+                static_cast<unsigned long long>(curTick()),
+                static_cast<unsigned long long>(curCycle()));
+    }
 }
 
 void
@@ -1361,8 +1523,11 @@ CPU::addInst(const DynInstPtr &inst)
 }
 
 void
-CPU::instDone(ThreadID tid, const DynInstPtr &inst)
+CPU::instDone(ThreadID tid, const DynInstPtr &inst,
+              Counter traceRecordIndex)
 {
+    const Counter previousCommittedThreadInsts = thread[tid]->numInst;
+
     if (!inst->isMicroop() || inst->isLastMicroop()) {
         thread[tid]->numInst++;
         thread[tid]->threadStats.numInsts++;
@@ -1377,7 +1542,24 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
             cpi_r.roll(1);
         }
 
-        const uint64_t committedThreadInsts = thread[tid]->numInst;
+        const Counter committedThreadInsts = thread[tid]->numInst;
+        const Counter boundaryCommittedInsts =
+            traceRecordIndex ? traceRecordIndex : committedThreadInsts;
+        const Counter previousBoundaryCommittedInsts =
+            traceRecordIndex ? traceRecordIndex - 1 :
+                               previousCommittedThreadInsts;
+
+        // A fused macro advances this architectural count by two. A boundary
+        // crossed by that indivisible macro is therefore target + 1 at most.
+        // Trace-mode boundaries instead use the exact 1-based source-record
+        // index, while architectural counters retain their normal semantics.
+
+        if (this->roiInstCount && !this->warmupInstCount &&
+                !roiEndInstCountSet[tid]) {
+            roiEndInstCounts[tid] =
+                previousBoundaryCommittedInsts + this->roiInstCount;
+            roiEndInstCountSet[tid] = true;
+        }
 
         if (this->nextDumpInstCount && !dump_done
                 && committedThreadInsts >= this->nextDumpInstCount) {
@@ -1395,11 +1577,45 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
         thread[tid]->comInstEventQueue.serviceEvents(thread[tid]->numInst);
 
         if (this->warmupInstCount && !warmup_done &&
-                committedThreadInsts >= this->warmupInstCount) {
-            fprintf(stderr, "Will trigger stat dump and reset\n");
+                boundaryCommittedInsts >= this->warmupInstCount) {
+            panic_if(btbpRoiBeginPending,
+                     "BTBP ROI begin boundary already pending");
+            btbpRoiBeginPending = true;
+            btbpRoiBeginTick = curTick();
+            btbpRoiBeginCycle = curCycle();
+            btbpRoiBeginTid = tid;
+            btbpRoiBeginInsts = boundaryCommittedInsts;
             statistics::schedStatEvent(true, true, curTick(), 0);
-            scheduleInstStop(tid,0,"Will trigger stat dump and reset");
+            exitSimLoop("Will trigger stat dump and reset");
             warmup_done = true;
+            stopCommitAtBoundaryFlag = true;
+
+            if (this->roiInstCount) {
+                roiEndInstCounts[tid] =
+                    boundaryCommittedInsts + this->roiInstCount;
+                roiEndInstCountSet[tid] = true;
+            }
+        }
+
+        if (this->roiInstCount && !roi_done &&
+                roiEndInstCountSet[tid] &&
+                boundaryCommittedInsts >= roiEndInstCounts[tid]) {
+            const Counter roiStartInsts =
+                roiEndInstCounts[tid] - this->roiInstCount;
+            const Counter measuredRoiInsts =
+                boundaryCommittedInsts - roiStartInsts;
+            panic_if(btbpRoiEndPending,
+                     "BTBP ROI end boundary already pending");
+            btbpRoiEndPending = true;
+            btbpRoiEndTick = curTick();
+            btbpRoiEndCycle = curCycle();
+            btbpRoiEndTid = tid;
+            btbpRoiEndInsts = boundaryCommittedInsts;
+            btbpMeasuredRoiInsts = measuredRoiInsts;
+            statistics::schedStatEvent(true, false, curTick(), 0);
+            exitSimLoop("BTBP ROI end");
+            roi_done = true;
+            stopCommitAtBoundaryFlag = true;
         }
     }
 
@@ -1792,6 +2008,28 @@ CPU::shouldDropFdipRefill(ContextID contextId,
                           const Request::XsMetadata &xsMeta) const
 {
     return fetch.shouldDropFdipRefill(contextId, xsMeta);
+}
+
+void
+CPU::notifyEipDemand(ContextID contextId, Addr virtualAddr,
+                     Addr physicalAddr, uint64_t demandId, bool cacheHit,
+                     bool prefetchHit, bool wrongPath,
+                     const Request::XsMetadata &requestMeta)
+{
+    fetch.notifyEipDemand(contextId, virtualAddr, physicalAddr, demandId,
+                          cacheHit, prefetchHit, wrongPath, requestMeta);
+}
+
+void
+CPU::notifyEipFill(ContextID contextId, Addr virtualAddr, Addr physicalAddr)
+{
+    fetch.notifyEipFill(contextId, virtualAddr, physicalAddr);
+}
+
+void
+CPU::notifyEipEvict(ContextID contextId, Addr physicalAddr)
+{
+    fetch.notifyEipEvict(contextId, physicalAddr);
 }
 
 const o3::TraceInstruction*

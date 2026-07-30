@@ -262,7 +262,13 @@ class BaseO3CPU(BaseCPU):
     branchPred = Param.BranchPredictor(DecoupledBPUWithBTB(),
                                        "Branch Predictor")
     fdipIcacheAccessor = Param.BaseCache(NULL,
-        "Optional direct ICache accessor for FDIP phase-2 tag probes")
+        "Optional direct ICache accessor for instruction prefetch requests")
+    eipAlgorithm = Param.String(
+        "disabled", "Entangling algorithm bundle: disabled, tc24, or isca21")
+    eipIssueBandwidth = Param.Unsigned(
+        1, "Maximum accepted EIP requests per core cycle")
+    eipMaxOutstanding = Param.Unsigned(
+        10, "Maximum accepted-but-incomplete EIP requests")
     resolveQueueSize = Param.Unsigned(16, "Number of entries in the branch resolution queue")
     needsTSO = Param.Bool(False, "Enable TSO Memory model")
 

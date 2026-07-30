@@ -339,6 +339,16 @@ TraceFetch::initTraceMode()
     fetch.cpu->pcState(*tracePC, 0);
 
     auto* tc0 = fetch.cpu->getContext(0);
+    // Startup-only arch-state writes: suppress the conditional pipeline
+    // squash that ThreadContext writes normally trigger. The pipeline is
+    // empty at this point, so there is nothing to squash; a spurious
+    // startup squash would cancel the first L1I request and force
+    // trace-replay recovery before any instruction has been bound.
+    const bool suppressStartupSquash = (tc0 != nullptr);
+    if (suppressStartupSquash) {
+        assert(!fetch.cpu->thread.empty());
+        fetch.cpu->thread[0]->noSquashFromTC = true;
+    }
     if (tc0) {
         tc0->pcState(*tracePC);
         RegVal status = tc0->readMiscReg(RiscvISA::MiscRegIndex::MISCREG_STATUS);
@@ -350,6 +360,9 @@ TraceFetch::initTraceMode()
         setupTraceTimingPTW(tc0);
     } else if (traceTimingPTW) {
         fatal("Trace timing PTW enabled but ThreadContext[0] is null\n");
+    }
+    if (suppressStartupSquash) {
+        fetch.cpu->thread[0]->noSquashFromTC = false;
     }
 
     DPRINTF(Fetch,
@@ -383,6 +396,8 @@ TraceFetch::resetStage()
     for (ThreadID tid = 0; tid < fetch.numThreads; ++tid) {
         // 正确路径的期望 trace 索引从 1 开始
         traceFetchExpectedCorrectIdx[tid] = 1;
+        traceSupplyPendingValid[tid] = false;
+        nextWrongPathInstructionOrdinal[tid] = 1;
     }
 
     // Reset trace consumption counter for precise seqNum→trace index mapping
@@ -446,14 +461,42 @@ TraceFetch::fetchTraceInstruction(ThreadID tid, PCStateBase &this_pc)
     if (wrong_path) {
         const unsigned nop_size =
             chooseWrongPathNopSize(tid, this_pc.instAddr());
+        const Addr instruction_pc = this_pc.instAddr();
+        if (!traceSupplyPendingValid[tid] ||
+            traceSupplyPendingPc[tid] != instruction_pc ||
+            traceSupplyPendingSize[tid] != nop_size ||
+            !traceSupplyPendingWrongPath[tid]) {
+            traceSupplyPendingValid[tid] = true;
+            traceSupplyPendingPc[tid] = instruction_pc;
+            traceSupplyPendingSize[tid] = nop_size;
+            traceSupplyPendingOrdinal[tid] =
+                (uint64_t{1} << 63) |
+                nextWrongPathInstructionOrdinal[tid]++;
+            traceSupplyPendingWrongPath[tid] = true;
+        }
+        fetch.pendingTraceInstructionOrdinal[tid] =
+            traceSupplyPendingOrdinal[tid];
+        fetch.pendingTraceInstructionPc[tid] = instruction_pc;
+        fetch.pendingTracePathWrong[tid] = true;
+        fetch.pendingTraceSupplyValid[tid] = true;
+        if (!fetch.traceInstructionBytesReady(
+                tid, instruction_pc, nop_size)) {
+            if (fetch.threads[tid].valid) {
+                fetch.threads[tid].valid = false;
+            }
+            return StallReason::IcacheStall;
+        }
         // RISC-V 32b nop: 0x00000013; 16b compressed nop: 0x0001
         TheISA::MachInst nop = (nop_size == 2)
             ? static_cast<TheISA::MachInst>(0x0001u)
             : static_cast<TheISA::MachInst>(0x00000013u);
         supplyTraceToDecoder(
-            tid, this_pc, nop, this_pc.instAddr(),
+            tid, this_pc, nop, instruction_pc, nop_size,
+            traceSupplyPendingOrdinal[tid], true,
             nop_size == 2 ? "supplied 2B NOP without advancing reader"
                           : "supplied 4B NOP without advancing reader (pred takenPC)");
+        traceSupplyPendingValid[tid] = false;
+        fetch.pendingTraceSupplyValid[tid] = false;
         return StallReason::NoStall;
     }
 
@@ -485,22 +528,48 @@ TraceFetch::fetchTraceInstruction(ThreadID tid, PCStateBase &this_pc)
     }
     pendingTraceInstr = head;
     pendingTraceValid = true;
+    const unsigned instruction_size =
+        head.getInstSizeBytes() ? head.getInstSizeBytes() : 4;
+    const uint64_t instruction_ordinal = head.getSeqNum() + 1;
+    traceSupplyPendingValid[tid] = true;
+    traceSupplyPendingPc[tid] = head.getPC();
+    traceSupplyPendingSize[tid] = instruction_size;
+    traceSupplyPendingOrdinal[tid] = instruction_ordinal;
+    traceSupplyPendingWrongPath[tid] = false;
+    fetch.pendingTraceInstructionOrdinal[tid] = instruction_ordinal;
+    fetch.pendingTraceInstructionPc[tid] = head.getPC();
+    fetch.pendingTracePathWrong[tid] = false;
+    fetch.pendingTraceSupplyValid[tid] = true;
+    if (!fetch.traceInstructionBytesReady(
+            tid, head.getPC(), instruction_size)) {
+        if (fetch.threads[tid].valid) {
+            fetch.threads[tid].valid = false;
+        }
+        return StallReason::IcacheStall;
+    }
     TheISA::MachInst machInst = createMachInstFromTrace(head);
     supplyTraceToDecoder(tid, this_pc, machInst, head.getPC(),
-                         "supplied 4B to decoder (from expected stream head)");
+                         instruction_size, instruction_ordinal, false,
+                         instruction_size == 2 ?
+                             "supplied 2B to decoder (from expected stream head)" :
+                             "supplied 4B to decoder (from expected stream head)");
+    traceSupplyPendingValid[tid] = false;
+    fetch.pendingTraceSupplyValid[tid] = false;
     return StallReason::NoStall;
 }
 
 void
 TraceFetch::supplyTraceToDecoder(ThreadID tid, const PCStateBase &this_pc,
                                  TheISA::MachInst machInst, Addr instrPC,
-                                 const char *tag)
+                                 unsigned instrSize,
+                                 uint64_t traceInstructionOrdinal,
+                                 bool wrongPath, const char *tag)
 {
     auto *dec_ptr = fetch.decoder[tid];
     memcpy(dec_ptr->moreBytesPtr(), &machInst, sizeof(machInst));
     fetch.decoder[tid]->moreBytes(this_pc, instrPC);
-    fetch.threads[tid].startPC = instrPC;
-    fetch.threads[tid].valid = true;
+    fetch.emitTraceDecodeConsume(
+        tid, instrPC, instrSize, traceInstructionOrdinal, wrongPath);
     DPRINTF(Fetch, "[tid:%i] Trace on-demand: %s at PC=0x%llx\n",
             tid, tag, (unsigned long long)instrPC);
 }
@@ -635,13 +704,16 @@ TraceFetch::applyTraceRecoveryAction(ThreadID tid,
         return;
     }
 
+    bool readerRepositioned = false;
     if (action.useTraceIndex) {
         DPRINTF(Fetch,
                 "[tid:%i] Trace recovery action=rollback (%s): traceIndex=%llu\n",
                 tid, action.debugReason ? action.debugReason : "rollback",
                 (unsigned long long)action.rollbackTraceIndex);
         cleanupTraceMetadata(action.rollbackSeqNum);
-        if (!rollbackTraceReaderToIndex(action.rollbackTraceIndex)) {
+        readerRepositioned =
+            rollbackTraceReaderToIndex(action.rollbackTraceIndex);
+        if (!readerRepositioned) {
             DPRINTF(Fetch,
                     "[tid:%i] Warning: Failed to rollback trace reader to traceIndex %llu\n",
                     tid, (unsigned long long)action.rollbackTraceIndex);
@@ -652,14 +724,89 @@ TraceFetch::applyTraceRecoveryAction(ThreadID tid,
                 tid, action.debugReason ? action.debugReason : "rollback",
                 (unsigned long long)action.rollbackSeqNum, action.squashItself);
         cleanupTraceMetadata(action.rollbackSeqNum);
-        if (!rollbackTraceReader(action.rollbackSeqNum, action.squashItself)) {
+        readerRepositioned =
+            rollbackTraceReader(action.rollbackSeqNum, action.squashItself);
+        if (!readerRepositioned) {
             DPRINTF(Fetch,
                     "[tid:%i] Warning: Failed to rollback trace reader to seqNum %llu\n",
                     tid, (unsigned long long)action.rollbackSeqNum);
         }
     }
-    traceExpectedStream[tid].clear();
-    DPRINTF(Fetch, "[tid:%i] Cleared expected trace stream after rollback\n", tid);
+
+    if (readerRepositioned) {
+        // The reader now yields the rollback target as its next instruction;
+        // drop the stale buffer so it is refilled from that position.
+        traceExpectedStream[tid].clear();
+        DPRINTF(Fetch, "[tid:%i] Cleared expected trace stream after rollback\n", tid);
+    } else {
+        // The reader could not be repositioned. Clearing the buffered
+        // expected stream here would silently drop instructions the reader
+        // has already advanced past, desynchronizing trace replay from the
+        // fetch/FTQ stream. Reconcile the buffer against the squash target
+        // instead of discarding it.
+        reconcileTraceStreamToSquashTarget(tid, action.targetPc);
+    }
+}
+
+void
+TraceFetch::reconcileTraceStreamToSquashTarget(ThreadID tid, Addr targetPc)
+{
+    auto &stream = traceExpectedStream[tid];
+    if (stream.empty()) {
+        // Nothing is buffered: the next refill resumes at the reader's
+        // current position, which is also the next undecoded instruction.
+        // Clearing an empty stream cannot corrupt anything.
+        DPRINTF(Fetch,
+                "[tid:%i] Trace reader rollback unresolved and expected "
+                "stream empty; resume at reader position\n", tid);
+        return;
+    }
+
+    // Every buffered entry was pulled from the reader but not yet bound to
+    // a dynamic instruction, so the buffer holds the correct-path stream
+    // starting at the oldest not-yet-decoded instruction, and the reader's
+    // next index equals the buffer head's index plus the buffer size. The
+    // squash restarts decode at targetPc; aligning the buffer head to the
+    // replay target keeps that reader<->buffer invariant intact. Clearing
+    // the buffer instead (the old behavior) would break it: the reader is
+    // not repositioned on this path, so the dropped entries would never be
+    // seen again.
+    size_t drop = 0;
+    bool found = false;
+    for (const auto &ti : stream) {
+        if (ti.isValid() && ti.getPC() == targetPc) {
+            found = true;
+            break;
+        }
+        ++drop;
+    }
+
+    panic_if(!found,
+             "[Fetch][tid:%d] trace squash target PC %#llx is not in the "
+             "buffered expected stream (size=%u, head PC=%#llx sn=%llu) and "
+             "the trace reader could not be repositioned; continuing would "
+             "silently desynchronize trace replay",
+             tid, (unsigned long long)targetPc,
+             (unsigned)stream.size(),
+             (unsigned long long)stream.front().getPC(),
+             (unsigned long long)stream.front().getSeqNum());
+
+    for (size_t i = 0; i < drop; ++i) {
+        DPRINTF(Fetch,
+                "[tid:%i] Reconcile: drop unreplayed buffered trace inst "
+                "PC=%#llx (sn:%llu)\n",
+                tid, (unsigned long long)stream.front().getPC(),
+                (unsigned long long)stream.front().getSeqNum());
+        stream.pop_front();
+    }
+    DPRINTF(Fetch,
+            "[tid:%i] Reconciled expected trace stream to squash target "
+            "PC=%#llx: dropped %u buffered entries, new head PC=%#llx "
+            "(sn:%llu), %u entries kept\n",
+            tid, (unsigned long long)targetPc, (unsigned)drop,
+            (unsigned long long)stream.front().getPC(),
+            (unsigned long long)stream.front().getSeqNum(),
+            (unsigned)stream.size());
 }
 
 bool
@@ -977,6 +1124,8 @@ TraceFetch::handleTraceSquash(ThreadID tid, const PCStateBase &new_pc,
         return;
     }
 
+    traceSupplyPendingValid[tid] = false;
+
     TraceRecoveryAction action;
     if (traceWrongPathActive) {
         DPRINTF(Fetch,
@@ -991,6 +1140,7 @@ TraceFetch::handleTraceSquash(ThreadID tid, const PCStateBase &new_pc,
         traceWrongPathForceMinStep = false;
         action = classifyNormalSquash(tid, new_pc, squashInst, seqNum);
     }
+    action.targetPc = new_pc.instAddr();
 
     applyTraceRecoveryAction(tid, action);
 }

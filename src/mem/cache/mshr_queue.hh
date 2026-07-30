@@ -55,6 +55,34 @@
 namespace gem5
 {
 
+struct MSHRPartitionOccupancy
+{
+    unsigned demandOwned = 0;
+    unsigned instPrefetchOwned = 0;
+};
+
+class MSHRPartitionPolicy
+{
+  public:
+    static constexpr bool
+    canAllocate(MSHR::AllocationOwner owner,
+                const MSHRPartitionOccupancy &occupancy,
+                unsigned demand_limit, unsigned inst_prefetch_limit)
+    {
+        switch (owner) {
+          case MSHR::AllocationOwner::Demand:
+            return demand_limit == 0 ||
+                   occupancy.demandOwned < demand_limit;
+          case MSHR::AllocationOwner::InstPrefetch:
+            return inst_prefetch_limit == 0 ||
+                   occupancy.instPrefetchOwned < inst_prefetch_limit;
+          case MSHR::AllocationOwner::Unallocated:
+            return false;
+        }
+        return false;
+    }
+};
+
 /**
  * A Class for maintaining a list of pending and allocated memory requests.
  */
@@ -74,6 +102,14 @@ class MSHRQueue : public Queue<MSHR>
     Tick occupancyLastUpdate;
     /** Time integral of allocated-entry count over the accounting window. */
     Counter occupancyEntryTicks;
+    /** Time integral of demand-owned entry count. */
+    Counter occupancyDemandEntryTicks;
+    /** Time integral of instruction-prefetch-owned entry count. */
+    Counter occupancyInstPrefetchEntryTicks;
+    /** Time integral for which every MSHR entry is allocated. */
+    Counter occupancyFullTicks;
+    /** Time integral at the Stage-A common-resource total of 14 entries. */
+    Counter occupancyFourteenEntryFullTicks;
 
     void updateOccupancyStats(Tick now);
 
@@ -118,6 +154,15 @@ class MSHRQueue : public Queue<MSHR>
 
     /** Return accumulated entry*tick integral up to @p now. */
     Counter getOccupancyEntryTicks(Tick now) const;
+
+    Counter getDemandOccupancyEntryTicks(Tick now) const;
+
+    Counter getInstPrefetchOccupancyEntryTicks(Tick now) const;
+
+    /** Return accumulated ticks at full queue occupancy up to @p now. */
+    Counter getOccupancyFullTicks(Tick now) const;
+
+    Counter getFourteenEntryFullTicks(Tick now) const;
 
     /** Return elapsed ticks in the current occupancy accounting window. */
     Tick getOccupancyElapsedTicks(Tick now) const;
@@ -185,26 +230,25 @@ class MSHRQueue : public Queue<MSHR>
         return (allocated < numEntries - (numReserve + 1 + demandReserve));
     }
 
-    int countPureFDIPEntries() const
+    MSHRPartitionOccupancy partitionOccupancy() const
     {
-        int pure_fdip_entries = 0;
+        MSHRPartitionOccupancy occupancy;
         for (const auto &entry : allocatedList) {
-            if (entry->hasFromFDIP() && !entry->hasFromDemand()) {
-                ++pure_fdip_entries;
+            if (entry->allocatedByInstPrefetch()) {
+                ++occupancy.instPrefetchOwned;
+            } else {
+                ++occupancy.demandOwned;
             }
         }
-        return pure_fdip_entries;
+        return occupancy;
     }
 
-    bool canAllocateFDIP(int fdip_quota) const
+    bool canAllocate(MSHR::AllocationOwner owner, unsigned demand_limit,
+                     unsigned inst_prefetch_limit) const
     {
-        return fdip_quota <= 0 || countPureFDIPEntries() < fdip_quota;
-    }
-
-    bool preservesDemandEntries(int demand_entries) const
-    {
-        return demand_entries <= 0 ||
-               allocated < numEntries - (numReserve + demand_entries);
+        return MSHRPartitionPolicy::canAllocate(
+            owner, partitionOccupancy(), demand_limit,
+            inst_prefetch_limit);
     }
 };
 
