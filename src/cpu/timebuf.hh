@@ -185,8 +185,10 @@ class TimeBuffer
         if (ptr >= (int)size)
             ptr -= size;
         (reinterpret_cast<T *>(index[ptr]))->~T();
-        std::memset(index[ptr], 0, sizeof(T));
-        new (index[ptr]) T;
+        // Value-initialize (T with parens): zero-initializes POD members
+        // (what the former explicit memset did) and runs the non-trivial
+        // default constructors, yielding the same observable object state.
+        new (index[ptr]) T();
     }
 
   protected:

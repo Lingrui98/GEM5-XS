@@ -662,14 +662,19 @@ envs = {
     'debug': env.Clone(ENV_LABEL='debug', OBJSUFFIX='.do'),
     'opt': env.Clone(ENV_LABEL='opt', OBJSUFFIX='.o'),
     'fast': env.Clone(ENV_LABEL='fast', OBJSUFFIX='.fo'),
+    # Simulation-only production variant: opt flags + NDEBUG (asserts and
+    # #ifndef NDEBUG verification blocks compiled out) while keeping
+    # TRACING_ON=1 so DPRINTF and the BtbpTracer path stay functional.
+    'nd': env.Clone(ENV_LABEL='nd', OBJSUFFIX='.no'),
 }
 
 envs['debug'].Append(CPPDEFINES=['DEBUG', 'TRACING_ON=1'])
 envs['opt'].Append(CCFLAGS=['-g'], CPPDEFINES=['TRACING_ON=1'])
 envs['fast'].Append(CPPDEFINES=['NDEBUG', 'TRACING_ON=0'])
+envs['nd'].Append(CCFLAGS=['-g'], CPPDEFINES=['TRACING_ON=1', 'NDEBUG'])
 
 if GetOption('debug_cycle'):
-    for target in ['debug', 'opt', 'fast']:
+    for target in ['debug', 'opt', 'fast', 'nd']:
         envs[target].Append(CPPDEFINES=['DEBUG_SHOW_CYCLES'])
 
 # For Link Time Optimization, the optimisation flags used to compile
@@ -684,7 +689,7 @@ if env['GCC']:
     envs['debug'].Append(LINKFLAGS=['-O0'])
     # opt and fast share the same cc flags, also add the optimization to the
     # linkflags as LTO defers the optimization to link time
-    for target in ['opt', 'fast']:
+    for target in ['opt', 'fast', 'nd']:
         envs[target].Append(CCFLAGS=['-O3', '${LTO_CCFLAGS}'])
         envs[target].Append(LINKFLAGS=['-O3', '${LTO_LINKFLAGS}'])
 

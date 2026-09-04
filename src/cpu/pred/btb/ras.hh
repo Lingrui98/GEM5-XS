@@ -154,6 +154,12 @@ namespace btb_pred {
         RASEssential getTop_meta(ThreadID tid);
 
         void printStack(const char *when, ThreadID tid) {
+            // Whole-stack walks (numEntries + inflight entries) run per
+            // call/return event even with the flag off; skip them then.
+            // Output is identical with the flag on.
+            if (!debug::RAS) {
+                return;
+            }
             auto &state = threadStates[tid];
             DPRINTF(RAS, "[tid:%u] printStack when %s: \n", tid, when);
             for (int i = 0; i < numEntries; i++) {

@@ -276,11 +276,13 @@ BTBITTAGE::update(const FetchTarget &stream)
     // get tage predictions from meta
     // TODO: use component idx
     auto meta = std::static_pointer_cast<TageMeta>(stream.predMetas[getComponentIdx()]);
-    auto preds = meta->preds;
-    auto updateTagFoldedHist = meta->tagFoldedHist;
-    auto updateAltTagFoldedHist = meta->altTagFoldedHist;
-    auto updateIndexFoldedHist = meta->indexFoldedHist;
-    
+    // Borrow the meta state below (all uses are read-only); the former
+    // by-value locals deep-copied the map and three vectors per update.
+    const auto &preds = meta->preds;
+    const auto &updateTagFoldedHist = meta->tagFoldedHist;
+    const auto &updateAltTagFoldedHist = meta->altTagFoldedHist;
+    const auto &updateIndexFoldedHist = meta->indexFoldedHist;
+
     // update each branch
     for (auto &btb_entry : all_entries_to_update) {
         bool this_indirect_actual_taken = stream.exeTaken && stream.exeBranchInfo == btb_entry;

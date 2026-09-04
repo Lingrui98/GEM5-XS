@@ -576,7 +576,6 @@ RegVal
 ISA::readMiscReg(int misc_reg)
 {
     int v = readMiscRegNoEffect(MISCREG_VIRMODE);
-    auto pm = readMiscRegNoEffect(MISCREG_PRV);
     if ((v == 1) && (misc_reg == MISCREG_SSCRATCH)) {
         return readMiscRegNoEffect(MISCREG_VSSCRATCH);
     }
