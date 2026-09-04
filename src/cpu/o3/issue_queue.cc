@@ -41,8 +41,18 @@
     do {                                                                                  \
         (x)->setInReadyQ();                                                               \
         auto& readyQ = readyQclassify[(x)->opClass()];                                    \
-        auto it = std::lower_bound(readyQ->begin(), readyQ->end(), (x), select_policy()); \
-        readyQ->insert(it, (x));                                                          \
+        /* New entries carry a fresh (ageCtr, seqNum), which the strict  */               \
+        /* select_policy ordering makes younger than every queued inst  */               \
+        /* in the common case; fast-path the tail insert and fall back  */               \
+        /* to lower_bound only when the ordering says otherwise.        */               \
+        if (readyQ->empty() ||                                                            \
+            select_policy()(*(std::prev(readyQ->end())), (x))) {                         \
+            readyQ->push_back((x));                                                       \
+        } else {                                                                          \
+            auto it = std::lower_bound(readyQ->begin(), readyQ->end(), (x),               \
+                                       select_policy());                                  \
+            readyQ->insert(it, (x));                                                      \
+        }                                                                                 \
     } while (0)
 
 // must be consistent with FUScheduler.py
@@ -712,9 +722,11 @@ IssueQue::selectInst()
     selectQ.clear();
     for (int pi = 0; pi < outports; pi++) {
         auto readyQ = readyQs[pi];
-        for (auto it = readyQ->begin(); it != readyQ->end(); ++it) {
-            DPRINTF(Schedule, "readyQ for port %d has [sn:%llu] %s [tid:%u]\n", pi, (*it)->seqNum,
-                    (*it)->genDisassembly(), (*it)->threadNumber);
+        if (DTRACE(Schedule)) {
+            for (auto it = readyQ->begin(); it != readyQ->end(); ++it) {
+                DPRINTF(Schedule, "readyQ for port %d has [sn:%llu] %s [tid:%u]\n", pi, (*it)->seqNum,
+                        (*it)->genDisassembly(), (*it)->threadNumber);
+            }
         }
 
         selector->begin(readyQ);

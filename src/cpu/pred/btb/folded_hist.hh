@@ -63,11 +63,11 @@ class FoldedHistBase
     std::size_t maxShamt;   // Maximum shift amount for history updates
     uint64_t _folded;       // The folded history bits
 
-    // Pre-calculated positions for efficient history updates
-    // Use static sized type to avoid heap alloc
-    // This class is very frequently used in fetch/BP, so ensure it is a fixed-sized object
-    std::array<std::size_t, staticMaxShamtLimit> posHighestBitsInGhr;  // Positions of highest bits in global history
-    std::array<std::size_t, staticMaxShamtLimit> posHighestBitsInOldFoldedHist;  // Positions in old folded history
+    // The update paths formerly consulted two precomputed position tables
+    // (posHighestBitsInGhr[i] = histLen-1-i, posHighestBitsInOldFoldedHist[i]
+    // = (histLen-1-i) % foldedLen). They are pure functions of the config, so
+    // update() computes them inline; this keeps FoldedHistBase small (~40 B)
+    // and makes the per-prediction meta-snapshot copies cheap.
 
     // Perform an immediate fold on given history bitvec
     uint64_t fold(const boost::dynamic_bitset<> &historyBitVec) const;
@@ -84,10 +84,6 @@ class FoldedHistBase
     {
         assert(maxShamt <= staticMaxShamtLimit);
         assert(foldedLen + maxShamt < 64);  // Ensure folded history fits in uint64_t
-        for (int i = 0; i < maxShamt; i++) {
-            posHighestBitsInGhr[i] = histLen - 1 - i;
-            posHighestBitsInOldFoldedHist[i] = (histLen - 1 - i) % foldedLen;
-        }
     }
 
     virtual ~FoldedHistBase() = default;

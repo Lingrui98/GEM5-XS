@@ -587,6 +587,30 @@ struct FullBTBPrediction
         s1Source(-1),
         s3Source(-1) {}
 
+    /** Reset to the default-constructed state while retaining the heap
+     * capacity of the containers (a fresh temporary would free and re-grow
+     * them on every prediction; the byte-level post-state here matches the
+     * default constructor field-for-field). */
+    void clear() {
+        // Note: this trace-new variant of FullBTBPrediction carries neither
+        // the addressSpaceId nor the BTBP trace-identity fields; the reset
+        // here mirrors the default constructor field-for-field for the
+        // fields that exist on this branch.
+        tid = 0;
+        asidHash = 0;
+        bbStart = 0;
+        btbEntries.clear();
+        condTakens.clear();
+        indirectTargets.clear();
+        returnTarget = 0;
+        tageInfoForMgscs.clear();
+        predSource = 0;
+        overrideReason = OverrideReason::NO_OVERRIDE;
+        predTick = 0;
+        s1Source = -1;
+        s3Source = -1;
+    }
+
     BTBEntry getTakenEntry() {
         // IMPORTANT: assume entries are sorted
         for (auto &entry : this->btbEntries) {

@@ -360,6 +360,10 @@ class HistoryManager
      */
     void dump(const char* when)
     {
+        // The per-entry loop below runs even with the flag off; skip it then.
+        if (!debug::DecoupleBPVerbose) {
+            return;
+        }
         DPRINTF(DecoupleBPVerbose, "Dump ideal history %s:\n", when);
 
         // Print each entry in the history list

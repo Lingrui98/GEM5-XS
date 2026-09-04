@@ -124,7 +124,7 @@ DirectionFoldedHist::update(const boost::dynamic_bitset<> &ghr, int shamt, bool 
         // Step 1: Handle the bits that would be lost in shift
         for (int i = 0; i < shamt; i++) {
             // XOR the highest bits from GHR with corresponding positions in folded history
-            temp ^= (ghr[posHighestBitsInGhr[i]] << posHighestBitsInOldFoldedHist[i]);
+            temp ^= (ghr[histLen - 1 - i] << ((histLen - 1 - i) % foldedLen));
         }
 
         // Step 2: Perform the shift
@@ -203,7 +203,7 @@ PathFoldedHist::update(const boost::dynamic_bitset<> &ghr, int shamt, bool taken
             // Step 1: Handle the bits that would be lost in shift
             for (int i = 0; i < shamt; i++) {
                 // XOR the highest bits from GHR with corresponding positions in folded history
-                temp ^= (ghr[posHighestBitsInGhr[i]] << posHighestBitsInOldFoldedHist[i]);
+                temp ^= (ghr[histLen - 1 - i] << ((histLen - 1 - i) % foldedLen));
             }
 
             // Step 2: Perform the shift

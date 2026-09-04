@@ -30,7 +30,9 @@ FetchTargetQueue::insert(FetchTarget& target)
 {
     ThreadID tid = target.tid;
     assert(queue[tid].cap.size() < ftqSize[tid]);
-    queue[tid].cap.push_back(target);
+    // The caller's entry is only read for scalar fields after the insert
+    // (post-move scalars retain their values), so move the containers in.
+    queue[tid].cap.push_back(std::move(target));
 }
 
 void

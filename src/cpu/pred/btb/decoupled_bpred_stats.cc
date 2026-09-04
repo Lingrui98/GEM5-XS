@@ -336,7 +336,7 @@ DecoupledBPUWithBTB::dumpStats()
     }
 }
 
-DecoupledBPUWithBTB::BpTrace::BpTrace(uint64_t fsqId, FetchTarget &target, const DynInstPtr &inst, bool mispred)
+DecoupledBPUWithBTB::BpTrace::BpTrace(uint64_t fsqId, const FetchTarget &target, const DynInstPtr &inst, bool mispred)
 {
     _tick = curTick();
     Addr pc = inst->pcState().instAddr();
@@ -803,10 +803,15 @@ DecoupledBPUWithBTB::updateStatistics(const FetchTarget &target)
             find_it->second++;
         }
 
-        // Track history pattern for mispredictions
-        auto hist(target.history);
-        hist.resize(18);
-        uint64_t pattern = hist.to_ulong();
+        // Track history pattern for mispredictions: extract the low 18
+        // bits directly (the former resize(18)+to_ulong copied the whole
+        // 970-bit GHR first; the extracted value is identical).
+        uint64_t pattern = 0;
+        for (int i = 0; i < 18; i++) {
+            if (target.history[i]) {
+                pattern |= (1ULL << i);
+            }
+        }
         auto find_it_hist = topMispredHist.find(pattern);
         if (find_it_hist == topMispredHist.end()) {
             topMispredHist[pattern] = 1;
@@ -836,7 +841,10 @@ DecoupledBPUWithBTB::commitBranch(const DynInstPtr &inst, bool mispred)
     addBranchClassStat(branchClass, mispred);
 
     // ---------- Find corresponding fetch target entry ----------
-    auto entry = ftq.get(inst->ftqId, inst->threadNumber);
+    // Borrow the FTQ entry (downstream uses are read-only); the former
+    // by-value copy duplicated 3 bitsets + a 32-element history vector +
+    // 8 shared_ptrs per committed branch.
+    const auto &entry = ftq.get(inst->ftqId, inst->threadNumber);
 
     // Record branch trace if enabled
     if (enableBranchTrace) {

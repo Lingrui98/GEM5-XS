@@ -499,8 +499,8 @@ class LSQ
                 r->setXsMetadata(v);
         }
 
-        RequestPtr req(int idx = 0) { return _reqs.at(idx); }
-        const RequestPtr req(int idx = 0) const { return _reqs.at(idx); }
+        const RequestPtr &req(int idx = 0) { return _reqs.at(idx); }
+        const RequestPtr &req(int idx = 0) const { return _reqs.at(idx); }
         size_t numReqs() const { return _reqs.size(); }
 
         Addr getVaddr(int idx = 0) const { return req(idx)->getVaddr(); }
@@ -515,14 +515,14 @@ class LSQ
             return packet();
         }
 
-        virtual RequestPtr
+        virtual const RequestPtr &
         mainReq()
         {
             assert (_reqs.size() == 1);
             return req();
         }
 
-        virtual RequestPtr
+        virtual const RequestPtr &
         mainReq() const
         {
             assert (_reqs.size() == 1);
@@ -811,8 +811,8 @@ class LSQ
                 gem5::ThreadContext *thread, PacketPtr pkt) override;
         bool isCacheBlockHit(Addr blockAddr, Addr cacheBlockMask) override;
 
-        RequestPtr mainReq() override;
-        RequestPtr mainReq() const override;
+        const RequestPtr &mainReq() override;
+        const RequestPtr &mainReq() const override;
         PacketPtr mainPacket() override;
         std::string name() const override { return "SplitDataRequest"; }
     };

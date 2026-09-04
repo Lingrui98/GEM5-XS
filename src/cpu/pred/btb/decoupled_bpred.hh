@@ -224,7 +224,10 @@ class DecoupledBPUWithBTB : public BPredUnit
 
     void clearPreds(ThreadID tid) {
         for (int i = 0; i < threads[tid].predsOfEachStage.size(); ++i) {
-            threads[tid].predsOfEachStage[i] = FullBTBPrediction();
+            // In-place clear keeps container capacity across predictions;
+            // the only writer (requestNewPrediction) re-initializes every
+            // field it reads before use.
+            threads[tid].predsOfEachStage[i].clear();
             threads[tid].predsOfEachStage[i].predSource = i;
         }
     }
@@ -237,6 +240,12 @@ class DecoupledBPUWithBTB : public BPredUnit
     }
 
     void printFullBTBPrediction(const FullBTBPrediction &pred) {
+        // The per-element DPRINTFs are flag-gated, but the container walks
+        // (and their by-value pair copies) run unconditionally; skip them
+        // when the flag is off. Identical output with the flag on.
+        if (!debug::DecoupleBP) {
+            return;
+        }
         DPRINTF(DecoupleBP, "dumping FullBTBPrediction\n");
         DPRINTF(DecoupleBP, "bbStart: %#lx, btbEntry:\n", pred.bbStart);
         for (auto &e: pred.btbEntries) {
@@ -405,7 +414,7 @@ class DecoupledBPUWithBTB : public BPredUnit
             _uint64_data["source"] = source;
             _uint64_data["target"] = target;
         }
-        BpTrace(uint64_t fsqId, FetchTarget &target, const DynInstPtr &inst, bool mispred);
+        BpTrace(uint64_t fsqId, const FetchTarget &target, const DynInstPtr &inst, bool mispred);
     };
 
     // Prediction trace record for tracking prediction-time information

@@ -2157,31 +2157,35 @@ Commit::updateComInstStats(const DynInstPtr &inst)
 
     //  Control Instructions
     if (inst->isControl()) {
-        bool mispred = inst->mispredicted();
-        std::unique_ptr<PCStateBase> tmp_next_pc(inst->pcState().clone());
-        inst->staticInst->advancePC(*tmp_next_pc);
-        // add if taken
-        if (tmp_next_pc->instAddr() != inst->fallThruPC) {
-            BranchInfo temp = {inst->pcState().instAddr(),
-                               tmp_next_pc->instAddr()};
-            if (branchLog.size() >= 20) {
-                branchLog.pop_front();
+        // The clone+advancePC+branchLog bookkeeping below only feeds the
+        // DecoupleBP debug printouts; skip it (and the per-control-inst
+        // heap clone) when that flag is off. Identical output with it on.
+        if (DTRACE(DecoupleBP)) {
+            bool mispred = inst->mispredicted();
+            std::unique_ptr<PCStateBase> tmp_next_pc(inst->pcState().clone());
+            inst->staticInst->advancePC(*tmp_next_pc);
+            // add if taken
+            if (tmp_next_pc->instAddr() != inst->fallThruPC) {
+                BranchInfo temp = {inst->pcState().instAddr(),
+                                   tmp_next_pc->instAddr()};
+                if (branchLog.size() >= 20) {
+                    branchLog.pop_front();
+                }
+                branchLog.push_back(temp);
             }
-            branchLog.push_back(temp);
+            // tracing recent taken branches
+            DPRINTF(DecoupleBP, "Control inst %lu, PC: %#lx -> target: %#lx\n",
+                    inst->seqNum, inst->pcState().instAddr(),
+                    tmp_next_pc->instAddr());
+            DPRINTF(DecoupleBP, "mispredicted: %i, pred taken: %i\n", mispred,
+                    inst->readPredTaken());
+            DPRINTF(DecoupleBP, "Start print branch logs\n");
+            for (auto it : branchLog) {
+                DPRINTF(DecoupleBP, "control pc: %#lx -> target pc: %#lx\n,",
+                        it.pc, it.target);
+            }
+            DPRINTF(DecoupleBP, "End\n");
         }
-        // tracing recent taken branches
-        DPRINTF(DecoupleBP, "Control inst %lu, PC: %#lx -> target: %#lx\n",
-                inst->seqNum, inst->pcState().instAddr(),
-                tmp_next_pc->instAddr());
-        DPRINTF(DecoupleBP, "mispredicted: %i, pred taken: %i\n", mispred,
-                inst->readPredTaken());
-        DPRINTF(DecoupleBP, "Start print branch logs\n");
-        for (auto it : branchLog) {
-            DPRINTF(DecoupleBP, "control pc: %#lx -> target pc: %#lx\n,",
-                    it.pc, it.target);
-        }
-        DPRINTF(DecoupleBP, "End\n");
-
 
         stats.branches[tid]++;
     }

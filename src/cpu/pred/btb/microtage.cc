@@ -953,7 +953,7 @@ MicroTAGE::doUpdateHist(const boost::dynamic_bitset<> &history, bool taken,
         DPRINTF(TAGEHistory, "t: %d, index foldedHist(next) _folded 0x%lx\n",
                 t, nextIndexFoldedHist[t].get());
     }
-    state.aheadIndexFoldedHist.push(nextIndexFoldedHist);
+    state.aheadIndexFoldedHist.push(std::move(nextIndexFoldedHist));
     if (state.aheadIndexFoldedHist.size() > 1) {
         state.aheadIndexFoldedHist.pop();
     }

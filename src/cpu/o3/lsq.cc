@@ -2347,13 +2347,13 @@ LSQ::SplitDataRequest::mainPacket()
     return _mainPacket;
 }
 
-RequestPtr
+const RequestPtr &
 LSQ::SplitDataRequest::mainReq()
 {
     return _mainReq;
 }
 
-RequestPtr
+const RequestPtr &
 LSQ::SplitDataRequest::mainReq() const
 {
     return _mainReq;
