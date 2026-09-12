@@ -1153,3 +1153,317 @@ TEST(R3WindowSmt, IndependentPerTidWindows)
     EXPECT_EQ(tid0.btbMissResteerCycles, 4);
     EXPECT_EQ(tid1.btbMissResteerCycles, 1);
 }
+
+// ===========================================================================
+// PART R4 — frontend recovery window raw counters (commit-squash redirect)
+// Guard: src/cpu/o3/fetch.cc
+//   Fetch::FetchStatGroup::{openRecoveryWindow, closeRecoveryWindow,
+//                           resetStats}   (recovery window machine, shared
+//                                           infrastructure with R3)
+//   Fetch::handleCommitSignals        (recovery window OPEN hook)
+//   Fetch::sendInstructionsToDecode   (close-on-delivery hook)
+//
+// Semantics implemented (D4-A contract R4):
+// - frontendRecoveryCycles / frontendRecoverySlots, per tid, half-open
+//   [open, close), same close rules as the R3 window:
+//     open  = the fetch tick that consumes the commit squash signal
+//             (handleCommitSignals; commitToFetchDelay = 2 cycles after
+//             commit initiated the squash — aligned with "the frontend
+//             starts recovering");
+//     close = first delivery of >= 1 instruction for that tid
+//             (sendInstructionsToDecode), OR a newer commit squash
+//             (overlap rule), OR the stats-reset ROI boundary (discarded,
+//             never billed across the segment boundary);
+//     a decode redirect does NOT close the recovery window (recovery
+//     continues until a delivery; a nested BTB-miss redirect opens its own
+//     R3 window in parallel);
+//     SMT  = independent per-tid windows.
+// - slots = cycles x decodeWidth (notional full-width loss; raw component
+//   only — may overlap fetchBubbles on post-squash cycles and is never
+//   summed into any composite numerator; no badSpecBoundCorrected formula
+//   is produced by this fix).
+// ===========================================================================
+
+namespace
+{
+
+// Full per-tid window machine replica (R3 BTB-miss window + R4 recovery
+// window), mirroring the FetchStatGroup helpers (fetch.cc) and the per-tick
+// hook ordering of Fetch::tick (handleCommitSignals -> handleDecodeSquash
+// -> sendInstructionsToDecode).
+struct FrontendWindowMachine
+{
+    // R3 window.
+    bool btb_active = false;
+    long btb_start = 0;
+    // R4 window.
+    bool rec_active = false;
+    long rec_start = 0;
+
+    long btbMissResteerCycles = 0;
+    long frontendRecoveryCycles = 0;
+    long frontendRecoverySlots = 0;
+
+    long decode_width = 8;
+    long cur_cycle = 0;
+    bool prev_tick_squash = false;
+
+    void
+    close_btb()
+    {
+        if (!btb_active) {
+            return;
+        }
+        const long elapsed = cur_cycle - btb_start;
+        if (elapsed > 0) {
+            btbMissResteerCycles += elapsed;
+        }
+        btb_active = false;
+    }
+
+    void
+    open_btb()
+    {
+        close_btb();
+        btb_active = true;
+        btb_start = cur_cycle;
+    }
+
+    void
+    close_rec()
+    {
+        if (!rec_active) {
+            return;
+        }
+        const long elapsed = cur_cycle - rec_start;
+        if (elapsed > 0) {
+            frontendRecoveryCycles += elapsed;
+            frontendRecoverySlots += elapsed * decode_width;
+        }
+        rec_active = false;
+    }
+
+    void
+    open_rec()
+    {
+        close_rec();
+        rec_active = true;
+        rec_start = cur_cycle;
+    }
+
+    struct TickEvents
+    {
+        bool commit_squash = false;
+        bool decode_redirect_btb_miss = false;
+        bool decode_redirect_other = false;
+        bool delivery = false;
+    };
+
+    void
+    tick(const TickEvents &ev)
+    {
+        bool squash_processed = false;
+
+        // (1) handleCommitSignals: R4 recovery window opens (overlap rule
+        //     closes any open recovery window first); R3 window truncated.
+        if (ev.commit_squash) {
+            open_rec();
+            close_btb();
+            squash_processed = true;
+        }
+
+        // (2) handleDecodeSquash (skipped on commit squash this tick or
+        //     Squashing status from the previous tick).  Does NOT touch the
+        //     recovery window: recovery continues until a delivery.
+        if (!ev.commit_squash && !prev_tick_squash) {
+            if (ev.decode_redirect_btb_miss) {
+                open_btb();
+                squash_processed = true;
+            } else if (ev.decode_redirect_other) {
+                close_btb();
+                squash_processed = true;
+            }
+        }
+
+        // (3) sendInstructionsToDecode: first delivery closes both windows.
+        if (ev.delivery) {
+            close_btb();
+            close_rec();
+        }
+
+        prev_tick_squash = squash_processed;
+        ++cur_cycle;
+    }
+
+    void
+    stats_reset()
+    {
+        btbMissResteerCycles = 0;
+        frontendRecoveryCycles = 0;
+        frontendRecoverySlots = 0;
+        btb_active = false;
+        rec_active = false;
+    }
+};
+
+} // anonymous namespace
+
+// Simple recovery window: squash consumed @0, first delivery @6 -> 6 empty
+// cycles, 6 x decodeWidth notional slots.
+TEST(R4Window, SimpleRecoveryWindowExact)
+{
+    FrontendWindowMachine m;
+    m.tick({true, false, false, false});   // 0: commit squash -> recovery opens
+    for (int i = 1; i < 6; ++i) {
+        m.tick({});
+    }
+    m.tick({false, false, false, true});   // 6: delivery -> [0,6) = 6
+    EXPECT_EQ(m.frontendRecoveryCycles, 6);
+    EXPECT_EQ(m.frontendRecoverySlots, 6 * 8);
+    EXPECT_FALSE(m.rec_active);
+}
+
+// Overlap rule: a second commit squash closes the old recovery window by
+// its elapsed cycles and opens a fresh one (4 + 5 = 9, no double charge).
+TEST(R4Window, RecoveryOverlapClosesOldByElapsed)
+{
+    FrontendWindowMachine m;
+    m.tick({true, false, false, false});   // 0: recovery opens @0
+    for (int i = 1; i < 4; ++i) {
+        m.tick({});
+    }
+    m.tick({true, false, false, false});   // 4: overlap -> +4, reopen @4
+    for (int i = 5; i < 9; ++i) {
+        m.tick({});
+    }
+    m.tick({false, false, false, true});   // 9: delivery -> +5
+    EXPECT_EQ(m.frontendRecoveryCycles, 9);
+    EXPECT_EQ(m.frontendRecoverySlots, 9 * 8);
+}
+
+// G4(e): a nested BTB-miss redirect during an open recovery window opens
+// the R3 window in parallel; the recovery window is NOT closed by the
+// decode redirect.  Attribution is exact and disjoint per window:
+//   recovery [0,8) = 8 cycles; btbMiss [2,8) = 6 cycles.
+TEST(G4eOverlap, RecoveryAndRedirectAttributedExactly)
+{
+    FrontendWindowMachine m;
+    m.tick({true, false, false, false});   // 0: commit squash -> recovery @0
+    m.tick({});                            // 1
+    m.tick({false, true, false, false});   // 2: BTB-miss redirect -> btb @2
+    for (int i = 3; i < 8; ++i) {
+        m.tick({});
+    }
+    m.tick({false, false, false, true});   // 8: delivery closes both
+    EXPECT_EQ(m.frontendRecoveryCycles, 8);
+    EXPECT_EQ(m.frontendRecoverySlots, 8 * 8);
+    EXPECT_EQ(m.btbMissResteerCycles, 6);
+}
+
+// G4(e), other direction: the recovery squash truncates an open BTB-miss
+// window (elapsed 3) and opens its own window; delivery closes the
+// recovery window (4 cycles).
+TEST(G4eOverlap, RecoverySquashTruncatesBtbMissWindow)
+{
+    FrontendWindowMachine m;
+    m.tick({false, true, false, false});   // 0: btb window @0
+    m.tick({});                            // 1
+    m.tick({});                            // 2
+    m.tick({true, false, false, false});   // 3: squash -> truncate btb(+3), recovery @3
+    for (int i = 4; i < 7; ++i) {
+        m.tick({});
+    }
+    m.tick({false, false, false, true});   // 7: delivery -> recovery [3,7) = 4
+    EXPECT_EQ(m.btbMissResteerCycles, 3);
+    EXPECT_EQ(m.frontendRecoveryCycles, 4);
+    EXPECT_EQ(m.frontendRecoverySlots, 4 * 8);
+}
+
+// Same-tick squash + delivery charges zero (the squash cleared the queue
+// but the fetch phase refilled and delivered within the same tick).
+TEST(R4Window, SameTickSquashDeliveryChargesZero)
+{
+    FrontendWindowMachine m;
+    m.tick({true, false, false, true});    // squash + delivery in one tick
+    EXPECT_EQ(m.frontendRecoveryCycles, 0);
+    EXPECT_EQ(m.frontendRecoverySlots, 0);
+    EXPECT_FALSE(m.rec_active);
+}
+
+// G4(f): a recovery window open at the stats-reset boundary is discarded
+// (billed to neither segment); a post-boundary window is billed wholly to
+// the new segment.
+TEST(G4fRoiResetRecovery, OpenRecoveryWindowDiscardedNotBilled)
+{
+    FrontendWindowMachine m;
+
+    // Segment 1: closed recovery window (2 cycles), then a window opened
+    // @3 that is still open at the boundary after tick 6.
+    m.tick({true, false, false, false});   // 0: recovery @0
+    m.tick({false, false, false, true});   // 1: delivery -> 1
+    EXPECT_EQ(m.frontendRecoveryCycles, 1);
+    m.tick({});                            // 2
+    m.tick({true, false, false, false});   // 3: recovery @3
+    for (int i = 4; i <= 6; ++i) {
+        m.tick({});
+    }
+    EXPECT_TRUE(m.rec_active);
+
+    // Stats reset: counters zeroed, open window truncated WITHOUT charge.
+    m.stats_reset();
+    EXPECT_FALSE(m.rec_active);
+    EXPECT_EQ(m.frontendRecoveryCycles, 0);
+
+    // Segment 2: delivery closes nothing; a fresh recovery window is
+    // billed wholly inside segment 2.
+    m.tick({false, false, false, true});   // 7: delivery, no open window
+    EXPECT_EQ(m.frontendRecoveryCycles, 0);
+    m.tick({true, false, false, false});   // 8: recovery @8
+    for (int i = 9; i < 12; ++i) {
+        m.tick({});
+    }
+    m.tick({false, false, false, true});   // 12: delivery -> [8,12) = 4
+    EXPECT_EQ(m.frontendRecoveryCycles, 4);
+    EXPECT_EQ(m.frontendRecoverySlots, 4 * 8);
+}
+
+// G6 budget sanity (SINGLE-TID scope): recovery slots are cycles x decodeWidth
+// and the recovery window never spans more cycles than the timeline itself.
+// In SMT each tid's window is accounted independently at full width, so the
+// SUM over tids may exceed the machine's per-cycle decode budget — the
+// machine-budget claim only holds per tid / single-thread.
+TEST(G6BudgetRecovery, PerTidSlotsEqualCyclesTimesWidthAndRespectBudget)
+{
+    FrontendWindowMachine m;
+    m.tick({true, false, false, false});   // 0
+    for (int i = 1; i < 10; ++i) {
+        m.tick({});
+    }
+    m.tick({false, false, false, true});   // 10
+    m.tick({true, false, false, false});   // 11
+    for (int i = 12; i < 20; ++i) {
+        m.tick({});
+    }
+    m.tick({false, false, false, true});   // 20
+    const long num_cycles = m.cur_cycle;
+    EXPECT_EQ(m.frontendRecoverySlots,
+              m.frontendRecoveryCycles * m.decode_width);
+    EXPECT_LE(m.frontendRecoveryCycles, num_cycles);
+    EXPECT_LE(m.frontendRecoverySlots, num_cycles * m.decode_width);
+}
+
+// SMT: per-tid independence (delivery on one tid does not close the
+// other tid's recovery window).
+TEST(R4WindowSmt, IndependentPerTidRecoveryWindows)
+{
+    FrontendWindowMachine tid0;
+    FrontendWindowMachine tid1;
+    tid0.tick({true, false, false, false});          // 0: tid0 recovery @0
+    tid1.tick({true, false, false, false});          // 0: tid1 recovery @0
+    tid1.tick({false, false, false, true});          // 1: tid1 delivers -> 1
+    tid0.tick({});                                   // 1
+    tid0.tick({});                                   // 2
+    tid0.tick({false, false, false, true});          // 3: tid0 -> [0,3) = 3
+    EXPECT_EQ(tid0.frontendRecoveryCycles, 3);
+    EXPECT_EQ(tid1.frontendRecoveryCycles, 1);
+}

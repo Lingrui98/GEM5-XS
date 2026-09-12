@@ -1311,6 +1311,16 @@ class Fetch
          * Branch_Resteers.
          */
         statistics::Formula gem5BranchResteers;
+        /**
+         * D4-A R4: cycles from fetch consuming a commit squash to the
+         * first instruction delivered to decode for that thread.
+         */
+        statistics::Scalar frontendRecoveryCycles;
+        /**
+         * D4-A R4: notional full-width decode slots lost inside frontend
+         * recovery windows (frontendRecoveryCycles x decodeWidth).
+         */
+        statistics::Scalar frontendRecoverySlots;
         /** Stat for total cycles the resolve queue is full. */
         statistics::Scalar resolveQueueFullEvents;
         /** Stat for total number of resolve enqueue fail events. */
@@ -1386,6 +1396,8 @@ class Fetch
 
         /** R3: per-tid BTB-miss decode-redirect windows. */
         FrontendWindow btbMissWindow[MaxThreads];
+        /** R4: per-tid commit-squash recovery windows. */
+        FrontendWindow recoveryWindow[MaxThreads];
 
         /**
          * R3: close the per-tid BTB-miss window if open, charging the
@@ -1402,6 +1414,23 @@ class Fetch
          * at the current cycle.
          */
         void openBtbMissWindow(ThreadID tid);
+
+        /**
+         * R4: close the per-tid recovery window if open, charging the
+         * elapsed cycles to frontendRecoveryCycles and the notional
+         * full-width slots (x decodeWidth) to frontendRecoverySlots.
+         * Same close rules as the R3 window (delivery / newer squash /
+         * ROI-boundary discard).  Note: these are independent raw
+         * components — recovery windows may overlap fetchBubbles on
+         * cycles after the ROB squash completes but before delivery, and
+         * must never be summed into any composite numerator.
+         */
+        void closeRecoveryWindow(ThreadID tid);
+        /**
+         * R4: open (or restart — overlap rule) the per-tid recovery
+         * window at the current cycle.
+         */
+        void openRecoveryWindow(ThreadID tid);
 
         /**
          * D4-A ROI boundary: the stats reset (e.g. warmupInstCount

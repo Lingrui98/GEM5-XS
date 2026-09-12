@@ -299,6 +299,16 @@ Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
              "is ONLY the BTB-miss subset of decode redirects as seen by "
              "this frontend; it is NOT the full Intel TMA Branch_Resteers",
              btbMissResteerCycles / cpu->baseStats.numCycles),
+    ADD_STAT(frontendRecoveryCycles, statistics::units::Cycle::get(),
+             "Cycles from fetch consuming a commit squash (recovery "
+             "window start; commitToFetchDelay = 2 cycles after commit "
+             "initiated it) to the first instruction delivered to decode "
+             "for that thread"),
+    ADD_STAT(frontendRecoverySlots, statistics::units::Count::get(),
+             "Notional full-width decode slots lost inside frontend "
+             "recovery windows (frontendRecoveryCycles x decodeWidth).  "
+             "Raw component only: may overlap fetchBubbles on post-squash "
+             "cycles and must never be summed into a composite numerator"),
     ADD_STAT(resolveQueueFullEvents, statistics::units::Count::get(),
              "Number of events the resolve queue becomes full"),
     ADD_STAT(resolveEnqueueFailEvent, statistics::units::Count::get(),
@@ -518,6 +528,32 @@ Fetch::FetchStatGroup::openBtbMissWindow(ThreadID tid)
 }
 
 void
+Fetch::FetchStatGroup::closeRecoveryWindow(ThreadID tid)
+{
+    if (!recoveryWindow[tid].active) {
+        return;
+    }
+    // Same half-open interval semantics as the R3 window.
+    const uint64_t elapsed =
+        cpu->curCycle() - recoveryWindow[tid].start;
+    if (elapsed > 0) {
+        frontendRecoveryCycles += elapsed;
+        frontendRecoverySlots += elapsed * fetch->decodeWidth;
+    }
+    recoveryWindow[tid].active = false;
+}
+
+void
+Fetch::FetchStatGroup::openRecoveryWindow(ThreadID tid)
+{
+    // Overlap rule (same as R3): a newer commit squash closes any open
+    // recovery window by its elapsed cycles first, then opens a fresh one.
+    closeRecoveryWindow(tid);
+    recoveryWindow[tid].active = true;
+    recoveryWindow[tid].start = cpu->curCycle();
+}
+
+void
 Fetch::FetchStatGroup::resetStats()
 {
     // Default behaviour first: wipe the stat storages.
@@ -529,8 +565,15 @@ Fetch::FetchStatGroup::resetStats()
     // WITHOUT charging: a window open at the boundary belongs (by charge-
     // at-close) to the segment that was just dumped without ever being
     // billed there, so discarding it bills those cycles to neither segment
-    // and no window is ever billed across the ROI boundary.
+    // and no window is ever billed across the ROI boundary.  Adopted
+    // semantics: only COMPLETE windows (closed inside a segment) are
+    // charged; empty cycles after the boundary and before the next
+    // delivery/redirect/squash event are attributed to no window by
+    // design (the contract forbids billing any window across segments).
     for (auto &w : btbMissWindow) {
+        w.active = false;
+    }
+    for (auto &w : recoveryWindow) {
         w.active = false;
     }
 }
@@ -2395,6 +2438,7 @@ Fetch::sendInstructionsToDecode()
     // the defined end point).
     if (insts_to_decode >= 1) {
         fetchStats.closeBtbMissWindow(tid);
+        fetchStats.closeRecoveryWindow(tid);
     }
 
     // If there was activity this cycle, inform the CPU of it
@@ -2635,6 +2679,13 @@ Fetch::handleCommitSignals(ThreadID tid)
         }
 
     // In any case, squash.
+    // D4-A R4: the frontend recovery window opens in this fetch tick —
+    // the cycle fetch consumes the commit squash signal (commitToFetch-
+    // Delay = 2 cycles after commit initiated it), aligned with "the
+    // frontend starts recovering".  The overlap rule closes any open
+    // recovery window by its elapsed cycles first.  Statistics-only
+    // bookkeeping.
+    fetchStats.openRecoveryWindow(tid);
     // D4-A R3: a deeper (commit-side) squash invalidates the path an open
     // BTB-miss redirect window was waiting for — truncate it by its
     // elapsed cycles (the "interrupted by a subsequent squash" rule; the
