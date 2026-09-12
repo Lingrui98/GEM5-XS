@@ -1303,11 +1303,23 @@ Scheduler::issueAndSelect()
         int misslevel = lsq->anyInflightLoadsNotComplete();
         if (misslevel != 0)
             stats.memstall_any_load++;
-        if ((misslevel & ((1 << 1) - 1)) == ((1 << 1) - 1))
+        // misslevel bit encoding (LSQ::anyInflightLoadsNotComplete, lsq.cc):
+        //   bit0 set = an inflight load has missed cache level 1 (depth==1),
+        //   bit1 set = an inflight load has missed cache level 2 (depth==2),
+        //   bit2 set = an inflight load has missed cache level 3 (depth==3),
+        //   bit3 set = any outstanding miss.
+        // depth==k means the request has already missed cache level k (each
+        // cache-level miss bumps Request::depth once), so a level-k miss
+        // necessarily missed every level below it.  Count with cumulative
+        // ("at least level k in flight") semantics:
+        //   l1miss: any depth>=1 miss in flight  (any of bits 0..2 set)
+        //   l2miss: any depth>=2 miss in flight  (bit1 or bit2 set)
+        //   l3miss: any depth>=3 miss in flight  (bit2 set)
+        if (misslevel & 0x7)
             stats.memstall_l1miss++;
-        if ((misslevel & ((1 << 2) - 1)) == ((1 << 2) - 1))
+        if (misslevel & 0x6)
             stats.memstall_l2miss++;
-        if ((misslevel & ((1 << 3) - 1)) == ((1 << 3) - 1))
+        if (misslevel & 0x4)
             stats.memstall_l3miss++;
     } else if (instsToFu.size() < intel_fewops) {
         if (lsq->anyStoreNotExecute())

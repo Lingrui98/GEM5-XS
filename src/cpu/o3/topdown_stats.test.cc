@@ -521,3 +521,155 @@ TEST(R6TotalSquash, ValuePredictionNonzeroIsCounted)
               totalSquashLegacy(branch, order_violation, trap, tc,
                                 squash_after) + vp);
 }
+
+// ===========================================================================
+// PART R7 — memstall misslevel cumulative semantics
+// Guard: src/cpu/o3/issue_queue.cc (Scheduler::issueAndSelect: the three
+//        memstall_l{1,2,3}miss decisions)
+// Bit encoding definition (NOT modified by the fix):
+//   src/cpu/o3/lsq.cc LSQ::anyInflightLoadsNotComplete()
+//     bit0 (0x1) = an inflight load has missed cache level 1 (depth == 1)
+//     bit1 (0x2) = an inflight load has missed cache level 2 (depth == 2)
+//     bit2 (0x4) = an inflight load has missed cache level 3 (depth == 3)
+//     bit3 (0x8) = any outstanding miss
+//
+// Failure mode (without fix): the consumer treated the per-level existence
+// flags as an exact low-bit mask, e.g. l3miss required bits 0..2 ALL set
+// (an L1 miss AND an L2 miss AND an L3 miss in flight simultaneously).
+// A cycle with only an L3 miss in flight (misslevel 0xC) charged none of
+// l1/l2/l3miss.  depth == k means the request has already missed cache
+// level k (each cache-level miss bumps Request::depth exactly once, see
+// BaseCache::incMissCount -> Request::incAccessDepth), so a level-k miss
+// necessarily missed every level below: cumulative ("at least level k in
+// flight") semantics are the correct consumption.
+//
+// Fixed decisions:
+//   l1miss: (misslevel & 0x7) != 0   any depth >= 1 miss in flight
+//   l2miss: (misslevel & 0x6) != 0   any depth >= 2 miss in flight
+//   l3miss: (misslevel & 0x4) != 0   any depth >= 3 miss in flight
+// ===========================================================================
+
+namespace
+{
+
+struct MemstallDelta
+{
+    int l1miss = 0;
+    int l2miss = 0;
+    int l3miss = 0;
+};
+
+// Fixed issue_queue.cc decisions (cumulative semantics).
+MemstallDelta
+memstallDecisionFixed(int misslevel)
+{
+    return MemstallDelta{(misslevel & 0x7) ? 1 : 0,
+                         (misslevel & 0x6) ? 1 : 0,
+                         (misslevel & 0x4) ? 1 : 0};
+}
+
+// Pre-fix (legacy) issue_queue.cc decisions: exact-mask equality on the
+// low k bits (all of bits 0..k-1 must be set simultaneously).
+MemstallDelta
+memstallDecisionLegacy(int misslevel)
+{
+    return MemstallDelta{
+        (misslevel & ((1 << 1) - 1)) == ((1 << 1) - 1) ? 1 : 0,
+        (misslevel & ((1 << 2) - 1)) == ((1 << 2) - 1) ? 1 : 0,
+        (misslevel & ((1 << 3) - 1)) == ((1 << 3) - 1) ? 1 : 0};
+}
+
+} // anonymous namespace
+
+// Full 8-combination truth table over the depth-existence bits
+// (bit0 = depth1 exists, bit1 = depth2 exists, bit2 = depth3 exists),
+// each combined with the any-bit (0x8) which must not affect the
+// level decisions.  Exact expected values for every combination.
+TEST(R7Misslevel, AllEightDepthCombinationsExactExpectations)
+{
+    // {misslevel_low3, expected(l1, l2, l3)} — cumulative semantics:
+    //   l1: any depth >= 1  (any of bits 0..2)
+    //   l2: any depth >= 2  (bit1 or bit2)
+    //   l3: any depth >= 3  (bit2)
+    const struct
+    {
+        int low3;
+        int l1;
+        int l2;
+        int l3;
+    } expect[8] = {
+        {0x0, 0, 0, 0},  // no miss in flight
+        {0x1, 1, 0, 0},  // depth-1 miss only (missed L1)
+        {0x2, 1, 1, 0},  // depth-2 miss only (missed L1+L2)
+        {0x3, 1, 1, 0},  // depth-1 + depth-2 misses in flight
+        {0x4, 1, 1, 1},  // depth-3 miss only (missed L1+L2+L3)
+        {0x5, 1, 1, 1},  // depth-1 + depth-3 misses
+        {0x6, 1, 1, 1},  // depth-2 + depth-3 misses
+        {0x7, 1, 1, 1},  // depth-1 + depth-2 + depth-3 misses
+    };
+
+    for (const auto &e : expect) {
+        for (const int any_bit : {0, 0x8}) {
+            const int misslevel = e.low3 | any_bit;
+            const auto d = memstallDecisionFixed(misslevel);
+            EXPECT_EQ(d.l1miss, e.l1);
+            EXPECT_EQ(d.l2miss, e.l2);
+            EXPECT_EQ(d.l3miss, e.l3);
+        }
+    }
+}
+
+// L3-only miss stream (the recon-report failure example): a single inflight
+// load that missed L1, L2 and L3 (depth == 3) produces misslevel 0x4|0x8 =
+// 0xC.  Legacy code charged NOTHING (0xC & 0x1 == 0, 0xC & 0x3 != 0x3,
+// 0xC & 0x7 != 0x7); the fix charges all three levels, because an L3 miss
+// has necessarily missed L1 and L2 on its way down.
+TEST(R7Misslevel, L3OnlyMissStreamLegacyChargedNothingFixChargesAll)
+{
+    const int misslevel_l3_only = 0xC;  // bit2 (depth==3) + bit3 (any)
+    const auto legacy = memstallDecisionLegacy(misslevel_l3_only);
+    const auto fixed = memstallDecisionFixed(misslevel_l3_only);
+
+    // Legacy undercount: none of the three counters fired.
+    EXPECT_EQ(legacy.l1miss, 0);
+    EXPECT_EQ(legacy.l2miss, 0);
+    EXPECT_EQ(legacy.l3miss, 0);
+
+    // Fixed: all three levels are (cumulatively) in miss.
+    EXPECT_EQ(fixed.l1miss, 1);
+    EXPECT_EQ(fixed.l2miss, 1);
+    EXPECT_EQ(fixed.l3miss, 1);
+}
+
+// Legacy vs fixed on the remaining diagnostic combinations: the legacy
+// decisions only agreed with the cumulative semantics when the exact low
+// bits happened to be fully populated (0x1, 0x3, 0x7) or empty (0x0).
+TEST(R7Misslevel, LegacyDisagreesOnSparseLevelCombinations)
+{
+    // 0x2 (depth-2 only): legacy charged nothing; fixed charges l1+l2.
+    EXPECT_EQ(memstallDecisionLegacy(0x2).l1miss, 0);
+    EXPECT_EQ(memstallDecisionLegacy(0x2).l2miss, 0);
+    EXPECT_EQ(memstallDecisionFixed(0x2).l1miss, 1);
+    EXPECT_EQ(memstallDecisionFixed(0x2).l2miss, 1);
+    EXPECT_EQ(memstallDecisionFixed(0x2).l3miss, 0);
+
+    // 0x5 (depth-1 + depth-3): legacy charged only l1; fixed charges all.
+    EXPECT_EQ(memstallDecisionLegacy(0x5).l1miss, 1);
+    EXPECT_EQ(memstallDecisionLegacy(0x5).l2miss, 0);
+    EXPECT_EQ(memstallDecisionLegacy(0x5).l3miss, 0);
+    EXPECT_EQ(memstallDecisionFixed(0x5).l1miss, 1);
+    EXPECT_EQ(memstallDecisionFixed(0x5).l2miss, 1);
+    EXPECT_EQ(memstallDecisionFixed(0x5).l3miss, 1);
+}
+
+// Any-bit alone (0x8: an outstanding request whose depth is not 1/2/3 —
+// e.g. depth 0, request not yet through the first level) must not charge
+// any of the level counters; memstall_any_load (checked separately in
+// production code as misslevel != 0) still fires.
+TEST(R7Misslevel, AnyBitAloneChargesNoLevel)
+{
+    const auto d = memstallDecisionFixed(0x8);
+    EXPECT_EQ(d.l1miss, 0);
+    EXPECT_EQ(d.l2miss, 0);
+    EXPECT_EQ(d.l3miss, 0);
+}
