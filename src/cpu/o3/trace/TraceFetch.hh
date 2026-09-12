@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "arch/riscv/types.hh"
+#include "base/statistics.hh"
 #include "base/types.hh"
 #include "config/the_isa.hh"
 #include "cpu/inst_seq.hh"
@@ -145,6 +146,21 @@ class TraceFetch
     };
 
     Fetch &fetch;
+
+    /**
+     * D4-A R5 statistics group (parent = fetch.cpu, mirrors the
+     * TraceReader::TraceReaderStats precedent).  Statistics-only; never
+     * read by any timing/arbitration/supply/prediction decision.
+     */
+    struct TraceFetchStats : public statistics::Group
+    {
+        TraceFetchStats(statistics::Group *parent, const std::string &name);
+
+        /** D4-A R5: NOP instructions supplied while in wrong-path mode. */
+        statistics::Scalar wrongPathSuppliedInsts;
+        /** D4-A R5: times the frontend entered trace wrong-path mode. */
+        statistics::Scalar enterTraceWrongPathCount;
+    } stats;
 
     bool initializeTraceReader();
     TheISA::MachInst createMachInstFromTrace(const o3::TraceInstruction &traceInstr);

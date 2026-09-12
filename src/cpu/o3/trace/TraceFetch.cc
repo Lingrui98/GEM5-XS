@@ -79,7 +79,8 @@ sv39LeafPte(Addr pa, bool readable, bool writable, bool executable)
 } // anonymous namespace
 
 TraceFetch::TraceFetch(Fetch &fetch_, const BaseO3CPUParams &params)
-    : fetch(fetch_)
+    : fetch(fetch_),
+      stats(fetch.cpu, "traceFetch")
 {
     for (int i = 0; i < MaxThreads; i++) {
         traceFetchExpectedCorrectIdx[i] = 1;
@@ -124,6 +125,18 @@ TraceFetch::TraceFetch(Fetch &fetch_, const BaseO3CPUParams &params)
 }
 
 TraceFetch::~TraceFetch() = default;
+
+TraceFetch::TraceFetchStats::TraceFetchStats(statistics::Group *parent,
+                                             const std::string &name)
+    : statistics::Group(parent, name.c_str()),
+      ADD_STAT(wrongPathSuppliedInsts, statistics::units::Count::get(),
+               "NOP instructions supplied to the decoder while the "
+               "frontend is in trace wrong-path mode (supply events, not "
+               "squashes; never summed with squash counters)"),
+      ADD_STAT(enterTraceWrongPathCount, statistics::units::Count::get(),
+               "Times the trace frontend entered wrong-path mode")
+{
+}
 
 bool
 TraceFetch::initializeTraceReader()
@@ -454,6 +467,11 @@ TraceFetch::fetchTraceInstruction(ThreadID tid, PCStateBase &this_pc)
             tid, this_pc, nop, this_pc.instAddr(),
             nop_size == 2 ? "supplied 2B NOP without advancing reader"
                           : "supplied 4B NOP without advancing reader (pred takenPC)");
+        // D4-A R5: statistics-only — one wrong-path NOP supplied (a supply
+        // event at the start of the instruction's life; it is later cleared
+        // by a squash counted by the *SquashedInsts family — different
+        // events, never to be summed into one composite numerator).
+        ++stats.wrongPathSuppliedInsts;
         return StallReason::NoStall;
     }
 
@@ -517,6 +535,9 @@ TraceFetch::enterTraceWrongPath(ThreadID tid, InstSeqNum branchSeqNum, Addr pred
     traceWrongPathForceMinStep = forceMinStep;
     traceWrongPathPredPC       = predPC;
     traceWrongPathCorrectPC    = corrPC;
+    // D4-A R5: statistics-only — every entry into wrong-path mode counts,
+    // including re-entries without an intervening exit.
+    ++stats.enterTraceWrongPathCount;
     DPRINTF(Fetch,
             "[tid:%i] %s (predPC=0x%llx, corrPC=0x%llx, sn:%llu, tracesn:%llu)\n",
             tid, reason,

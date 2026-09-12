@@ -169,6 +169,11 @@ IEW::IEWStats::IEWStats(CPU *cpu)
              "Number of instructions dispatched to IQ"),
     ADD_STAT(dispSquashedInsts, statistics::units::Count::get(),
              "Number of squashed instructions skipped by dispatch"),
+    ADD_STAT(dispQueSquashedInsts, statistics::units::Count::get(),
+             "Instructions dropped when dispatch pops a squashed entry "
+             "from the dispatch queue.  With enableDispatchStage false "
+             "(e.g. kmhv3.py) this two-stage path is inactive and the "
+             "counter stays 0"),
     ADD_STAT(dispLoadInsts, statistics::units::Count::get(),
              "Number of dispatched load instructions"),
     ADD_STAT(dispStoreInsts, statistics::units::Count::get(),
@@ -1359,6 +1364,12 @@ IEW::dispatchInstFromDispQue()
             if (inst->isSquashed()) {
                 DPRINTF(IEW, "[tid:%i] [sn:%llu] Dispatch: Squashed instruction encountered, "
                         "not adding to IQ.\n", tid, inst->seqNum);
+
+                // D4-A R5: statistics-only — count instructions dropped
+                // when the dispatch queue pops a squashed entry.  With
+                // enableDispatchStage false (kmhv3.py) this path is
+                // inactive and the counter stays 0.
+                ++iewStats.dispQueSquashedInsts;
 
                 dispQue[i].pop_front();
                 continue;

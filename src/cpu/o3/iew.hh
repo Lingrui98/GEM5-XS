@@ -510,6 +510,13 @@ class IEW
         statistics::Scalar dispatchedInsts;
         /** Stat for total number of squashed instructions dispatch skips. */
         statistics::Scalar dispSquashedInsts;
+        /**
+         * D4-A R5: instructions dropped when dispatch pops a squashed
+         * entry from the dispatch queue (dispatchInstFromDispQue).  With
+         * enableDispatchStage false (kmhv3.py) the two-stage dispatch path
+         * is inactive and this counter stays 0.
+         */
+        statistics::Scalar dispQueSquashedInsts;
         /** Stat for total number of dispatched load instructions. */
         statistics::Scalar dispLoadInsts;
         /** Stat for total number of dispatched store instructions. */

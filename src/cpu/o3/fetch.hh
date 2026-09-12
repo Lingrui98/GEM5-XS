@@ -1321,6 +1321,12 @@ class Fetch
          * recovery windows (frontendRecoveryCycles x decodeWidth).
          */
         statistics::Scalar frontendRecoverySlots;
+        /**
+         * D4-A R5: instructions dropped when a squash clears the fetch
+         * queue (Fetch::doSquash).  Neutral "squashed" naming: includes
+         * non-misprediction clears (trap/tc/squashAfter) as well.
+         */
+        statistics::Scalar fetchQueueSquashedInsts;
         /** Stat for total cycles the resolve queue is full. */
         statistics::Scalar resolveQueueFullEvents;
         /** Stat for total number of resolve enqueue fail events. */
