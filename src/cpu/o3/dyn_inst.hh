@@ -673,6 +673,20 @@ class DynInst : public ExecContext, public RefCounted
         instFlags[PredTaken] = predicted_taken;
     }
 
+    // ---- D4-A R3 statistics-only snapshot (NOT a prediction input) ----
+    // predBtbHitValue records whether this instruction's PC hit an entry
+    // of the supplying FetchTarget's predBTBEntries *at prediction time*
+    // (i.e. whether the BTB recognized the branch when the prediction was
+    // made).  It is a fact snapshot taken in
+    // Fetch::lookupAndUpdateNextPC and consumed exclusively by statistics
+    // code: the Decode::selfSquash BTB-miss classification and
+    // Fetch::handleDecodeSquash's redirect-window decision.  No timing,
+    // arbitration, supply or prediction decision ever reads it.
+    bool predBtbHitValue = false;
+
+    void setPredBtbHit(bool hit) { predBtbHitValue = hit; }
+    bool readPredBtbHit() const { return predBtbHitValue; }
+
     // ---- Trace branch/control-flow ground-truth (used by Decode/EXE in trace mode)
     bool traceBranchInfoValid = false;
     bool traceBranchTakenValue = false;

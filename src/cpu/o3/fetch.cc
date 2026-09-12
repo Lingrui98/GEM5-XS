@@ -197,6 +197,8 @@ Fetch::regProbePoints()
 
 Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
     : statistics::Group(cpu, "fetch"),
+      cpu(cpu),
+      fetch(fetch),
     ADD_STAT(icacheStallCycles, statistics::units::Cycle::get(),
              "Number of cycles fetch is stalled on an Icache miss"),
     ADD_STAT(insts, statistics::units::Count::get(),
@@ -280,6 +282,23 @@ Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
                     statistics::units::Count, statistics::units::Cycle>::get(),
              "Frontend Bandwidth Bound",
              frontendBound - frontendLatencyBound),
+    ADD_STAT(btbMissResteers, statistics::units::Count::get(),
+             "Decode redirects caused by a prediction-time BTB miss "
+             "(fetch-time snapshot predBtbHit false: the branch PC hit "
+             "no predBTBEntry of the supplying FetchTarget)"),
+    ADD_STAT(btbMissResteerCycles, statistics::units::Cycle::get(),
+             "Cycles from fetch consuming a BTB-miss decode redirect "
+             "(decodeToFetchDelay = 1 after decode's selfSquash) to the "
+             "first instruction delivered to decode for that thread.  The "
+             "defined end point is the first DELIVERY (not queue refill): "
+             "cycles where decode is backend-blocked while the queue is "
+             "non-empty can extend an open window — documented "
+             "approximation of this diagnostic proxy"),
+    ADD_STAT(gem5BranchResteers, statistics::units::Ratio::get(),
+             "gem5 proxy metric: btbMissResteerCycles / numCycles.  This "
+             "is ONLY the BTB-miss subset of decode redirects as seen by "
+             "this frontend; it is NOT the full Intel TMA Branch_Resteers",
+             btbMissResteerCycles / cpu->baseStats.numCycles),
     ADD_STAT(resolveQueueFullEvents, statistics::units::Count::get(),
              "Number of events the resolve queue becomes full"),
     ADD_STAT(resolveEnqueueFailEvent, statistics::units::Count::get(),
@@ -468,6 +487,54 @@ Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
         fdipEpochMismatch
             .prereq(fdipEpochMismatch);
 }
+
+void
+Fetch::FetchStatGroup::closeBtbMissWindow(ThreadID tid)
+{
+    if (!btbMissWindow[tid].active) {
+        return;
+    }
+    // Half-open interval [start, curCycle): the opening cycle itself is
+    // an empty-delivery cycle for this tid (the squash cleared the fetch
+    // queue before sendInstructionsToDecode in the same tick), the
+    // closing cycle delivered >= 1 instruction and is not charged.
+    const uint64_t elapsed =
+        cpu->curCycle() - btbMissWindow[tid].start;
+    if (elapsed > 0) {
+        btbMissResteerCycles += elapsed;
+    }
+    btbMissWindow[tid].active = false;
+}
+
+void
+Fetch::FetchStatGroup::openBtbMissWindow(ThreadID tid)
+{
+    // Overlap rule: a new redirect closes any still-open window by its
+    // elapsed cycles first, then opens a fresh one — windows never double
+    // charge the same cycle.
+    closeBtbMissWindow(tid);
+    btbMissWindow[tid].active = true;
+    btbMissWindow[tid].start = cpu->curCycle();
+}
+
+void
+Fetch::FetchStatGroup::resetStats()
+{
+    // Default behaviour first: wipe the stat storages.
+    statistics::Group::resetStats();
+
+    // D4-A ROI boundary: the stats reset (warmupInstCount / nextDumpInst-
+    // Count dump+reset in CPU::instDone) only clears the statistics — this
+    // custom window state machine survives it.  Truncate any open window
+    // WITHOUT charging: a window open at the boundary belongs (by charge-
+    // at-close) to the segment that was just dumped without ever being
+    // billed there, so discarding it bills those cycles to neither segment
+    // and no window is ever billed across the ROI boundary.
+    for (auto &w : btbMissWindow) {
+        w.active = false;
+    }
+}
+
 void
 Fetch::setTimeBuffer(TimeBuffer<TimeStruct> *time_buffer)
 {
@@ -1590,6 +1657,22 @@ Fetch::lookupAndUpdateNextPC(const DynInstPtr &inst, PCStateBase &next_pc)
     const Addr curr_pc = next_pc.instAddr();
     assert(stream.startPC <= curr_pc && curr_pc < stream.predEndPC);
 
+    // D4-A R3 statistics-only snapshot: whether this instruction's PC hit
+    // an entry of the supplying FetchTarget's predBTBEntries at prediction
+    // time (stricter than predict_taken: a hit entry whose conditional
+    // branch is direction-predicted not-taken still counts as a hit).  The
+    // only readers are Decode's selfSquash BTB-miss classification and
+    // Fetch::handleDecodeSquash's redirect-window decision; no timing,
+    // arbitration, supply or prediction logic ever reads it.
+    bool pred_btb_hit = false;
+    for (const auto &entry : stream.predBTBEntries) {
+        if (entry.valid && entry.pc == curr_pc) {
+            pred_btb_hit = true;
+            break;
+        }
+    }
+    inst->setPredBtbHit(pred_btb_hit);
+
     bool run_out = false;
 
     // Taken when the current PC matches the predicted control PC.
@@ -2302,6 +2385,18 @@ Fetch::sendInstructionsToDecode()
     // Intel TopDown method for measuring frontend bubbles
     measureFrontendBubbles(insts_to_decode, tid);
 
+    // D4-A R3/R4: delivering >= 1 instruction to decode for this tid is
+    // the end condition of any open frontend window (BTB-miss redirect
+    // window / commit-squash recovery window) — the frontend is supplying
+    // the currently-known correct path again.  Cycles in which decode is
+    // backend-blocked (blockFetch) while the queue is non-empty can
+    // extend an open window past the queue refill; that is a documented
+    // approximation of this diagnostic proxy (delivery, not refill, is
+    // the defined end point).
+    if (insts_to_decode >= 1) {
+        fetchStats.closeBtbMissWindow(tid);
+    }
+
     // If there was activity this cycle, inform the CPU of it
     if (wroteToTimeBuffer) {
         DPRINTF(Activity, "Activity this cycle.\n");
@@ -2540,6 +2635,15 @@ Fetch::handleCommitSignals(ThreadID tid)
         }
 
     // In any case, squash.
+    // D4-A R3: a deeper (commit-side) squash invalidates the path an open
+    // BTB-miss redirect window was waiting for — truncate it by its
+    // elapsed cycles (the "interrupted by a subsequent squash" rule; the
+    // squash and robSquashing flags co-arrive on this commitInfo, and a
+    // window opened DURING an ongoing robSquashing period is a legitimate
+    // correct-path redirect that must survive — hence the event-driven
+    // truncation here rather than a per-cycle robSquashing check).
+    fetchStats.closeBtbMissWindow(tid);
+
     squash(*fromCommit->commitInfo[tid].pc, squash_seq,
            squash_inst, tid);
 
@@ -2615,6 +2719,20 @@ Fetch::handleDecodeSquash(ThreadID tid)
 
             DPRINTF(Fetch, "Squashing from decode with PC = %s\n",
                 *fromDecode->decodeInfo[tid].nextPC);
+            // D4-A R3: fetch consumes a decode selfSquash redirect here
+            // (decodeToFetchDelay = 1 cycle after decode emitted it).  A
+            // BTB-miss redirect (the redirecting instruction's fetch-time
+            // snapshot predBtbHit false) (re)opens the per-tid redirect
+            // window — the overlap rule closes any open window by its
+            // elapsed cycles first.  A false-hit / wrong-target redirect
+            // (predBtbHit true) only truncates any open window (its
+            // awaited path is invalidated by this redirect) without
+            // opening a new one.  Statistics-only bookkeeping.
+            if (mispred_inst && !mispred_inst->readPredBtbHit()) {
+                fetchStats.openBtbMissWindow(tid);
+            } else {
+                fetchStats.closeBtbMissWindow(tid);
+            }
             // Squash unless we're already squashing
             squashFromDecode(*fromDecode->decodeInfo[tid].nextPC,
                              fromDecode->decodeInfo[tid].squashInst,

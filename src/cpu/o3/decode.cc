@@ -775,6 +775,16 @@ Decode::decodeInsts(ThreadID tid)
             if (*target != inst->readPredTarg()) {
                 ++stats.branchMispred;
 
+                // D4-A R3 classification: this decode redirect counts as a
+                // BTB-miss resteer only when the instruction's fetch-time
+                // snapshot (predBtbHit) says its PC hit no predBTBEntry —
+                // the branch was not recognized by the BTB at prediction
+                // time.  A hit with a wrong target (alias/stale entry) is
+                // NOT a BTB miss and is not counted here.
+                if (!inst->readPredBtbHit()) {
+                    fetch_ptr->countBtbMissResteer();
+                }
+
                 RiscvISA::PCState cpTarget = target->clone()->as<RiscvISA::PCState>();
                 RiscvISA::PCState cpPredTarget = inst->readPredTarg().clone()->as<RiscvISA::PCState>();
 
@@ -821,6 +831,13 @@ Decode::decodeInsts(ThreadID tid)
             }
 
             ++stats.branchMispred;
+            // D4-A R3 classification: an unpredicted return taking the RAS
+            // fixup redirect counts as a BTB-miss resteer only when the
+            // return's fetch-time snapshot (predBtbHit) says its PC hit no
+            // predBTBEntry (not recognized by the BTB at prediction time).
+            if (!inst->readPredBtbHit()) {
+                fetch_ptr->countBtbMissResteer();
+            }
             decode_stalls.push(StallReason::InstMisPred);
             breakDecode = StallReason::InstMisPred;
             DPRINTF(Decode, "[tid:%i] [sn:%llu] Updating predictions:"

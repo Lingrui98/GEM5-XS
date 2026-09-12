@@ -673,3 +673,483 @@ TEST(R7Misslevel, AnyBitAloneChargesNoLevel)
     EXPECT_EQ(d.l2miss, 0);
     EXPECT_EQ(d.l3miss, 0);
 }
+
+// ===========================================================================
+// PART R3 — BTB-miss decode-redirect diagnostics (event classification +
+//           per-tid redirect window state machine)
+// Guard: src/cpu/o3/fetch.cc
+//   Fetch::lookupAndUpdateNextPC      (predBtbHit snapshot write)
+//   Fetch::FetchStatGroup::{openBtbMissWindow, closeBtbMissWindow,
+//                           resetStats}   (window state machine)
+//   Fetch::handleDecodeSquash         (window open/truncate hook)
+//   Fetch::handleCommitSignals        (truncate-on-deeper-squash hook)
+//   Fetch::sendInstructionsToDecode   (close-on-delivery hook)
+// Guard: src/cpu/o3/decode.cc
+//   Decode::selfSquash trigger points 1/2/3 (event classification)
+// Guard: src/cpu/o3/dyn_inst.hh
+//   predBtbHitValue + setPredBtbHit/readPredBtbHit (the snapshot field)
+//
+// Semantics implemented (D4-A contract):
+// - predBtbHit = the instruction's PC hit a *valid* entry of the supplying
+//   FetchTarget's predBTBEntries at prediction time (stricter than
+//   predict_taken: a hit whose cond branch is predicted not-taken is still
+//   a hit).  Snapshot written in fetch, read only by statistics code.
+// - btbMissResteers (events): decode selfSquash classification —
+//     trigger 1 (readPredTaken && !isControl, false-hit):      NOT counted
+//       (readPredTaken implies the PC matched a taken predBTBEntry, so
+//       predBtbHit is necessarily true there);
+//     trigger 2 (direct branch, target != predTarg): counted iff
+//       predBtbHit false (BTB miss); a hit with wrong target (alias/
+//       stale) is NOT counted;
+//     trigger 3 (unpredicted return taking the RAS fixup): counted iff
+//       predBtbHit false.
+// - btbMissResteerCycles (window, per tid, half-open [open, close)):
+//     open  = the fetch tick that consumes the decode redirect
+//             (decodeToFetchDelay = 1 after decode's selfSquash; the
+//             fetch-side receipt keeps start and end on one timeline);
+//     close = the first tick sendInstructionsToDecode delivers >= 1
+//             instruction for that tid, OR
+//             a newer decode redirect (overlap rule: close old by elapsed
+//             cycles, then open fresh — never double charge), OR
+//             a commit squash (truncation: the awaited path is
+//             invalidated), OR
+//             the stats-reset ROI boundary (DISCARDED — never billed
+//             across the segment boundary);
+//     SMT   = independent per-tid windows.
+// - gem5BranchResteers = btbMissResteerCycles / numCycles is a gem5 proxy
+//   for the BTB-miss subset only, NOT the full Intel TMA Branch_Resteers.
+// ===========================================================================
+
+namespace
+{
+
+// Mirror of the predBTBEntries membership test written in
+// Fetch::lookupAndUpdateNextPC (fetch.cc).  BTBEntry mirror: the real
+// struct is BTBEntry : BranchInfo with `valid` and inherited `pc`
+// (src/cpu/pred/btb/common.hh:243).
+struct FakeBTBEntry
+{
+    bool valid = false;
+    uint64_t pc = 0;
+};
+
+// Exact replica of the fetch-time snapshot predicate (fetch.cc,
+// Fetch::lookupAndUpdateNextPC): PC membership among valid entries.
+bool
+predBtbHitSnapshot(uint64_t pc, const std::vector<FakeBTBEntry> &entries)
+{
+    for (const auto &entry : entries) {
+        if (entry.valid && entry.pc == pc) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The three Decode::selfSquash trigger points (decode.cc):
+//   trigger 1 ~@719  readPredTaken() && !isControl()        (false-hit)
+//   trigger 2 ~@774  direct ctrl, target != readPredTarg()
+//   trigger 3 ~@836  isReturn() && !readPredTaken()         (RAS fixup)
+enum class SelfSquashTrigger
+{
+    FalseHitNonControl,
+    DirectTargetMismatch,
+    ReturnRasFixup,
+};
+
+// Exact replica of the decode-side event classification (decode.cc,
+// trigger points 2 and 3: `if (!inst->readPredBtbHit())
+// fetch_ptr->countBtbMissResteer();`).  Trigger 1 has no counting hook:
+// a predicted-taken match implies the PC matched a taken predBTBEntry, so
+// predBtbHit is necessarily true and the row is never a BTB miss.
+bool
+countsAsBtbMissResteer(SelfSquashTrigger trigger, bool pred_btb_hit)
+{
+    switch (trigger) {
+    case SelfSquashTrigger::FalseHitNonControl:
+        return false;
+    case SelfSquashTrigger::DirectTargetMismatch:
+    case SelfSquashTrigger::ReturnRasFixup:
+        return !pred_btb_hit;
+    }
+    return false;  // unreachable
+}
+
+// Per-tid redirect window machine: exact replica of
+// Fetch::FetchStatGroup::{openBtbMissWindow, closeBtbMissWindow,
+// resetStats} (fetch.cc) driven through the per-tick hook ordering of
+// Fetch::tick -> initializeTickState (checkSignalsAndUpdate:
+// handleCommitSignals then handleDecodeSquash) then
+// fetchAndProcessInstructions (sendInstructionsToDecode).
+struct BtbMissWindowMachine
+{
+    // Window state (fetch.cc FetchStatGroup::btbMissWindow[tid]).
+    bool active = false;
+    long start = 0;
+
+    // Charged counters (reset together by the stats reset).
+    long btbMissResteers = 0;         // events (classified in decode)
+    long btbMissResteerCycles = 0;    // window cycles
+
+    long cur_cycle = 0;
+    // fetchStatus == Squashing from a squash processed on the previous
+    // tick (set by doSquash, cleared in checkSignalsAndUpdate after
+    // handleDecodeSquash on the following tick).
+    bool prev_tick_squash = false;
+
+    // Replica of FetchStatGroup::closeBtbMissWindow.
+    void
+    close()
+    {
+        if (!active) {
+            return;
+        }
+        const long elapsed = cur_cycle - start;
+        if (elapsed > 0) {
+            btbMissResteerCycles += elapsed;
+        }
+        active = false;
+    }
+
+    // Replica of FetchStatGroup::openBtbMissWindow (overlap rule).
+    void
+    open()
+    {
+        close();
+        active = true;
+        start = cur_cycle;
+    }
+
+    // Events visible to fetch within one tick, in processing order.
+    struct TickEvents
+    {
+        bool commit_squash = false;        // handleCommitSignals
+        bool decode_redirect_btb_miss = false;  // handleDecodeSquash
+        bool decode_redirect_other = false;     // handleDecodeSquash
+        bool delivery = false;             // sendInstructionsToDecode
+    };
+
+    // One fetch tick.
+    void
+    tick(const TickEvents &ev)
+    {
+        bool squash_processed = false;
+
+        // (1) handleCommitSignals (fetch.cc:2600): a commit squash
+        //     truncates an open BTB-miss window (deeper squash
+        //     invalidates the awaited path).
+        if (ev.commit_squash) {
+            close();
+            squash_processed = true;
+        }
+
+        // (2) handleDecodeSquash (fetch.cc:2688): processed only when no
+        //     commit squash was handled this tick (checkSignalsAndUpdate
+        //     returns early on commitSquashed) and fetch is not still in
+        //     Squashing status from a squash processed on the previous
+        //     tick (the `fetchStatus[tid] != Squashing` guard).
+        if (!ev.commit_squash && !prev_tick_squash) {
+            if (ev.decode_redirect_btb_miss) {
+                open();
+                squash_processed = true;
+            } else if (ev.decode_redirect_other) {
+                // False-hit / wrong-target redirect: truncates any open
+                // window, opens nothing.
+                close();
+                squash_processed = true;
+            }
+        }
+
+        // (3) sendInstructionsToDecode (fetch.cc:2392): first delivery of
+        //     >= 1 instruction for this tid closes the window.
+        if (ev.delivery) {
+            close();
+        }
+
+        prev_tick_squash = squash_processed;
+        ++cur_cycle;
+    }
+
+    // Stats-reset ROI boundary (fetch.cc FetchStatGroup::resetStats):
+    // the reset zeroes the counters and truncates an open window WITHOUT
+    // charging it — no window is billed across the boundary.  Pipeline
+    // state (prev_tick_squash) survives: the reset only clears statistics.
+    void
+    stats_reset()
+    {
+        btbMissResteers = 0;
+        btbMissResteerCycles = 0;
+        active = false;
+    }
+};
+
+} // anonymous namespace
+
+// --- R3 classification truth table (trigger x predBtbHit), 5 rows exact --
+
+// Trigger 1 (false-hit: predicted as branch but not a control): never a
+// BTB-miss resteer.  With readPredTaken() true the PC necessarily
+// matched a taken predBTBEntry, so predBtbHit is true; the row is pinned
+// uncounted for both snapshot values anyway.
+TEST(R3Classification, FalseHitNeverCounts)
+{
+    EXPECT_FALSE(countsAsBtbMissResteer(SelfSquashTrigger::FalseHitNonControl,
+                                         true));
+    EXPECT_FALSE(countsAsBtbMissResteer(SelfSquashTrigger::FalseHitNonControl,
+                                         false));
+}
+
+// Trigger 2 (direct branch, predicted target mismatch): counted iff the
+// fetch-time snapshot says the branch missed the BTB.
+TEST(R3Classification, DirectTargetMismatchExact)
+{
+    EXPECT_FALSE(countsAsBtbMissResteer(
+        SelfSquashTrigger::DirectTargetMismatch, true));   // hit, wrong tgt
+    EXPECT_TRUE(countsAsBtbMissResteer(
+        SelfSquashTrigger::DirectTargetMismatch, false));  // BTB miss
+}
+
+// Trigger 3 (unpredicted return, RAS fixup redirect): counted iff the
+// return's PC hit no predBTBEntry.
+TEST(R3Classification, ReturnRasFixupExact)
+{
+    EXPECT_FALSE(countsAsBtbMissResteer(SelfSquashTrigger::ReturnRasFixup,
+                                         true));
+    EXPECT_TRUE(countsAsBtbMissResteer(SelfSquashTrigger::ReturnRasFixup,
+                                       false));
+}
+
+// --- R3 snapshot semantics ---------------------------------------------
+
+// PC membership among *valid* predBTBEntries defines the hit; a hit entry
+// whose conditional branch is direction-predicted not-taken is still a hit
+// (stricter than predict_taken — G4(c) input side).
+TEST(R3Snapshot, PcMembershipAmongValidEntriesDefinesHit)
+{
+    const std::vector<FakeBTBEntry> entries = {
+        {true, 0x1000},   // valid hit entry (cond branch, predicted NT)
+        {false, 0x2000},  // invalid entry must be ignored
+        {true, 0x3000},   // valid entry
+    };
+    EXPECT_TRUE(predBtbHitSnapshot(0x1000, entries));
+    EXPECT_TRUE(predBtbHitSnapshot(0x3000, entries));
+    EXPECT_FALSE(predBtbHitSnapshot(0x2000, entries));   // invalid: no hit
+    EXPECT_FALSE(predBtbHitSnapshot(0x4000, entries));   // absent: miss
+    EXPECT_FALSE(predBtbHitSnapshot(0x1004, entries));   // not an entry pc
+}
+
+// G4(c): a BTB *hit* branch predicted not-taken (fallthrough) is NOT a
+// BTB-miss resteer.  The snapshot says hit; every classification row with
+// predBtbHit true is uncounted, and trigger 2/3 with a hit do not fire
+// as BTB-miss redirects (the misprediction, if any, resolves downstream).
+TEST(G4cBtbHitFallthrough, NotCountedAsBtbMissResteer)
+{
+    const std::vector<FakeBTBEntry> entries = {{true, 0x1000}};
+    const bool hit = predBtbHitSnapshot(0x1000, entries);
+    ASSERT_TRUE(hit);   // entry present although direction predicts NT
+    EXPECT_FALSE(countsAsBtbMissResteer(SelfSquashTrigger::DirectTargetMismatch, hit));
+    EXPECT_FALSE(countsAsBtbMissResteer(SelfSquashTrigger::ReturnRasFixup, hit));
+    EXPECT_FALSE(countsAsBtbMissResteer(SelfSquashTrigger::FalseHitNonControl, hit));
+}
+
+// --- G4(d): BTB-miss redirect -> exact event and window accounting ------
+
+// G4(d): a synthetic redirect/delivery sequence with exact expectations.
+//   redirect(miss) @0  -> delivery @4  : window = [0,4)  = 4 cycles
+//   redirect(miss) @10 -> redirect(miss) @12 (overlap; old window charged
+//                         2 by elapsed) -> delivery @15 : +2 +3 cycles
+//   redirect(miss) @20 -> commit squash @23 (truncation, charged 3)
+//                         -> delivery @28 (no open window)
+// Events: 4 classified BTB-miss redirects.  Cycles: 4 + 5 + 3 = 12.
+TEST(G4dBtbMissRedirect, ExactEventAndWindowCounts)
+{
+    BtbMissWindowMachine m;
+
+    // Window 1: [0, 4)
+    m.tick({false, true, false, false});          // 0: BTB-miss redirect
+    m.tick({});                                    // 1
+    m.tick({});                                    // 2
+    m.tick({});                                    // 3
+    m.tick({false, false, false, true});           // 4: delivery -> 4
+    EXPECT_EQ(m.btbMissResteerCycles, 4);
+    EXPECT_FALSE(m.active);
+
+    // Idle cycles do not open or extend anything.
+    for (int i = 5; i < 10; ++i) {
+        m.tick({});
+    }
+    EXPECT_EQ(m.btbMissResteerCycles, 4);
+
+    // Window 2/3: overlap — redirect @10, superseded @12, delivery @15.
+    m.tick({false, true, false, false});           // 10: open @10
+    m.tick({});                                    // 11
+    m.tick({false, true, false, false});           // 12: close @10(+2), open @12
+    m.tick({});                                    // 13
+    m.tick({});                                    // 14
+    m.tick({false, false, false, true});           // 15: close @12(+3)
+    EXPECT_EQ(m.btbMissResteerCycles, 4 + 2 + 3);
+
+    // Window 4: truncated by a commit squash.
+    for (int i = 16; i < 20; ++i) {
+        m.tick({});
+    }
+    m.tick({false, true, false, false});           // 20: open @20
+    m.tick({});                                    // 21
+    m.tick({});                                    // 22
+    m.tick({true, false, false, false});           // 23: squash -> truncate(+3)
+    EXPECT_EQ(m.btbMissResteerCycles, 4 + 5 + 3);
+    EXPECT_FALSE(m.active);
+    for (int i = 24; i < 28; ++i) {
+        m.tick({});
+    }
+    m.tick({false, false, false, true});           // 28: delivery, no window
+    EXPECT_EQ(m.btbMissResteerCycles, 12);
+
+    // Event count: the four classified BTB-miss redirects (decode side).
+    EXPECT_EQ(m.btbMissResteers, 0);   // events charged by decode, not here
+}
+
+// Overlap rule dedicated: two redirects, one window each, no cycle is
+// charged twice (2 + 3 = 5 == the single-window equivalent [0,5)).
+TEST(R3Window, OverlapRedirectsNeverDoubleCharge)
+{
+    BtbMissWindowMachine split;
+    split.tick({false, true, false, false});   // 0: open
+    split.tick({});                            // 1
+    split.tick({false, true, false, false});   // 2: close(+2), reopen
+    split.tick({});                            // 3
+    split.tick({});                            // 4
+    split.tick({false, false, false, true});   // 5: close(+3)
+    EXPECT_EQ(split.btbMissResteerCycles, 5);
+
+    BtbMissWindowMachine single;
+    single.tick({false, true, false, false});  // 0: open
+    for (int i = 1; i < 5; ++i) {
+        single.tick({});
+    }
+    single.tick({false, false, false, true});  // 5: close(+5)
+    EXPECT_EQ(single.btbMissResteerCycles, 5);
+    EXPECT_EQ(split.btbMissResteerCycles, single.btbMissResteerCycles);
+}
+
+// A redirect and a delivery in the SAME tick charge zero cycles: the
+// window is the half-open interval [open, close) and the opening cycle
+// delivered (the fetch phase refilled the queue between the redirect
+// consumption and sendInstructionsToDecode).
+TEST(R3Window, SameTickDeliveryChargesZero)
+{
+    BtbMissWindowMachine m;
+    m.tick({false, true, false, true});   // redirect + delivery in one tick
+    EXPECT_EQ(m.btbMissResteerCycles, 0);
+    EXPECT_FALSE(m.active);
+}
+
+// Guard 1: a decode redirect arriving in the same tick as a commit squash
+// is not processed by fetch at all (checkSignalsAndUpdate returns early on
+// commitSquashed) — no BTB-miss window opens for it.
+TEST(R3Window, DecodeRedirectSkippedWhenCommitSquashSameTick)
+{
+    BtbMissWindowMachine m;
+    m.tick({true, true, false, false});   // squash + redirect signal: skipped
+    for (int i = 1; i < 5; ++i) {
+        m.tick({});
+    }
+    m.tick({false, false, false, true});  // 5: delivery, no window
+    EXPECT_EQ(m.btbMissResteerCycles, 0);
+}
+
+// Guard 2: fetch is still in Squashing status on the tick after a squash
+// was processed, so a decode redirect arriving exactly then is skipped
+// (pre-existing `fetchStatus[tid] != Squashing` guard) — the window from
+// the earlier redirect keeps running.
+TEST(R3Window, DecodeRedirectSkippedWhileSquashingFromPreviousTick)
+{
+    BtbMissWindowMachine m;
+    m.tick({false, true, false, false});   // 0: open @0 (Squashing now)
+    m.tick({false, true, false, false});   // 1: skipped (still Squashing)
+    m.tick({});                            // 2
+    m.tick({});                            // 3
+    m.tick({false, false, false, true});   // 4: close -> [0,4) = 4
+    EXPECT_EQ(m.btbMissResteerCycles, 4);
+}
+
+// A non-BTB-miss decode redirect (false-hit / wrong target) truncates an
+// open window by its elapsed cycles without opening a new one.
+TEST(R3Window, NonMissRedirectTruncatesWithoutReopening)
+{
+    BtbMissWindowMachine m;
+    m.tick({false, true, false, false});   // 0: BTB-miss window opens
+    m.tick({});                            // 1
+    m.tick({});                            // 2
+    m.tick({false, false, true, false});   // 3: other redirect -> truncate(+3)
+    EXPECT_EQ(m.btbMissResteerCycles, 3);
+    EXPECT_FALSE(m.active);
+    m.tick({});                            // 4
+    m.tick({false, false, false, true});   // 5: delivery, nothing open
+    EXPECT_EQ(m.btbMissResteerCycles, 3);
+}
+
+// --- G4(f): ROI stats reset truncation (no cross-segment billing) -------
+
+// G4(f): a window open at the stats-reset boundary is discarded — its
+// elapsed cycles are billed to NEITHER segment — and windows opened after
+// the boundary are billed wholly to the new segment.
+TEST(G4fRoiReset, OpenWindowDiscardedNotBilledAcrossBoundary)
+{
+    BtbMissWindowMachine m;
+
+    // Segment 1: one closed window (1 cycle) + one window still open at
+    // the boundary (opened @5, boundary after tick 8 -> 4 elapsed cycles).
+    m.tick({false, true, false, false});   // 0: open @0
+    m.tick({false, false, false, true});   // 1: delivery -> [0,1) = 1
+    EXPECT_EQ(m.btbMissResteerCycles, 1);
+    for (int i = 2; i < 5; ++i) {
+        m.tick({});
+    }
+    m.tick({false, true, false, false});   // 5: open @5
+    for (int i = 6; i <= 8; ++i) {
+        m.tick({});
+    }
+    EXPECT_TRUE(m.active);
+
+    // Stats reset (dump+reset at the boundary): counters zeroed, open
+    // window truncated WITHOUT charging.
+    m.stats_reset();
+    EXPECT_FALSE(m.active);
+    EXPECT_EQ(m.btbMissResteerCycles, 0);
+
+    // Segment 2: delivery of the pre-boundary path closes nothing; a new
+    // redirect/delivery pair is billed wholly inside segment 2.
+    m.tick({false, false, false, true});   // 9: delivery, no open window
+    EXPECT_EQ(m.btbMissResteerCycles, 0);
+    m.tick({});                            // 10
+    m.tick({false, true, false, false});   // 11: open @11
+    m.tick({});                            // 12
+    m.tick({});                            // 13
+    m.tick({false, false, false, true});   // 14: close -> 3
+    EXPECT_EQ(m.btbMissResteerCycles, 3);
+
+    // The 4 pre-boundary elapsed cycles (5..8) appear in neither segment:
+    // segment 1 dumped 1, segment 2 shows 3 (all from cycles 11..13).
+}
+
+// --- SMT: per-tid independent windows -----------------------------------
+
+// SMT: the window state machine is per-tid; two threads' windows never
+// interact (delivery on one tid does not close the other's window).
+TEST(R3WindowSmt, IndependentPerTidWindows)
+{
+    BtbMissWindowMachine tid0;
+    BtbMissWindowMachine tid1;
+
+    tid0.tick({false, true, false, false});   // 0: tid0 redirect
+    tid1.tick({false, true, false, false});   // 0: tid1 redirect
+    tid0.tick({});                            // 1
+    tid1.tick({false, false, false, true});   // 1: tid1 delivers -> 1
+    EXPECT_EQ(tid1.btbMissResteerCycles, 1);
+    tid0.tick({});                            // 2
+    tid0.tick({});                            // 3
+    tid0.tick({false, false, false, true});   // 4: tid0 delivers -> 4
+    EXPECT_EQ(tid0.btbMissResteerCycles, 4);
+    EXPECT_EQ(tid1.btbMissResteerCycles, 1);
+}

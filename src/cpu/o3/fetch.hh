@@ -1217,6 +1217,12 @@ class Fetch
     struct FetchStatGroup : public statistics::Group
     {
         FetchStatGroup(CPU *cpu, Fetch *fetch);
+
+        // D4-A R3/R4: retained pointers (the statistics-only window
+        // bookkeeping needs curCycle() and decodeWidth; never read by any
+        // pipeline decision).
+        CPU *cpu;
+        Fetch *fetch;
         // @todo: Consider making these
         // vectors and tracking on a per thread basis.
         /** Stat for total number of cycles stalled due to an icache miss. */
@@ -1295,6 +1301,16 @@ class Fetch
         statistics::Formula frontendLatencyBound;
         /** Frontend Bandwidth Bound */
         statistics::Formula frontendBandwidthBound;
+        /** D4-A R3: decode redirects caused by a prediction-time BTB miss. */
+        statistics::Scalar btbMissResteers;
+        /** D4-A R3: cycles spent in BTB-miss redirect windows. */
+        statistics::Scalar btbMissResteerCycles;
+        /**
+         * D4-A R3: gem5 proxy for Branch_Resteers.  ONLY covers the
+         * BTB-miss subset of decode redirects — NOT the full Intel TMA
+         * Branch_Resteers.
+         */
+        statistics::Formula gem5BranchResteers;
         /** Stat for total cycles the resolve queue is full. */
         statistics::Scalar resolveQueueFullEvents;
         /** Stat for total number of resolve enqueue fail events. */
@@ -1354,12 +1370,62 @@ class Fetch
         statistics::Scalar fdipOutstandingMax;
         /** Number of stale FDIP translation/response events ignored by epoch. */
         statistics::Scalar fdipEpochMismatch;
+
+        // ---- D4-A R3/R4 shared per-tid frontend window bookkeeping ----
+        // Statistics-only state (never read by any timing/arbitration/
+        // supply/prediction decision).  A window is the half-open cycle
+        // interval [open cycle, close cycle): it opens in the fetch tick
+        // that consumes the redirect/squash signal and closes in the first
+        // tick that delivers >= 1 instruction to decode for that tid; the
+        // charge is (close cycle - open cycle).
+        struct FrontendWindow
+        {
+            bool active = false;
+            Cycles start = Cycles(0);
+        };
+
+        /** R3: per-tid BTB-miss decode-redirect windows. */
+        FrontendWindow btbMissWindow[MaxThreads];
+
+        /**
+         * R3: close the per-tid BTB-miss window if open, charging the
+         * elapsed cycles to btbMissResteerCycles.  Closing happens on the
+         * first delivery to decode for the tid, on a newer redirect
+         * (overlap rule) or on a commit squash (truncation) — charged by
+         * elapsed cycles — or at the stats-reset ROI boundary (discarded:
+         * never billed across the segment boundary).
+         */
+        void closeBtbMissWindow(ThreadID tid);
+        /**
+         * R3: open (or restart — closing any open window first by its
+         * elapsed cycles, the overlap rule) the per-tid BTB-miss window
+         * at the current cycle.
+         */
+        void openBtbMissWindow(ThreadID tid);
+
+        /**
+         * D4-A ROI boundary: the stats reset (e.g. warmupInstCount
+         * dump+reset) clears the statistics but NOT this window state
+         * machine.  Truncate open windows WITHOUT charging so that no
+         * window is billed across the ROI boundary: a window open at the
+         * boundary contributes to neither segment.
+         */
+        void resetStats() override;
     } fetchStats;
 
     SquashVersion localSquashVer[MaxThreads];
 
 public:
     const FetchStatGroup &getFetchStats() { return fetchStats; }
+
+    /**
+     * D4-A R3: count one BTB-miss decode-redirect event.  Called from
+     * Decode's selfSquash classification points when the redirecting
+     * instruction's fetch-time snapshot (predBtbHit) says its PC hit no
+     * BTB entry at prediction time.  Statistics-only hook; the counter is
+     * never read by any pipeline decision.
+     */
+    void countBtbMissResteer() { ++fetchStats.btbMissResteers; }
 
   private:
 
