@@ -490,7 +490,7 @@ CPU::CPUStats::CPUStats(CPU *cpu)
     // an alias of decodeWidth (cpu.cc: issueWidth(params.decodeWidth)), so
     // this is a dimension/semantics fix with no numerical change.
     frontendLatencyBound = cpu->fetch.getFetchStats().fetchBubbles_max *
-        cpu->fetch.decodeWidth /
+        cpu->fetch.getDecodeWidth() /
         (cpu->issueWidth * cpu->baseStats.numCycles);
 
     frontendBandwidthBound = frontendBound - frontendLatencyBound;
