@@ -274,7 +274,8 @@ Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
     ADD_STAT(frontendLatencyBound, statistics::units::Rate<
                     statistics::units::Count, statistics::units::Cycle>::get(),
              "Frontend Latency Bound",
-             fetchBubbles_max / cpu->baseStats.numCycles),
+             fetchBubbles_max * fetch->decodeWidth /
+                 (cpu->baseStats.numCycles * fetch->decodeWidth)),
     ADD_STAT(frontendBandwidthBound, statistics::units::Rate<
                     statistics::units::Count, statistics::units::Cycle>::get(),
              "Frontend Bandwidth Bound",
