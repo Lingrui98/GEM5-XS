@@ -397,8 +397,13 @@ Commit::CommitStats::CommitStats(CPU *cpu, Commit *commit)
 
     committedInstType.ysubnames(enums::OpClassStrings);
 
+    // totalSquash must cover every squashDueTo* source.  It previously
+    // omitted squashDueToValuePrediction, undercounting totalSquash whenever
+    // a value predictor is attached (with the default VP=NULL the term is
+    // always 0, so numbers are unchanged for configurations without VP).
     totalSquash = squashDueToBranch + squashDueToOrderViolation + \
-        squashDueToTrap + squashDueToTC + squashDueToSquashAfter;
+        squashDueToValuePrediction + squashDueToTrap + squashDueToTC + \
+        squashDueToSquashAfter;
 }
 
 void

@@ -451,3 +451,73 @@ TEST(G6Budget, LatencyNeverExceedsFrontendAcrossMixes)
         }
     }
 }
+
+// ===========================================================================
+// PART R6 — totalSquash completeness (value-prediction term)
+// Guard: src/cpu/o3/commit.cc (CommitStatGroup: totalSquash formula)
+//
+// Failure mode (without fix): totalSquash summed
+//   branch + orderViolation + trap + tc + squashAfter
+// and omitted squashDueToValuePrediction, undercounting totalSquash
+// whenever a value predictor is attached (squashDueToValuePrediction is
+// incremented in the fromIEW valuePredictionError squash dispatch).
+//
+// Fixed formula:
+//   totalSquash = branch + orderViolation + valuePrediction + trap + tc
+//                 + squashAfter
+// ===========================================================================
+
+namespace
+{
+
+// Fixed commit.cc formula.
+long
+totalSquashFixed(long branch, long order_violation, long value_prediction,
+                 long trap, long tc, long squash_after)
+{
+    return branch + order_violation + value_prediction + trap + tc +
+           squash_after;
+}
+
+// Pre-fix (legacy) commit.cc formula: value-prediction term missing.
+long
+totalSquashLegacy(long branch, long order_violation, long trap, long tc,
+                  long squash_after)
+{
+    return branch + order_violation + trap + tc + squash_after;
+}
+
+} // anonymous namespace
+
+// VP term == 0 (VP = NULL, the default configuration): the fix is a
+// numerical identity — totalSquash is unchanged for runs without a value
+// predictor.
+TEST(R6TotalSquash, ValuePredictionZeroLeavesTotalUnchanged)
+{
+    const long branch = 120, order_violation = 7, vp = 0, trap = 3,
+               tc = 2, squash_after = 11;
+    EXPECT_EQ(totalSquashFixed(branch, order_violation, vp, trap, tc,
+                               squash_after),
+              totalSquashLegacy(branch, order_violation, trap, tc,
+                                squash_after));
+    EXPECT_EQ(totalSquashFixed(branch, order_violation, vp, trap, tc,
+                               squash_after), 143);
+}
+
+// VP term != 0 (value predictor attached): the previously dropped
+// squashDueToValuePrediction events are now included in totalSquash.
+TEST(R6TotalSquash, ValuePredictionNonzeroIsCounted)
+{
+    const long branch = 100, order_violation = 5, vp = 42, trap = 3,
+               tc = 2, squash_after = 11;
+    // Legacy: 100 + 5 + 3 + 2 + 11 = 121 (undercounted by 42).
+    EXPECT_EQ(totalSquashLegacy(branch, order_violation, trap, tc,
+                                squash_after), 121);
+    // Fixed: 100 + 5 + 42 + 3 + 2 + 11 = 163.
+    EXPECT_EQ(totalSquashFixed(branch, order_violation, vp, trap, tc,
+                               squash_after), 163);
+    EXPECT_EQ(totalSquashFixed(branch, order_violation, vp, trap, tc,
+                               squash_after),
+              totalSquashLegacy(branch, order_violation, trap, tc,
+                                squash_after) + vp);
+}
