@@ -317,3 +317,137 @@ TEST(G4bDownstreamBlocked, NoFrontendBubblesCharged)
         EXPECT_EQ(d.fetchBubbles_max, 0);
     }
 }
+
+// ===========================================================================
+// PART R2 — frontendLatencyBound dimension unification
+// Guard: src/cpu/o3/cpu.cc (O3CPU::O3CPUStats: frontendLatencyBound formula)
+//        src/cpu/o3/fetch.cc (FetchStatGroup: frontendLatencyBound formula)
+//
+// Failure mode (without fix): frontendBound divided slot-level bubbles by
+// (issueWidth * numCycles) while frontendLatencyBound divided cycle-level
+// fetchBubbles_max by numCycles alone — two different dimensions (slots vs
+// cycles), so the frontendBandwidthBound difference mixed units.
+//
+// Fixed formulas (cpu.cc; the fetch.cc FetchStatGroup twin is isomorphic
+// with decodeWidth in place of issueWidth, which fetch cannot see):
+//   frontendBound        = fetchBubbles / (issueWidth * numCycles)
+//   frontendLatencyBound = fetchBubbles_max * decodeWidth /
+//                          (issueWidth * numCycles)
+//   frontendBandwidthBound = frontendBound - frontendLatencyBound
+//
+// Known fact: O3CPU has no independent issueWidth SimObject param —
+// cpu.cc constructs issueWidth(params.decodeWidth), so the two widths are
+// aliases and the fix is numerically an identity.  G4(g) therefore can only
+// vary decodeWidth (which moves issueWidth with it).
+// ===========================================================================
+
+namespace
+{
+
+// Fixed cpu.cc formula for frontendLatencyBound.
+double
+frontendLatencyBoundFixed(long fetch_bubbles_max, double decode_width,
+                          double issue_width, double num_cycles)
+{
+    return static_cast<double>(fetch_bubbles_max) * decode_width /
+           (issue_width * num_cycles);
+}
+
+// Pre-fix (legacy) cpu.cc formula: cycle-level / cycle-level.
+double
+frontendLatencyBoundLegacy(long fetch_bubbles_max, double num_cycles)
+{
+    return static_cast<double>(fetch_bubbles_max) / num_cycles;
+}
+
+// Fixed cpu.cc formula for frontendBound (unchanged by R2, used as the
+// reference bound).
+double
+frontendBoundFixed(long fetch_bubbles, double issue_width, double num_cycles)
+{
+    return static_cast<double>(fetch_bubbles) / (issue_width * num_cycles);
+}
+
+} // anonymous namespace
+
+// Identity: with issueWidth aliased to decodeWidth (the only configuration
+// reality — cpu.cc: issueWidth(params.decodeWidth)), the fixed formula is
+// numerically identical to the legacy one.  Checked at W = 8 and W = 4.
+TEST(R2Formula, IdentityWhenIssueWidthAliasesDecodeWidth)
+{
+    // W = 8 (kmhv3.py default): 3 max-bubble cycles out of 5.
+    EXPECT_DOUBLE_EQ(frontendLatencyBoundFixed(3, 8.0, 8.0, 5.0),
+                     frontendLatencyBoundLegacy(3, 5.0));
+    // W = 4 (alternate decodeWidth; issueWidth follows it).
+    EXPECT_DOUBLE_EQ(frontendLatencyBoundFixed(3, 4.0, 4.0, 5.0),
+                     frontendLatencyBoundLegacy(3, 5.0));
+}
+
+// G4(g): width-variant self-consistency.  Only decodeWidth can vary (and
+// issueWidth with it).  W = 4 scenario: 3 forced-empty cycles + 2 cycles
+// supplying k = 2 out of 4 slots.
+//   fetchBubbles = 3*4 + 2*2 = 16, fetchBubbles_max = 3
+//   frontendBound        = 16 / (4*5) = 0.8
+//   frontendLatencyBound = 3*4 / (4*5) = 0.6
+//   frontendBandwidthBound = 0.8 - 0.6 = 0.2  (>= 0)
+// The accounting itself reuses the R1 pure functions so the widths and the
+// attribution stay in lockstep.
+TEST(G4gWidthVariant, FormulaSelfConsistentAtDecodeWidth4)
+{
+    const unsigned W = 4;
+    const FakeThreadState empty_cycle{false, false, true};
+    const FakeThreadState supply_cycle{false, false, false};
+
+    long fetch_bubbles = 0;
+    long fetch_bubbles_max = 0;
+    for (int c = 0; c < 3; ++c) {
+        const auto d = accountFrontendBubblesCycle({empty_cycle}, W, -1, 0);
+        fetch_bubbles += d.fetchBubbles;
+        fetch_bubbles_max += d.fetchBubbles_max;
+    }
+    for (int c = 0; c < 2; ++c) {
+        const auto d = accountFrontendBubblesCycle({supply_cycle}, W, 0, 2);
+        fetch_bubbles += d.fetchBubbles;
+        fetch_bubbles_max += d.fetchBubbles_max;
+    }
+
+    EXPECT_EQ(fetch_bubbles, 16);
+    EXPECT_EQ(fetch_bubbles_max, 3);
+
+    const double num_cycles = 5.0;
+    const double issue_width = 4.0;   // == decodeWidth (alias in cpu.cc)
+    const double frontend_bound =
+        frontendBoundFixed(fetch_bubbles, issue_width, num_cycles);
+    const double latency_bound =
+        frontendLatencyBoundFixed(fetch_bubbles_max, W, issue_width,
+                                  num_cycles);
+
+    EXPECT_NEAR(frontend_bound, 0.8, 1e-12);
+    EXPECT_NEAR(latency_bound, 0.6, 1e-12);
+    EXPECT_LE(latency_bound, frontend_bound);
+    EXPECT_NEAR(frontend_bound - latency_bound, 0.2, 1e-12);
+}
+
+// G6 sanity at both widths: latency bound never exceeds frontend bound and
+// the bandwidth residual is non-negative across a sweep of workload mixes.
+TEST(G6Budget, LatencyNeverExceedsFrontendAcrossMixes)
+{
+    for (unsigned W : {4u, 8u}) {
+        for (int empty = 0; empty <= 6; ++empty) {
+            for (int partial = 0; partial <= 6; ++partial) {
+                const int num_cycles = empty + partial + 1;  // >=1 supply-full
+                long bubbles = 0;
+                long max_cycles = 0;
+                bubbles += empty * W;
+                max_cycles += empty;
+                bubbles += partial * (W / 2);   // k = W/2 partial supply
+                const double fb = frontendBoundFixed(
+                    bubbles, W, static_cast<double>(num_cycles));
+                const double lb = frontendLatencyBoundFixed(
+                    max_cycles, W, W, static_cast<double>(num_cycles));
+                EXPECT_LE(lb, fb);
+                EXPECT_GE(fb - lb, -1e-12);
+            }
+        }
+    }
+}

@@ -483,7 +483,15 @@ CPU::CPUStats::CPUStats(CPU *cpu)
     frontendBound = cpu->fetch.getFetchStats().fetchBubbles /
         (cpu->issueWidth * cpu->baseStats.numCycles);
 
-    frontendLatencyBound = cpu->fetch.getFetchStats().fetchBubbles_max / cpu->baseStats.numCycles;
+    // frontendLatencyBound must share the slot-level denominator of
+    // frontendBound: fetchBubbles_max counts *cycles*, so scale it up to
+    // slots (x decodeWidth) before dividing by the issue slot budget
+    // (issueWidth x numCycles).  Note: issueWidth is currently defined as
+    // an alias of decodeWidth (cpu.cc: issueWidth(params.decodeWidth)), so
+    // this is a dimension/semantics fix with no numerical change.
+    frontendLatencyBound = cpu->fetch.getFetchStats().fetchBubbles_max *
+        cpu->fetch.decodeWidth /
+        (cpu->issueWidth * cpu->baseStats.numCycles);
 
     frontendBandwidthBound = frontendBound - frontendLatencyBound;
 
