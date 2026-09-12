@@ -438,6 +438,13 @@ class Fetch
 
     // Select a thread that is not fetch-blocked, using scheduler
     ThreadID selectUnstalledThread();
+
+    /**
+     * Decode (issue-slot) width of the frontend.  Read by the CPU-level
+     * topdown formulas (CPU::CPUStats) to keep the slot budget consistent
+     * with the fetch-level FetchStatGroup twins.
+     */
+    unsigned getDecodeWidth() const { return decodeWidth; }
   private:
     /** Reset this pipeline stage */
     void resetStage();
