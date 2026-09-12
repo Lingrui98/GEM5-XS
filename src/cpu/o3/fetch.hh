@@ -493,6 +493,14 @@ class Fetch
     void measureFrontendBubbles(unsigned insts_to_decode, ThreadID tid);
 
     /**
+     * measure frontend bubbles for the empty-queue early-out cycle
+     * (no thread selected in sendInstructionsToDecode).  Cycle-level
+     * aggregate: charges at most one full-width bubble per cycle, never
+     * indexed by a thread id (must never see tid == -1).
+     */
+    void measureFrontendBubblesEmptyQueueCycle();
+
+    /**
      * update branch predictors
      */
     /**

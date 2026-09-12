@@ -114,6 +114,10 @@ if env['CONF']['TARGET_ISA'] == 'null':
     # (commits 064029e6ef, add587d180, 803b6ec090). No gem5 link deps.
     GTest('trace_mode_regression.test',
           'trace/trace_mode_regression.test.cc')
+    # D4-A topdown statistics fixes (R1/R2/R6/R7): self-contained pure
+    # function tests, no gem5 link deps.
+    GTest('topdown_stats.test',
+          'topdown_stats.test.cc')
     GTest('champsim_trace_reader.test',
           'trace/ChampSimTraceReader.test.cc',
           'trace/TraceReader.cc',
@@ -139,6 +143,10 @@ else:
     # (commits 064029e6ef, add587d180, 803b6ec090). No gem5 link deps.
     GTest('trace_mode_regression.test',
           'trace/trace_mode_regression.test.cc')
+    # D4-A topdown statistics fixes (R1/R2/R6/R7): self-contained pure
+    # function tests, no gem5 link deps.
+    GTest('topdown_stats.test',
+          'topdown_stats.test.cc')
     GTest('champsim_trace_reader.test',
           'trace/ChampSimTraceReader.test.cc',
           'trace/TraceReader.cc',

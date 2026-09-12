@@ -2261,6 +2261,12 @@ Fetch::sendInstructionsToDecode()
     if (tid == -1)
     {
         DPRINTF(Fetch, "All threads are stalled, no thread selected.\n");
+        // Reached only when some thread is not backend-blocked
+        // (any_thread_active) yet no thread was selected: every unblocked
+        // thread has an empty fetch queue.  Account the frontend bubble for
+        // the whole cycle before returning (at most one full-width bubble
+        // per cycle, never per thread).
+        measureFrontendBubblesEmptyQueueCycle();
         return;
     }
     DPRINTF(Fetch, "select Unstalled [tid:%i]\n",tid);
@@ -2353,6 +2359,35 @@ Fetch::measureFrontendBubbles(unsigned insts_to_decode, ThreadID tid)
     if (stallSig->blockFetch[tid]) {
         fetchStats.decodeStalls++;
         //fetchStats.smtdecodeStalls[tid]++;
+    }
+}
+
+void
+Fetch::measureFrontendBubblesEmptyQueueCycle()
+{
+    // Intel TopDown method for measuring frontend bubbles — empty-queue
+    // early-out path (no thread selected in sendInstructionsToDecode).
+    //
+    // Reached only when some thread is not backend-blocked (any_thread_active)
+    // but no thread is a selection candidate, i.e. every unblocked thread has
+    // an empty fetch queue.  This is a *cycle-level* aggregate: the bubble is
+    // charged at most once per cycle at full decode width, never per thread,
+    // and no tid == -1 is ever passed to a per-thread indexed stats function.
+    //
+    // Gate: at least one unblocked thread must also be outside squash
+    // recovery (robSquashing).  If every unblocked thread is robSquashing the
+    // cycle belongs to bad-speculation recovery, not the frontend.
+    //
+    // SMT note: the bubble is charged once at full decode width regardless of
+    // how many threads have an empty queue (single-thread configs are
+    // unaffected); see the commit message for this SMT policy decision.
+    for (ThreadID i = 0; i < numThreads; ++i) {
+        if (!stallSig->blockFetch[i] &&
+            !fromCommit->commitInfo[i].robSquashing) {
+            fetchStats.fetchBubbles += decodeWidth;
+            fetchStats.fetchBubbles_max++;
+            return;
+        }
     }
 }
 
