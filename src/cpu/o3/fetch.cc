@@ -432,6 +432,11 @@ Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
              "recovery windows (frontendRecoveryCycles x decodeWidth).  "
              "Raw component only: may overlap fetchBubbles on post-squash "
              "cycles and must never be summed into a composite numerator"),
+    ADD_STAT(fetchQueueSquashedInsts, statistics::units::Count::get(),
+             "Instructions dropped when a squash clears the fetch queue "
+             "(Fetch::doSquash; the resetStage/clearStates clears are not "
+             "squashes and are not counted).  Neutral naming: includes "
+             "non-misprediction squash sources (trap/tc/squashAfter)"),
     ADD_STAT(resolveQueueFullEvents, statistics::units::Count::get(),
              "Number of events the resolve queue becomes full"),
     ADD_STAT(resolveEnqueueFailEvent, statistics::units::Count::get(),
@@ -3564,6 +3569,10 @@ Fetch::doSquash(PCStateBase &new_pc, const DynInstPtr squashInst, const InstSeqN
     setAllFetchStalls(StallReason::BpStall); // may caused by other stages like load and store
 
     // Empty fetch queue
+    // D4-A R5: count the instructions dropped by this squash clear
+    // (statistics-only; the resetStage/clearStates queue clears are NOT
+    // squashes and are never counted here).
+    fetchStats.fetchQueueSquashedInsts += fetchQueue[tid].size();
     fetchQueue[tid].clear();
     deferVsetvlDecode[tid] = true;
     postSquashFetchBatchSize[tid] = 0;

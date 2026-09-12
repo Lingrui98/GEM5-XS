@@ -1467,3 +1467,239 @@ TEST(R4WindowSmt, IndependentPerTidRecoveryWindows)
     EXPECT_EQ(tid0.frontendRecoveryCycles, 3);
     EXPECT_EQ(tid1.frontendRecoveryCycles, 1);
 }
+
+// ===========================================================================
+// PART R5 — wasted-clear raw counters (fetch queue / dispatch queue /
+//           trace wrong-path supply)
+// Guard: src/cpu/o3/fetch.cc
+//   Fetch::doSquash   (~@2088: fetchQueueSquashedInsts += size() BEFORE
+//                      fetchQueue[tid].clear(); the clearStates ~@668 /
+//                      resetStage ~@704 clears are NOT squashes and are
+//                      never counted)
+// Guard: src/cpu/o3/iew.cc
+//   IEW::dispatchInstFromDispQue (~@1372: ++dispQueSquashedInsts where a
+//                      squashed entry is popped from the dispatch queue;
+//                      with enableDispatchStage false (kmhv3.py) this
+//                      two-stage path is inactive and the counter stays 0)
+// Guard: src/cpu/o3/trace/TraceFetch.cc
+//   TraceFetchStats group (new, parent = fetch.cpu, mirrors the
+//   TraceReader::TraceReaderStats precedent):
+//     wrongPathSuppliedInsts  (~@474, wrong-path NOP supply)
+//     enterTraceWrongPathCount (~@540, every wrong-path entry)
+//
+// Semantics: neutral "squashed" naming — every squash-clear counter
+// includes non-misprediction squash sources (trap/tc/squashAfter).
+// Supply counters count the START of an instruction's life; clear
+// counters count its END — different events over the same instructions,
+// never to be summed into any composite numerator.
+// ===========================================================================
+
+namespace
+{
+
+// Replica of the fetch-queue clear accounting (fetch.cc):
+//   doSquash         (~@2088): size() charged BEFORE clear() -> counted
+//   clearStates      (~@668):  reset bookkeeping, not a squash -> ignored
+//   resetStage       (~@704):  reset bookkeeping, not a squash -> ignored
+//   delivery pops              (sendInstructionsToDecode): not a clear
+struct FetchQueueClearModel
+{
+    std::vector<int> queue;             // instruction ids in the queue
+    long fetchQueueSquashedInsts = 0;
+
+    void push(int id) { queue.push_back(id); }
+
+    // Fetch::doSquash path.
+    void
+    squash_clear()
+    {
+        fetchQueueSquashedInsts += static_cast<long>(queue.size());
+        queue.clear();
+    }
+
+    // resetStage/clearStates path (not counted).
+    void reset_clear() { queue.clear(); }
+
+    // sendInstructionsToDecode pop (not a clear).
+    void deliver(unsigned n)
+    {
+        if (n > queue.size()) {
+            n = queue.size();
+        }
+        queue.erase(queue.begin(), queue.begin() + n);
+    }
+};
+
+// Replica of the dispatch-queue pop accounting (iew.cc
+// dispatchInstFromDispQue): each squashed entry popped is +1; live entries
+// dispatched are not counted.
+struct DispQuePopModel
+{
+    // (is_squashed, id) entries in one dispatch queue.
+    std::vector<std::pair<bool, int>> queue;
+    long dispQueSquashedInsts = 0;
+
+    void push(bool squashed, int id) { queue.emplace_back(squashed, id); }
+
+    // One dispatchInstFromDispQue pass: pops until the queue is empty;
+    // squashed heads are dropped and counted, live heads are dispatched.
+    void
+    dispatch_pass()
+    {
+        while (!queue.empty()) {
+            if (queue.front().first) {
+                ++dispQueSquashedInsts;
+                queue.erase(queue.begin());
+                continue;
+            }
+            queue.erase(queue.begin());
+        }
+    }
+};
+
+// Replica of the TraceFetch supply accounting (TraceFetch.cc):
+//   wrong-path NOP supply (~@474)   -> wrongPathSuppliedInsts++
+//   correct-path supply              -> not counted
+//   enterTraceWrongPath (~@540)      -> enterTraceWrongPathCount++ (every
+//                                        entry, including re-entries)
+struct TraceWrongPathModel
+{
+    bool wrong_path_active = false;
+    long wrongPathSuppliedInsts = 0;
+    long enterTraceWrongPathCount = 0;
+
+    void
+    supply(bool wrong_path)
+    {
+        if (wrong_path) {
+            ++wrongPathSuppliedInsts;
+        }
+    }
+
+    void
+    enter_wrong_path()
+    {
+        wrong_path_active = true;
+        ++enterTraceWrongPathCount;
+    }
+
+    void exit_wrong_path() { wrong_path_active = false; }
+};
+
+} // anonymous namespace
+
+// fetchQueueSquashedInsts: only squash clears charge the dropped size;
+// resetStage/clearStates clears and delivery pops never do.
+TEST(R5FetchQueue, OnlySquashClearsCountDroppedInsts)
+{
+    FetchQueueClearModel q;
+    for (int i = 0; i < 5; ++i) {
+        q.push(i);
+    }
+    q.deliver(2);                          // 3 left, not a clear
+    EXPECT_EQ(q.fetchQueueSquashedInsts, 0);
+
+    q.squash_clear();                      // doSquash: +3
+    EXPECT_EQ(q.fetchQueueSquashedInsts, 3);
+
+    for (int i = 10; i < 15; ++i) {        // refill 5
+        q.push(i);
+    }
+    q.reset_clear();                       // clearStates/resetStage: +0
+    EXPECT_EQ(q.fetchQueueSquashedInsts, 3);
+    EXPECT_TRUE(q.queue.empty());
+
+    q.push(20);
+    q.push(21);
+    q.squash_clear();                      // doSquash: +2
+    EXPECT_EQ(q.fetchQueueSquashedInsts, 5);
+
+    q.squash_clear();                      // empty squash: +0
+    EXPECT_EQ(q.fetchQueueSquashedInsts, 5);
+}
+
+// dispQueSquashedInsts: each squashed entry popped from the dispatch queue
+// counts exactly once; live entries never count.
+TEST(R5DispQue, SquashedPopsCountLiveDispatchesDoNot)
+{
+    DispQuePopModel dq;
+    dq.push(false, 1);     // live
+    dq.push(true, 2);      // squashed
+    dq.push(true, 3);      // squashed
+    dq.push(false, 4);     // live
+    dq.push(true, 5);      // squashed
+    dq.dispatch_pass();
+    EXPECT_EQ(dq.dispQueSquashedInsts, 3);
+    EXPECT_TRUE(dq.queue.empty());
+
+    // A second pass over a fully live queue adds nothing.
+    dq.push(false, 6);
+    dq.push(false, 7);
+    dq.dispatch_pass();
+    EXPECT_EQ(dq.dispQueSquashedInsts, 3);
+}
+
+// wrongPathSuppliedInsts: only wrong-path NOP supplies count; correct-path
+// supplies (from the expected stream head) never do.
+TEST(R5TraceWrongPath, OnlyWrongPathSuppliesCount)
+{
+    TraceWrongPathModel m;
+    m.supply(false);                       // correct-path supply
+    m.supply(false);
+    EXPECT_EQ(m.wrongPathSuppliedInsts, 0);
+
+    m.enter_wrong_path();
+    for (int i = 0; i < 4; ++i) {
+        m.supply(true);                    // wrong-path NOP supplies
+    }
+    EXPECT_EQ(m.wrongPathSuppliedInsts, 4);
+
+    m.exit_wrong_path();
+    m.supply(false);                       // back on the correct path
+    EXPECT_EQ(m.wrongPathSuppliedInsts, 4);
+}
+
+// enterTraceWrongPathCount: every entry counts, including a re-entry
+// without an intervening exit (guarded by the production code placing the
+// increment unconditionally at the function entry).
+TEST(R5TraceWrongPath, EveryEntryCountsIncludingReEntry)
+{
+    TraceWrongPathModel m;
+    m.enter_wrong_path();
+    m.exit_wrong_path();
+    m.enter_wrong_path();
+    m.enter_wrong_path();                  // re-entry without exit
+    m.exit_wrong_path();
+    EXPECT_EQ(m.enterTraceWrongPathCount, 3);
+}
+
+// Supply vs clear are different events over the same instructions: the
+// wrong-path supply counter and the squash-clear counters must never be
+// summed into one composite numerator (documented mutual-exclusion scope:
+// the clear counters ARE mutually exclusive per queue position — an
+// instruction cleared upstream never reaches a downstream queue — but a
+// supplied instruction may be counted once at supply and once at clear).
+TEST(R5MutualExclusion, SupplyAndClearAreDifferentEventsNeverSummed)
+{
+    TraceWrongPathModel tf;
+    FetchQueueClearModel fq;
+
+    // Three wrong-path NOPs supplied, then a squash clears them plus two
+    // older in-flight instructions from the fetch queue.
+    tf.enter_wrong_path();
+    for (int i = 0; i < 3; ++i) {
+        tf.supply(true);
+        fq.push(i);
+    }
+    fq.push(90);
+    fq.push(91);
+    fq.squash_clear();
+
+    // Component listing (raw values, kept separate on purpose):
+    EXPECT_EQ(tf.wrongPathSuppliedInsts, 3);
+    EXPECT_EQ(tf.enterTraceWrongPathCount, 1);
+    EXPECT_EQ(fq.fetchQueueSquashedInsts, 5);
+    // NOT a valid composite: 3 + 5 double-counts the three supplied NOPs
+    // once at supply and once at clear.  The fix deliberately produces no
+    // composite formula.
+}
