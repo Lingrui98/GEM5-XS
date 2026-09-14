@@ -53,6 +53,8 @@
 #include "config/the_isa.hh"
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/entangling_prefetcher.hh"
+#include "cpu/o3/fdip_cleanup.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/pc_event.hh"
 #include "cpu/pred/bpred_unit.hh"
@@ -129,6 +131,46 @@ class Fetch
         {
             assert(mode == BaseMMU::Execute);
             fetch->finishTranslation(fault, req);
+            delete this;
+        }
+    };
+
+    class FdipTranslation : public BaseMMU::Translation
+    {
+      protected:
+        Fetch *fetch;
+
+      public:
+        FdipTranslation(Fetch *_fetch) : fetch(_fetch) {}
+
+        void markDelayed() {}
+
+        void
+        finish(const Fault &fault, const RequestPtr &req,
+            gem5::ThreadContext *tc, BaseMMU::Mode mode)
+        {
+            assert(mode == BaseMMU::Execute);
+            fetch->finishFdipTranslation(fault, req);
+            delete this;
+        }
+    };
+
+    class EipTranslation : public BaseMMU::Translation
+    {
+      protected:
+        Fetch *fetch;
+
+      public:
+        EipTranslation(Fetch *_fetch) : fetch(_fetch) {}
+
+        void markDelayed() {}
+
+        void
+        finish(const Fault &fault, const RequestPtr &req,
+            gem5::ThreadContext *tc, BaseMMU::Mode mode)
+        {
+            assert(mode == BaseMMU::Execute);
+            fetch->finishEipTranslation(fault, req);
             delete this;
         }
     };
@@ -214,6 +256,115 @@ class Fetch
         NumCacheRequestStatus
     };
 
+    enum FdipLineStatus
+    {
+        FdipIdle,
+        FdipTlbWait,
+        FdipReady,
+        FdipInflight,
+        FdipDone,
+        FdipFilteredFault,
+        FdipFilteredUncacheable,
+        FdipFilteredRecentUnused
+    };
+
+    struct FdipLineState
+    {
+        Addr lineAddr = 0;
+        Addr physLineAddr = 0;
+        RequestPtr req;
+        FdipLineStatus status = FdipIdle;
+        bool directProbeHit = false;
+
+        void reset()
+        {
+            lineAddr = 0;
+            physLineAddr = 0;
+            req.reset();
+            status = FdipIdle;
+            directProbeHit = false;
+        }
+
+        bool isTerminal() const
+        {
+            return status == FdipDone ||
+                   status == FdipFilteredFault ||
+                   status == FdipFilteredUncacheable ||
+                   status == FdipFilteredRecentUnused;
+        }
+    };
+
+    struct FdipThreadState
+    {
+        bool valid = false;
+        branch_prediction::btb_pred::FetchTargetId ftqId = 0;
+        uint64_t addressSpaceId = 0;
+        uint8_t asidHash = 0;
+        Addr startPC = 0;
+        uint64_t epoch = 0;
+        unsigned lineCount = 0;
+        std::array<FdipLineState, 2> lines;
+
+        void reset()
+        {
+            valid = false;
+            ftqId = 0;
+            addressSpaceId = 0;
+            asidHash = 0;
+            startPC = 0;
+            epoch = 0;
+            lineCount = 0;
+            for (auto &line : lines) {
+                line.reset();
+            }
+        }
+    };
+
+    struct FdipPendingRequest
+    {
+        ThreadID tid = 0;
+        branch_prediction::btb_pred::FetchTargetId ftqId = 0;
+        Addr startPC = 0;
+        Addr lineAddr = 0;
+        uint64_t epoch = 0;
+        unsigned lineIndex = 0;
+        bool outstanding = false;
+        RequestPtr req;
+    };
+
+    enum EipRequestStatus
+    {
+        EipAccepted,
+        EipTlbWait,
+        EipReady,
+        EipInflight,
+    };
+
+    struct EipPendingRequest
+    {
+        ThreadID tid = 0;
+        uint64_t virtualLine = 0;
+        uint64_t decisionId = 0;
+        EipRequestStatus status = EipTlbWait;
+        RequestPtr req;
+    };
+
+    struct FdipProbeHint
+    {
+        uint64_t epoch = 0;
+        branch_prediction::btb_pred::FetchTargetId ftqId = 0;
+        Addr physLineAddr = 0;
+        bool isSecure = false;
+        uint8_t selectedWay = 0;
+        Tick installTick = 0;
+    };
+
+    struct FdipTrackedTarget
+    {
+        uint64_t issuedLines = 0;
+        std::unordered_set<Addr> issuedPhysLines;
+    };
+
   private:
     friend class TraceFetch;
 
@@ -287,6 +438,8 @@ class Fetch
 
     /** Processes cache completion event. */
     void processCacheCompletion(PacketPtr pkt);
+    void processFdipCompletion(PacketPtr pkt);
+    void processEipCompletion(PacketPtr pkt);
 
     /** Resume after a drain. */
     void drainResume();
@@ -423,6 +576,8 @@ class Fetch
     void sendNextCacheRequest(ThreadID tid, const PCStateBase &pc_state);
 
     void finishTranslation(const Fault &fault, const RequestPtr &mem_req);
+    void finishFdipTranslation(const Fault &fault, const RequestPtr &mem_req);
+    void finishEipTranslation(const Fault &fault, const RequestPtr &mem_req);
 
     /** Validate if a translation request is expected and should be processed.
      * @param tid Thread ID
@@ -461,6 +616,81 @@ class Fetch
      * @return true if all packets have arrived and data is merged, false if still waiting
      */
     bool processMultiCacheLineCompletion(ThreadID tid, PacketPtr pkt);
+    void runFdip();
+    void runFdip(ThreadID tid);
+    void runEip();
+    void resetFdipPartialState(ThreadID tid);
+    void resetFdipState(ThreadID tid);
+    void resetFdipProbeHints(ThreadID tid);
+    void resetFdipTracking(ThreadID tid);
+    bool initFdipTargetState(ThreadID tid);
+    unsigned computeFdipLineAddrs(
+        const branch_prediction::btb_pred::FetchTarget &target,
+        std::array<Addr, 2> &lineAddrs) const;
+    bool startFdipTranslation(ThreadID tid, unsigned lineIndex);
+    bool issueFdipReadyLine(ThreadID tid, unsigned lineIndex,
+                            unsigned &remainingBudget);
+    bool finishFdipTargetIfReady(ThreadID tid);
+    bool tryCompleteFdipLineByDirectProbe(ThreadID tid, unsigned lineIndex,
+                                          const RequestPtr &mem_req);
+    void installFdipProbeHint(
+        ThreadID tid, branch_prediction::btb_pred::FetchTargetId ftqId,
+        uint64_t epoch, Addr physLineAddr, bool isSecure,
+        uint8_t selectedWay);
+    bool lookupAndConsumeFdipProbeHint(
+        ThreadID tid, branch_prediction::btb_pred::FetchTargetId ftqId,
+        Addr physLineAddr, bool isSecure, FdipProbeHint &hint);
+    bool reserveInstPrefetchDecision(
+        unsigned maxOutstanding, unsigned issueBandwidth,
+        uint64_t &decisionId);
+    void releaseInstPrefetchDecision();
+    void emitInstPrefetchTrace(
+        branch_prediction::btb_pred::BtbpTraceEvent::EventType eventType,
+        ThreadID tid, const RequestPtr &req,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason =
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                Unknown);
+    void emitTraceFetchRequest(
+        branch_prediction::btb_pred::BtbpTraceEvent::EventType eventType,
+        ThreadID tid,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason =
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                Unknown);
+    void emitTraceDemandEvent(
+        branch_prediction::btb_pred::BtbpTraceEvent::EventType eventType,
+        ThreadID tid, const RequestPtr &req,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason =
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                Unknown);
+    uint32_t beginTraceDemandAttempt(ThreadID tid, const RequestPtr &req);
+    void closeTraceDemand(
+        ThreadID tid, const RequestPtr &req,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason);
+    void closeTraceFetchRequest(
+        ThreadID tid,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason);
+    void closeOutstandingTraceFetch(
+        ThreadID tid,
+        branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason reason);
+    void emitTraceDecodeConsume(
+        ThreadID tid, Addr instructionPc, unsigned instructionSize,
+        uint64_t traceInstructionOrdinal, bool wrongPath);
+    bool traceInstructionBytesReady(
+        ThreadID tid, Addr instructionPc, unsigned instructionSize) const;
+    bool acceptEipCandidate(
+        ThreadID tid, const EntanglingPrefetcher::Candidate &candidate,
+        const Request::XsMetadata &triggerMeta);
+    void cancelAllEipRequests();
+    uint64_t demandIdForPC(ThreadID tid, Addr pc) const;
+    void noteFdipCandidateLine(ThreadID tid, Addr lineAddr);
+    void noteFdipIssuedLine(
+        ThreadID tid, branch_prediction::btb_pred::FetchTargetId ftqId,
+        Addr physLineAddr);
+    void noteFdipWrongPathTargets(
+        ThreadID tid, branch_prediction::btb_pred::FetchTargetId squashFtqId);
+    void retireCommittedFdipTargets(
+        ThreadID tid, branch_prediction::btb_pred::FetchTargetId doneFtqId);
+    void noteDemandOnWrongPathFdipLine(ThreadID tid, Addr physLineAddr);
 
 
     /** Check if an interrupt is pending and that we need to handle
@@ -541,6 +771,18 @@ class Fetch
     uint64_t findTraceIndexForSeqNum(InstSeqNum seqNum) const;
     bool lookupTraceIndexForSeqNum(InstSeqNum seqNum, uint64_t &index) const;
     Addr getTracePCByIndex(uint64_t index);
+    bool shouldDropFdipRefill(ContextID contextId,
+                              const Request::XsMetadata &xsMeta) const;
+    bool eipEnabled() const { return eipPrefetcher != nullptr; }
+    void notifyEipDemand(
+        ContextID contextId, Addr virtualAddr, Addr physicalAddr,
+        uint64_t demandId, bool cacheHit, bool prefetchHit,
+        bool wrongPath, const Request::XsMetadata &requestMeta);
+    void notifyEipFill(
+        ContextID contextId, Addr virtualAddr, Addr physicalAddr);
+    void notifyEipEvict(ContextID contextId, Addr physicalAddr);
+    void beginBtbpRoiTracking();
+    void beginBtbpRoiDrain();
 
   private:
     DynInstPtr buildInst(ThreadID tid, StaticInstPtr staticInst,
@@ -732,8 +974,26 @@ class Fetch
         /** Number of completed packets received */
         unsigned completedPackets;
 
+        uint64_t traceRequestUid;
+        uint64_t traceLookupUid;
+        uint64_t traceFetchEpoch;
+        uint64_t traceInstructionOrdinal;
+        uint64_t traceFtqId;
+        uint64_t traceAddressSpaceId;
+        uint8_t traceAsidHash;
+        bool tracePathWrong;
+        bool traceRequestOpened;
+        bool traceRequestTerminalEmitted;
+
         /** Constructor */
-        CacheRequest() : baseAddr(0), totalSize(0), completedPackets(0) {}
+        CacheRequest()
+            : baseAddr(0), totalSize(0), completedPackets(0),
+              traceRequestUid(0), traceLookupUid(0), traceFetchEpoch(0),
+              traceInstructionOrdinal(0), traceFtqId(0),
+              traceAddressSpaceId(0), traceAsidHash(0),
+              tracePathWrong(false), traceRequestOpened(false),
+              traceRequestTerminalEmitted(false)
+        {}
 
         /** Check if all packets have been completed */
         bool allCompleted() const {
@@ -783,6 +1043,16 @@ class Fetch
             baseAddr = 0;
             totalSize = 0;
             completedPackets = 0;
+            traceRequestUid = 0;
+            traceLookupUid = 0;
+            traceFetchEpoch = 0;
+            traceInstructionOrdinal = 0;
+            traceFtqId = 0;
+            traceAddressSpaceId = 0;
+            traceAsidHash = 0;
+            tracePathWrong = false;
+            traceRequestOpened = false;
+            traceRequestTerminalEmitted = false;
         }
 
         /** Add a new request */
@@ -997,6 +1267,36 @@ class Fetch
     /** fetch stall reasons */
     std::vector<StallReason> stallReason;
 
+    /** Fetch-directed ICache prefetch bookkeeping. */
+    FdipThreadState fdipState[MaxThreads];
+    std::deque<FdipProbeHint> fdipProbeHints[MaxThreads];
+    std::map<branch_prediction::btb_pred::FetchTargetId, FdipTrackedTarget>
+        fdipTrackedTargets[MaxThreads];
+    std::unordered_map<Addr, uint64_t> fdipCandidateLineSeen[MaxThreads];
+    std::unordered_map<Addr, uint64_t> fdipIssuedLineSeen[MaxThreads];
+    std::unordered_set<Addr> fdipWrongPathIssuedLineSeen[MaxThreads];
+    std::unordered_set<Addr> fdipWrongPathDemandReuseLineSeen[MaxThreads];
+    uint64_t fdipEpoch[MaxThreads]{};
+    std::vector<FdipPendingRequest> fdipPendingReqs;
+    std::vector<EipPendingRequest> eipPendingReqs;
+    std::unique_ptr<EntanglingPrefetcher> eipPrefetcher;
+    unsigned eipIssueBandwidth = 0;
+    unsigned eipMaxOutstanding = 0;
+    unsigned instPrefetchOutstandingLines = 0;
+    Tick instPrefetchDecisionTick = MaxTick;
+    unsigned instPrefetchDecisionsThisTick = 0;
+    uint64_t nextInstPrefetchDecisionId = 1;
+    uint64_t nextL1iDemandUid = 1;
+    uint64_t pendingTraceInstructionOrdinal[MaxThreads]{};
+    Addr pendingTraceInstructionPc[MaxThreads]{};
+    bool pendingTracePathWrong[MaxThreads]{};
+    bool pendingTraceSupplyValid[MaxThreads]{};
+    CacheAccessor *fdipIcacheAccessor = nullptr;
+    bool btbpRoiActive = false;
+    bool btbpRoiDrainMode = false;
+    bool btbpRoiDrainExitRequested = false;
+    Tick btbpRoiDrainBeginTick = 0;
+
     /**
      * Check if the thread can fetch instructions
      * @param tid Thread ID
@@ -1151,6 +1451,74 @@ class Fetch
         statistics::Scalar traceMetaCleanupSquashEntries;
         /** Number of times cleanup was called on successful commit. */
         statistics::Scalar traceMetaCleanupCommitCalls;
+        /** Number of FDIP cacheline prefetches successfully sent. */
+        statistics::Scalar fdipIssuedLines;
+        /** Number of FDIP issue attempts dropped due to best-effort limits. */
+        statistics::Scalar fdipDropped;
+        /** Number of FDIP lines filtered due to translation faults. */
+        statistics::Scalar fdipFilteredFault;
+        /** Number of FDIP lines filtered due to uncacheable/strict regions. */
+        statistics::Scalar fdipFilteredUncacheable;
+        /** Number of FDIP lines filtered due to recent-unused suppression. */
+        statistics::Scalar fdipFilteredRecentUnused;
+        /** Number of FDIP candidate line touches from predictor targets. */
+        statistics::Scalar fdipCandidateLines;
+        /** Number of unique FDIP candidate lines seen across the run. */
+        statistics::Scalar fdipUniqueCandidateLines;
+        /** Number of repeated FDIP candidate line touches. */
+        statistics::Scalar fdipRepeatedCandidateLines;
+        /** Number of FDIP translated lines that hit via direct ICache probe. */
+        statistics::Scalar fdipDirectProbeHit;
+        /** Number of unique physical lines issued by FDIP. */
+        statistics::Scalar fdipUniqueIssuedLines;
+        /** Number of repeated FDIP issued-line touches. */
+        statistics::Scalar fdipRepeatedIssuedLines;
+        /** Number of FDIP issued lines that later belonged to squashed FTQs. */
+        statistics::Scalar fdipWrongPathIssuedLines;
+        /** Number of unique physical lines later attributed to wrong-path FDIP. */
+        statistics::Scalar fdipWrongPathUniqueIssuedLines;
+        /** Number of demand fetch line accesses to previously squashed FDIP lines. */
+        statistics::Scalar fdipWrongPathDemandAccesses;
+        /** Number of unique squashed FDIP lines later revisited by demand. */
+        statistics::Scalar fdipWrongPathDemandReusedLines;
+        /** Number of selected-way hints installed by direct probe hit. */
+        statistics::Scalar fdipWayHintsInstalled;
+        /** Number of selected-way hints consumed by demand fetch. */
+        statistics::Scalar fdipWayHintsConsumed;
+        /** Peak number of outstanding FDIP cacheline requests. */
+        statistics::Scalar fdipOutstandingMax;
+        /** Number of stale FDIP translation/response events ignored by epoch. */
+        statistics::Scalar fdipEpochMismatch;
+        /** Number of instruction-prefetch decisions accepted at the common gate. */
+        statistics::Scalar instPrefetchDecisionsAccepted;
+        /** Number of decisions rejected by the per-cycle bandwidth gate. */
+        statistics::Scalar instPrefetchDecisionBandwidthRejects;
+        /** Number of decisions rejected by the outstanding-request gate. */
+        statistics::Scalar instPrefetchDecisionOutstandingRejects;
+        /** Peak accepted-but-incomplete instruction-prefetch requests. */
+        statistics::Scalar instPrefetchOutstandingMax;
+        /** Number of demand tag checks observed by EIP. */
+        statistics::Scalar eipDemandAccesses;
+        /** Number of EIP candidates offered by the paper-native core. */
+        statistics::Scalar eipCandidatesOffered;
+        /** Number of EIP candidates accepted at the common gate. */
+        statistics::Scalar eipCandidatesAccepted;
+        /** Number of EIP translations rejected by faults. */
+        statistics::Scalar eipFilteredFault;
+        /** Number of EIP translations rejected as uncacheable. */
+        statistics::Scalar eipFilteredUncacheable;
+        /** Number of EIP requests sent to the L1I port. */
+        statistics::Scalar eipIssuedLines;
+        /** Number of EIP physical-send attempts blocked by L1I backpressure. */
+        statistics::Scalar eipBackpressureEvents;
+        /** Number of EIP request completions returned to Fetch. */
+        statistics::Scalar eipCompletedLines;
+        /** Number of real L1I fill events observed by EIP. */
+        statistics::Scalar eipFillEvents;
+        /** Number of real L1I eviction events observed by EIP. */
+        statistics::Scalar eipEvictionEvents;
+        /** Number of wrong-path squash events observed by EIP. */
+        statistics::Scalar eipSquashEvents;
     } fetchStats;
 
     SquashVersion localSquashVer[MaxThreads];

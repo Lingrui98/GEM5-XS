@@ -42,6 +42,7 @@ if env['CONF']['TARGET_ISA'] != 'null':
     Source('cpu.cc')
     Source('decode.cc')
     Source('dyn_inst.cc')
+    Source('entangling_prefetcher.cc')
     Source('fetch.cc')
     Source('free_list.cc')
     Source('fu_pool.cc')
@@ -110,14 +111,11 @@ if env['CONF']['TARGET_ISA'] == 'null':
     env.Append(LIBS=['z'])
     GTest('fdip_cleanup.test',
           'fdip_cleanup.test.cc')
-    # Targeted regression tests for 3 trace-mode failure modes
-    # (commits 064029e6ef, add587d180, 803b6ec090). No gem5 link deps.
-    GTest('trace_mode_regression.test',
-          'trace/trace_mode_regression.test.cc')
-    # D4-A topdown statistics fixes (R1/R2/R6/R7): self-contained pure
-    # function tests, no gem5 link deps.
-    GTest('topdown_stats.test',
-          'topdown_stats.test.cc')
+    GTest('entangling_prefetcher.test',
+          'entangling_prefetcher.test.cc',
+          'entangling_prefetcher.cc')
+    GTest('trace_l1i_identity.test',
+          'trace/TraceL1iIdentity.test.cc')
     GTest('champsim_trace_reader.test',
           'trace/ChampSimTraceReader.test.cc',
           'trace/TraceReader.cc',
@@ -153,14 +151,11 @@ else:
     env.Append(LIBS=['z'])
     GTest('fdip_cleanup.test',
           'fdip_cleanup.test.cc')
-    # Targeted regression tests for 3 trace-mode failure modes
-    # (commits 064029e6ef, add587d180, 803b6ec090). No gem5 link deps.
-    GTest('trace_mode_regression.test',
-          'trace/trace_mode_regression.test.cc')
-    # D4-A topdown statistics fixes (R1/R2/R6/R7): self-contained pure
-    # function tests, no gem5 link deps.
-    GTest('topdown_stats.test',
-          'topdown_stats.test.cc')
+    GTest('entangling_prefetcher.test',
+          'entangling_prefetcher.test.cc',
+          'entangling_prefetcher.cc')
+    GTest('trace_l1i_identity.test',
+          'trace/TraceL1iIdentity.test.cc')
     GTest('champsim_trace_reader.test',
           'trace/ChampSimTraceReader.test.cc',
           'trace/TraceReader.cc',

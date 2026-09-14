@@ -377,22 +377,74 @@ Cache::handleTimingReqMiss(PacketPtr pkt, CacheBlk *blk, Tick forward_time,
         assert(pkt->req->hasPaddr());
         assert(!pkt->req->isUncacheable());
 
-        // There's no reason to add a prefetch as an additional target
-        // to an existing MSHR. If an outstanding request is already
-        // in progress, there is nothing for the prefetch to do.
-        // If this is the case, we don't even create a request at all.
-        PacketPtr pf = nullptr;
+        const bool inst_prefetch_pkt = isL1I() && isInstPrefetchPkt(pkt);
+        const bool fdip_pkt = inst_prefetch_pkt && isFdipPkt(pkt);
+        if (!(inst_prefetch_pkt && !mshr)) {
+            if (mshr && fdip_pkt) {
+                stats.fdipProbeMerged++;
+                if (mshr->hasFromDemand() && mshr->markFdipLateSeen()) {
+                    stats.fdipLate++;
+                    noteFdipLateLifecycle(pkt->getBlockAddr(blkSize),
+                                          pkt->isSecure());
+                }
+            }
 
-        if (!mshr) {
-            // copy the request and create a new SoftPFReq packet
-            RequestPtr req = std::make_shared<Request>(pkt->req->getPaddr(),
-                                                    pkt->req->getSize(),
-                                                    pkt->req->getFlags(),
-                                                    pkt->req->requestorId());
-            pf = new Packet(req, pkt->cmd);
-            pf->allocate();
-            assert(pf->matchAddr(pkt));
-            assert(pf->getSize() == pkt->getSize());
+            // There's no reason to add a prefetch as an additional target
+            // to an existing MSHR. If an outstanding request is already
+            // in progress, there is nothing for the prefetch to do.
+            // If this is the case, we don't even create a request at all.
+            PacketPtr pf = nullptr;
+
+            if (!mshr) {
+                // copy the request and create a new SoftPFReq packet
+                RequestPtr req = std::make_shared<Request>(*pkt->req);
+                req->setPFSource(pkt->req->getPFSource());
+                req->setPFDepth(pkt->req->getPFDepth());
+                if (pkt->req->hasXsMetadata()) {
+                    req->setXsMetadata(pkt->req->getXsMetadata());
+                }
+                pf = new Packet(req, pkt->cmd);
+                pf->allocate();
+                assert(pf->matchAddr(pkt));
+                assert(pf->getSize() == pkt->getSize());
+            }
+
+            pkt->makeTimingResponse();
+
+            // request_time is used here, taking into account lat and the delay
+            // charged if the packet comes from the xbar.
+            cpuSidePort.schedTimingResp(pkt, request_time);
+
+            // If an outstanding request is in progress (we found an
+            // MSHR) this is set to null
+            pkt = pf;
+            if (!pkt) {
+                return;
+            }
+        } else {
+            if (!canAllocateL1IMSHR(pkt)) {
+                if (fdip_pkt) {
+                    stats.fdipRejectedNoPrefetchMSHR++;
+                }
+                DPRINTF(Cache,
+                        "%s: reject instruction prefetch by MSHR partition "
+                        "addr=%#llx source=%u\n",
+                        __func__, pkt->getAddr(),
+                        pkt->req->getXsMetadata().prefetchSource);
+                pkt->setMshrArbFailed();
+                pkt->makeTimingResponse();
+                cpuSidePort.schedTimingResp(pkt, request_time);
+                return;
+            }
+            // Packet::makeReadCmd maps Request::PREFETCH to SoftPFReq. A
+            // real instruction-prefetch miss must remain an MSHR-owned
+            // HardPFReq so its original packet returns only after fill.
+            pkt->cmd = MemCmd::HardPFReq;
+            DPRINTF(Cache,
+                    "%s: keep instruction prefetch miss on original request "
+                    "for real completion addr=%#llx source=%u\n",
+                    __func__, pkt->getAddr(),
+                    pkt->req->getXsMetadata().prefetchSource);
         }
 
         pkt->makeTimingResponse();
@@ -413,7 +465,7 @@ Cache::handleTimingReqMiss(PacketPtr pkt, CacheBlk *blk, Tick forward_time,
         DPRINTF(Cache, "Cache miss for %s, but hit in Write Buffer, triggering replay\n", pkt->print());
         assert(wb_entry->getNumTargets() == 1);
         pkt->setHitInWriteBuffer();
-        pkt->req->decAccessDepth();
+        rollbackDeferredMiss(pkt);
         stats.FindHitInWriteBuffer++;
         return; // don't allocate an MSHR, just replay
     }
@@ -441,7 +493,7 @@ Cache::handleTimingReqMiss(PacketPtr pkt, CacheBlk *blk, Tick forward_time,
                     pkt->print());
             pkt->setMshrAliasFailed();
             stats.MSHRAliasFails++;
-            pkt->req->decAccessDepth();
+            rollbackDeferredMiss(pkt);
             return;
         }
     }
@@ -955,8 +1007,37 @@ Cache::serviceMSHRTargets(MSHR *mshr, const PacketPtr pkt, CacheBlk *blk)
           case MSHR::Target::FromPrefetcher:
             assert(tgt_pkt->cmd == MemCmd::HardPFReq);
             from_pref = true;
-
-            delete tgt_pkt;
+            DPRINTF(Cache,
+                    "BTBP prefetch MSHR target addr=%#llx l1i=%d "
+                    "inst_prefetch=%d source=%u decision=%llu\n",
+                    tgt_pkt->getAddr(), isL1I(),
+                    isInstPrefetchPkt(tgt_pkt),
+                    tgt_pkt->req->hasXsMetadata() ?
+                        tgt_pkt->req->getXsMetadata().prefetchSource : 0,
+                    tgt_pkt->req->hasXsMetadata() ?
+                        tgt_pkt->req->getXsMetadata().
+                            instPrefetchDecisionId : 0);
+            if (isL1I() && isInstPrefetchPkt(tgt_pkt)) {
+                // FDIP/EIP keep the original request through a real miss so
+                // the common outstanding slot closes only after the fill.
+                tgt_pkt->makeTimingResponse();
+                if (is_error) {
+                    tgt_pkt->copyError(pkt);
+                }
+                tgt_pkt->headerDelay = tgt_pkt->payloadDelay = 0;
+                const Tick completion_time =
+                    clockEdge(responseLatency) + pkt->headerDelay;
+                DPRINTF(Cache,
+                        "BTBP schedule instruction prefetch response "
+                        "addr=%#llx decision=%llu at tick=%llu\n",
+                        tgt_pkt->getAddr(),
+                        tgt_pkt->req->getXsMetadata().
+                            instPrefetchDecisionId,
+                        completion_time);
+                cpuSidePort.schedTimingResp(tgt_pkt, completion_time);
+            } else {
+                delete tgt_pkt;
+            }
             break;
 
           case MSHR::Target::FromSnoop:
@@ -984,12 +1065,18 @@ Cache::serviceMSHRTargets(MSHR *mshr, const PacketPtr pkt, CacheBlk *blk)
         }
     }
 
-    if (blk && !from_core && from_pref) {
+    const bool demand_merged = targets.hasFromDemand || mshr->hasFromDemand();
+    const bool inst_prefetch_fill = blk && isL1I() &&
+        mshr->allocatedByInstPrefetch() &&
+        isInstPrefetchSource(pkt->req->getPFSource());
+    const bool inst_prefetched = inst_prefetch_fill && !demand_merged;
+    if (blk && ((!from_core && from_pref) || inst_prefetched)) {
         blk->setPrefetched();
         blk->setXsMetadata(pkt->req->getXsMetadata());
         DPRINTF(Cache, "Marking block as prefetched from prefetcher %i\n", blk->getXsMetadata().prefetchSource);
         stats.pfOnlyFill++;  // Pure prefetch fill (no demand merge)
-    } else if (blk && from_core && from_pref) {
+    } else if (blk && ((from_core && from_pref) ||
+                       (inst_prefetch_fill && demand_merged))) {
         // Prefetch was merged with demand - won't be marked as prefetched
         stats.pfMergedWithDemand++;
         DPRINTF(Cache, "Prefetch merged with demand for %#lx - not marking as prefetched\n",
@@ -1612,7 +1699,10 @@ Cache::sendMSHRQueuePacket(MSHR* mshr)
                     mshr->blkAddr);
 
             // Deallocate the mshr target
-            if (mshrQueue.forceDeallocateTarget(mshr)) {
+            const bool no_longer_full =
+                mshrQueue.forceDeallocateTarget(mshr);
+            emitL1IMshrOccupancy(tgt_pkt);
+            if (no_longer_full) {
                 // Clear block if this deallocation resulted freed an
                 // mshr when all had previously been utilized
                 clearBlocked(Blocked_NoMSHRs);
