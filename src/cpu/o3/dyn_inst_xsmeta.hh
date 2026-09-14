@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <deque>
 #include <list>
 #include <string>
@@ -63,10 +64,15 @@ class XsDynInstMeta : public RefCounted
     bool squashed;
     Addr instAddr;
     InstSeqNum seqNum;
+    uint64_t eipDemandId;
 
   public:
-    XsDynInstMeta(): squashed(false), instAddr(0), seqNum(0) {}
-    XsDynInstMeta(InstSeqNum seq): squashed(false), instAddr(0), seqNum(seq) {}
+    XsDynInstMeta()
+        : squashed(false), instAddr(0), seqNum(0), eipDemandId(0)
+    {}
+    XsDynInstMeta(InstSeqNum seq)
+        : squashed(false), instAddr(0), seqNum(seq), eipDemandId(0)
+    {}
 };
 
 using XsDynInstMetaPtr = RefCountingPtr<XsDynInstMeta>;

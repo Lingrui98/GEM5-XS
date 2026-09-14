@@ -94,11 +94,15 @@ class BaseCache(ClockedObject):
     demand_mshr_reserve = Param.Unsigned(1, "MSHRs reserved for demand access")
     demand_fetch_mshrs = Param.Unsigned(
         0,
-        "Protected demand-fetch MSHR capacity for L1I FDIP gating; 0 disables the quota"
+        "Maximum demand-owned MSHRs for a partitioned L1I; 0 disables the quota"
     )
     fdip_prefetch_mshrs = Param.Unsigned(
         0,
-        "Maximum pure-FDIP miss MSHRs for L1I; 0 disables the quota"
+        "Legacy instruction-prefetch MSHR limit used when inst_prefetch_mshrs is 0"
+    )
+    inst_prefetch_mshrs = Param.Unsigned(
+        0,
+        "Maximum FDIP/EIP-owned MSHRs for a partitioned L1I; 0 uses the legacy limit"
     )
     tgts_per_mshr = Param.Unsigned("Max number of accesses per MSHR")
     # Per-cycle limit for MSHR arbitration (allocations or target merges).

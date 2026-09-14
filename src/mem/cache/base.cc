@@ -71,6 +71,7 @@
 #include "debug/TagReadFail.hh"
 #include "mem/cache/compressors/base.hh"
 #include "mem/cache/mshr.hh"
+#include "mem/cache/pf_source_propagation.hh"
 #include "mem/cache/prefetch/associative_set_impl.hh"
 #include "mem/cache/queue_entry.hh"
 #include "mem/cache/tags/compressed_tags.hh"
@@ -86,6 +87,314 @@
 
 namespace gem5
 {
+
+namespace
+{
+
+o3::CPU *
+resolveO3Cpu(System *system, ContextID context_id)
+{
+    if (!system || context_id < 0 || context_id >= system->threads.size()) {
+        return nullptr;
+    }
+
+    ThreadContext *thread_context = system->threads[context_id];
+    if (!thread_context) {
+        return nullptr;
+    }
+
+    return dynamic_cast<o3::CPU *>(thread_context->getCpuPtr());
+}
+
+o3::CPU *
+resolveBtbpTraceCpu(System *system, const RequestPtr &request, ThreadID &tid)
+{
+    if (!request || !request->hasContextId()) {
+        return nullptr;
+    }
+
+    const ContextID context_id = request->contextId();
+    auto *cpu = resolveO3Cpu(system, context_id);
+    if (cpu) {
+        tid = cpu->contextToThread(context_id);
+    }
+    return cpu;
+}
+
+void
+populateBtbpRequestIdentity(
+    branch_prediction::btb_pred::BtbpTraceEvent &event,
+    const RequestPtr &request, unsigned line_size)
+{
+    event.lineSize = line_size;
+    event.lineSizeValid = true;
+    if (request->hasVaddr()) {
+        const Addr vaddr = request->getVaddr();
+        event.virtualLineAddr = vaddr - (vaddr % line_size);
+        event.virtualLineAddrValid = true;
+    }
+    if (!request->hasXsMetadata()) {
+        return;
+    }
+
+    const Request::XsMetadata xs_meta = request->getXsMetadata();
+    if (xs_meta.eipDemandId != 0) {
+        event.demandUid = xs_meta.eipDemandId;
+        event.demandUidValid = true;
+    }
+    if (xs_meta.instPrefetchDecisionId != 0) {
+        event.prefetchDecisionId = xs_meta.instPrefetchDecisionId;
+        event.prefetchDecisionIdValid = true;
+    }
+    if (xs_meta.instPrefetchAttemptId != 0) {
+        event.prefetchAttemptId = xs_meta.instPrefetchAttemptId;
+        event.prefetchAttemptIdValid = true;
+    }
+    if (xs_meta.isInstPrefetch()) {
+        event.prefetchSource =
+            static_cast<uint32_t>(xs_meta.prefetchSource);
+        event.prefetchSourceValid = true;
+    }
+    if (xs_meta.traceIdentityValid) {
+        event.addressSpaceId = xs_meta.traceAddressSpaceId;
+        event.addressSpaceIdValid = true;
+        event.asidHash = xs_meta.traceAsidHash;
+        event.asidHashValid = true;
+        event.ftqId = xs_meta.traceFtqId;
+        event.ftqIdValid = true;
+    }
+    if (xs_meta.traceRequestUid != 0) {
+        event.requestUid = xs_meta.traceRequestUid;
+        event.requestUidValid = true;
+    }
+    if (xs_meta.traceLookupUid != 0) {
+        event.lookupUid = xs_meta.traceLookupUid;
+        event.lookupUidValid = true;
+    }
+    if (xs_meta.traceFetchEpoch != 0) {
+        event.fetchEpoch = xs_meta.traceFetchEpoch;
+        event.fetchEpochValid = true;
+    }
+    if (xs_meta.traceInstructionOrdinal != 0) {
+        event.traceInstructionOrdinal = xs_meta.traceInstructionOrdinal;
+        event.traceInstructionOrdinalValid = true;
+    }
+    if (xs_meta.traceDemandAttemptOrdinal != 0) {
+        event.demandAttemptOrdinal =
+            xs_meta.traceDemandAttemptOrdinal - 1;
+        event.demandAttemptOrdinalValid = true;
+    }
+    if (xs_meta.traceL1iVisibilityTick != 0) {
+        event.visibilityTick = xs_meta.traceL1iVisibilityTick;
+        event.visibilityTickValid = true;
+    }
+    if (xs_meta.l1iResidencyId != 0) {
+        event.residencyId = xs_meta.l1iResidencyId;
+        event.residencyIdValid = true;
+    }
+    event.pathState = xs_meta.tracePathWrong ?
+        branch_prediction::btb_pred::BtbpTraceEvent::WrongPath :
+        branch_prediction::btb_pred::BtbpTraceEvent::CorrectPath;
+    event.pathStateValid = xs_meta.traceRequestUid != 0;
+    if (xs_meta.instPrefetchDecisionId != 0) {
+        event.ownerPrefetchDecisionIds.push_back(
+            xs_meta.instPrefetchDecisionId);
+    }
+    if (xs_meta.isFdip()) {
+        event.fdipEpoch = xs_meta.fdipEpoch;
+        event.fdipEpochValid = true;
+        event.triggerPc = xs_meta.fdipStartPC;
+        event.triggerPcValid = true;
+    } else if (xs_meta.isEip()) {
+        event.triggerPc = xs_meta.eipTriggerPC;
+        event.triggerPcValid = true;
+    }
+}
+
+} // anonymous namespace
+
+void
+BaseCache::emitL1IMshrOccupancy(const PacketPtr pkt)
+{
+    if (!isL1I() || !pkt || !pkt->req) {
+        return;
+    }
+
+    ThreadID tid = 0;
+    auto *cpu = resolveBtbpTraceCpu(system, pkt->req, tid);
+    if (!cpu) {
+        return;
+    }
+
+    const auto occupancy = mshrQueue.partitionOccupancy();
+    branch_prediction::btb_pred::BtbpTraceEvent event;
+    event.tick = curTick();
+    event.eventType = branch_prediction::btb_pred::BtbpTraceEvent::
+        L1IMshrOccupancy;
+    event.threadId = tid;
+    event.mshrDemandOwned = occupancy.demandOwned;
+    event.mshrDemandOwnedValid = true;
+    event.mshrInstPrefetchOwned = occupancy.instPrefetchOwned;
+    event.mshrInstPrefetchOwnedValid = true;
+    event.mshrTotal = occupancy.demandOwned + occupancy.instPrefetchOwned;
+    event.mshrTotalValid = true;
+    event.requestKind = isInstPrefetchReq(pkt->req) ?
+        branch_prediction::btb_pred::BtbpTraceEvent::PrefetchRequest :
+        branch_prediction::btb_pred::BtbpTraceEvent::DemandRequest;
+    event.requestKindValid = true;
+    populateBtbpRequestIdentity(event, pkt->req, blkSize);
+    cpu->notifyBtbpTrace(event);
+}
+
+void
+BaseCache::emitL1ILineEvict(
+    CacheBlk *blk,
+    branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind kind,
+    const PacketPtr incoming)
+{
+    if (!isL1I() || !blk || !blk->isValid() || blk == tempBlock) {
+        return;
+    }
+
+    const auto xs_meta = blk->getXsMetadata();
+    if (xs_meta.eipContextId == InvalidContextID ||
+        xs_meta.l1iResidencyId == 0) {
+        return;
+    }
+
+    auto *cpu = resolveO3Cpu(system, xs_meta.eipContextId);
+    if (!cpu) {
+        return;
+    }
+
+    branch_prediction::btb_pred::BtbpTraceEvent event;
+    event.tick = curTick();
+    event.eventType = branch_prediction::btb_pred::BtbpTraceEvent::
+        L1ILineEvict;
+    event.threadId = cpu->contextToThread(xs_meta.eipContextId);
+    event.lineAddr = regenerateBlkAddr(blk);
+    event.lineAddrValid = true;
+    event.secure = blk->isSecure();
+    event.secureValid = true;
+    event.lineSize = blkSize;
+    event.lineSizeValid = true;
+    event.lifecycleKind = static_cast<uint32_t>(kind);
+    event.lifecycleKindValid = true;
+    event.terminalReason = static_cast<uint32_t>(
+        kind == branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind::
+                    SameLineRefill ?
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                Invalidated :
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                Evicted);
+    event.terminalReasonValid = true;
+    event.residencyId = xs_meta.l1iResidencyId;
+    event.residencyIdValid = true;
+    event.replacement = kind == branch_prediction::btb_pred::BtbpTraceEvent::
+        LifecycleKind::Evict && incoming;
+    event.replacementValid = true;
+    event.requestKind = isInstPrefetchSource(xs_meta.prefetchSource) ?
+        branch_prediction::btb_pred::BtbpTraceEvent::PrefetchRequest :
+        branch_prediction::btb_pred::BtbpTraceEvent::DemandRequest;
+    event.requestKindValid = true;
+    if (isInstPrefetchSource(xs_meta.prefetchSource)) {
+        event.prefetchSource =
+            static_cast<uint32_t>(xs_meta.prefetchSource);
+        event.prefetchSourceValid = true;
+        if (xs_meta.instPrefetchDecisionId != 0) {
+            event.prefetchDecisionId = xs_meta.instPrefetchDecisionId;
+            event.prefetchDecisionIdValid = true;
+        }
+        if (xs_meta.instPrefetchAttemptId != 0) {
+            event.prefetchAttemptId = xs_meta.instPrefetchAttemptId;
+            event.prefetchAttemptIdValid = true;
+        }
+    }
+    if (xs_meta.instPrefetchDecisionId != 0) {
+        event.ownerPrefetchDecisionIds.push_back(
+            xs_meta.instPrefetchDecisionId);
+    }
+    if (xs_meta.traceIdentityValid) {
+        event.addressSpaceId = xs_meta.traceAddressSpaceId;
+        event.addressSpaceIdValid = true;
+        event.asidHash = xs_meta.traceAsidHash;
+        event.asidHashValid = true;
+        event.ftqId = xs_meta.traceFtqId;
+        event.ftqIdValid = true;
+    }
+    if (incoming && incoming->req) {
+        event.incomingRequestKind = isInstPrefetchReq(incoming->req) ?
+            branch_prediction::btb_pred::BtbpTraceEvent::PrefetchRequest :
+            branch_prediction::btb_pred::BtbpTraceEvent::DemandRequest;
+        event.incomingRequestKindValid = true;
+        if (incoming->req->hasXsMetadata()) {
+            const auto incoming_meta = incoming->req->getXsMetadata();
+            if (incoming_meta.instPrefetchDecisionId != 0) {
+                event.incomingPrefetchDecisionId =
+                    incoming_meta.instPrefetchDecisionId;
+                event.incomingPrefetchDecisionIdValid = true;
+            }
+            if (incoming_meta.isInstPrefetch()) {
+                event.incomingPrefetchSource = static_cast<uint32_t>(
+                    incoming_meta.prefetchSource);
+                event.incomingPrefetchSourceValid = true;
+            }
+        }
+    }
+    cpu->notifyBtbpTrace(event);
+}
+
+void
+BaseCache::beginBtbpRoiTracking()
+{
+    panic_if(btbpLifecycleLedger.size() != btbpRoiResidencies.size(),
+             "BTBP ROI begin ledger/map size mismatch: %zu != %zu",
+             btbpLifecycleLedger.size(), btbpRoiResidencies.size());
+}
+
+unsigned
+BaseCache::closeBtbpRoiResidencies()
+{
+    const auto drained = btbpLifecycleLedger.drainAll();
+    panic_if(drained.size() != btbpRoiResidencies.size(),
+             "BTBP ROI drain ledger/map size mismatch: %zu != %zu",
+             drained.size(), btbpRoiResidencies.size());
+    for (const auto &[line, ledger_residency] : drained) {
+        const uint64_t residency_id = ledger_residency.id;
+        const auto tracked = btbpRoiResidencies.find(residency_id);
+        panic_if(tracked == btbpRoiResidencies.end(),
+                 "BTBP ROI residency %llu at %#llx (%s) lacks trace state",
+                 residency_id, line.lineAddr,
+                 line.secure ? "secure" : "non-secure");
+        auto &residency = tracked->second;
+        auto *cpu = resolveO3Cpu(system, residency.contextId);
+        panic_if(!cpu, "BTBP ROI residency %llu lost its CPU context",
+                 residency_id);
+        auto event = residency.event;
+        event.tick = curTick();
+        event.eventType = branch_prediction::btb_pred::BtbpTraceEvent::
+            L1ILineEvict;
+        event.lifecycleKind = static_cast<uint32_t>(
+            branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind::
+                RoiDrainClose);
+        event.lifecycleKindValid = true;
+        event.terminalReason = static_cast<uint32_t>(
+            branch_prediction::btb_pred::BtbpTraceEvent::TerminalReason::
+                RetainedAtDrain);
+        event.terminalReasonValid = true;
+        event.fillBytesTickValid = false;
+        event.l1iReadyTickValid = false;
+        event.scanCompleteTickValid = false;
+        event.residencyId = residency_id;
+        event.residencyIdValid = true;
+        event.replacement = false;
+        event.replacementValid = true;
+        cpu->notifyBtbpTrace(event);
+    }
+    const unsigned closed = drained.size();
+    btbpRoiResidencies.clear();
+    return closed;
+}
 
 BaseCache::SendTimingRespEvent::SendTimingRespEvent(BaseCache* cache, PacketPtr pkt)
     : Event(Delayed_Writeback_Pri, AutoDelete),
@@ -176,7 +485,9 @@ BaseCache::BaseCache(const BaseCacheParams &p, unsigned blk_size)
       clusivity(p.clusivity),
       isReadOnly(p.is_read_only),
       demandFetchMSHRs(p.demand_fetch_mshrs),
-      fdipPrefetchMSHRs(p.fdip_prefetch_mshrs),
+      instPrefetchMSHRs(p.inst_prefetch_mshrs ?
+          p.inst_prefetch_mshrs : p.fdip_prefetch_mshrs),
+      btbpLifecycleLedger(p.size / blk_size),
       replaceExpansions(p.replace_expansions),
       moveContractions(p.move_contractions),
       blocked(0),
@@ -216,12 +527,18 @@ BaseCache::BaseCache(const BaseCacheParams &p, unsigned blk_size)
     fatal_if(demandFetchMSHRs > p.mshrs,
         "%s demand_fetch_mshrs (%u) exceeds mshrs (%u)",
         name(), demandFetchMSHRs, p.mshrs);
-    fatal_if(fdipPrefetchMSHRs > p.mshrs,
-        "%s fdip_prefetch_mshrs (%u) exceeds mshrs (%u)",
-        name(), fdipPrefetchMSHRs, p.mshrs);
-    fatal_if(demandFetchMSHRs + fdipPrefetchMSHRs > p.mshrs,
-        "%s demand_fetch_mshrs + fdip_prefetch_mshrs (%u + %u) exceeds mshrs (%u)",
-        name(), demandFetchMSHRs, fdipPrefetchMSHRs, p.mshrs);
+    fatal_if(p.inst_prefetch_mshrs && p.fdip_prefetch_mshrs &&
+             p.inst_prefetch_mshrs != p.fdip_prefetch_mshrs,
+        "%s inst_prefetch_mshrs (%u) conflicts with legacy "
+        "fdip_prefetch_mshrs (%u)", name(), p.inst_prefetch_mshrs,
+        p.fdip_prefetch_mshrs);
+    fatal_if(instPrefetchMSHRs > p.mshrs,
+        "%s inst_prefetch_mshrs (%u) exceeds mshrs (%u)",
+        name(), instPrefetchMSHRs, p.mshrs);
+    fatal_if(demandFetchMSHRs + instPrefetchMSHRs > p.mshrs,
+        "%s demand_fetch_mshrs + inst_prefetch_mshrs (%u + %u) "
+        "exceeds mshrs (%u)", name(), demandFetchMSHRs,
+        instPrefetchMSHRs, p.mshrs);
 
     fatal_if(compressor && !dynamic_cast<CompressedTags*>(tags),
         "The tags of compressed cache %s must derive from CompressedTags",
@@ -388,6 +705,50 @@ BaseCache::getMshrOccupancyRatio() const
     return getMshrAvgEntryNum() / static_cast<double>(num_entries);
 }
 
+Counter
+BaseCache::getMshrEntryTicks() const
+{
+    return mshrQueue.getOccupancyEntryTicks(curTick());
+}
+
+Counter
+BaseCache::getMshrDemandEntryTicks() const
+{
+    return mshrQueue.getDemandOccupancyEntryTicks(curTick());
+}
+
+Counter
+BaseCache::getMshrInstPrefetchEntryTicks() const
+{
+    return mshrQueue.getInstPrefetchOccupancyEntryTicks(curTick());
+}
+
+Counter
+BaseCache::getMshrFullTicks() const
+{
+    return mshrQueue.getOccupancyFullTicks(curTick());
+}
+
+Counter
+BaseCache::getMshrFourteenEntryFullTicks() const
+{
+    return mshrQueue.getFourteenEntryFullTicks(curTick());
+}
+
+void
+BaseCache::deferMshrAllocation(PacketPtr pkt)
+{
+    pkt->setMshrArbFailed();
+    rollbackDeferredMiss(pkt);
+}
+
+void
+BaseCache::rollbackDeferredMiss(PacketPtr pkt)
+{
+    pkt->req->decAccessDepth();
+    stats.cmdStats(pkt).misses[pkt->req->requestorId()]--;
+}
+
 bool
 BaseCache::checkAndAllocateMSHRCycle(PacketPtr pkt)
 {
@@ -412,9 +773,7 @@ BaseCache::checkAndAllocateMSHRCycle(PacketPtr pkt)
 
     // Exceeded per-cycle limit: fail and account.
     stats.MSHRArbFails++;
-    pkt->setMshrArbFailed();
-    pkt->req->decAccessDepth();
-    stats.cmdStats(pkt).misses[pkt->req->requestorId()]--;
+    deferMshrAllocation(pkt);
     return false;
 }
 
@@ -561,12 +920,13 @@ BaseCache::handleTimingReqMiss(PacketPtr pkt, MSHR *mshr, CacheBlk *blk,
 
                 assert(pkt->req->requestorId() < system->maxRequestors());
                 stats.cmdStats(pkt).mshrHits[pkt->req->requestorId()]++;
-                if (isL1I() && pkt->isDemand() && mshr->hasFromFDIP() &&
+                if (isL1I() && pkt->isDemand() &&
+                    mshr->allocatedByInstPrefetch() &&
                     !mshr->hasFromDemand()) {
                     pkt->missOnLatePf = true;
                     pkt->pfSource = mshr->getPFSource();
                     pkt->pfDepth = mshr->getPFDepth();
-                    if (mshr->markFdipLateSeen()) {
+                    if (mshr->hasFromFDIP() && mshr->markFdipLateSeen()) {
                         stats.fdipLate++;
                         noteFdipLateLifecycle(pkt->getBlockAddr(blkSize),
                                               pkt->isSecure());
@@ -627,6 +987,14 @@ BaseCache::handleTimingReqMiss(PacketPtr pkt, MSHR *mshr, CacheBlk *blk,
             // writeback or writeclean, forwarded to WriteBuffer.
             allocateWriteBuffer(pkt, forward_time);
         } else {
+            if (!canAllocateL1IMSHR(pkt)) {
+                DPRINTF(Cache,
+                        "%s: defer demand miss because its L1I MSHR "
+                        "partition is full addr=%#llx\n",
+                        __func__, pkt->getAddr());
+                deferMshrAllocation(pkt);
+                return;
+            }
             if (blk && blk->isValid()) {
                 // If we have a write miss to a valid block, we
                 // need to mark the block non-readable.  Otherwise
@@ -866,6 +1234,7 @@ BaseCache::calReqInterval(PacketPtr pkt)
 void
 BaseCache::recvTimingReq(PacketPtr pkt)
 {
+    const Tick request_arrival_tick = curTick();
     calReqInterval(pkt);
 
     if (pkt->isStorePFTrain()) {
@@ -920,6 +1289,51 @@ BaseCache::recvTimingReq(PacketPtr pkt)
         // to the write buffer to ensure they logically precede anything
         // happening below
         doWritebacks(writebacks, clockEdge(lat + forwardLatency));
+    }
+
+    o3::CPU *btbp_demand_cpu = nullptr;
+    branch_prediction::btb_pred::BtbpTraceEvent btbp_demand_event;
+    bool btbp_demand_event_valid = false;
+    if (isL1I() && pkt->req && pkt->req->isInstFetch() &&
+        !pkt->req->isPrefetch()) {
+        ThreadID tid = 0;
+        btbp_demand_cpu = resolveBtbpTraceCpu(system, pkt->req, tid);
+        if (btbp_demand_cpu) {
+            auto &demand_event = btbp_demand_event;
+            demand_event.tick = request_arrival_tick;
+            demand_event.eventType = branch_prediction::btb_pred::
+                BtbpTraceEvent::L1IDemandAccess;
+            demand_event.threadId = tid;
+            demand_event.lineAddr = pkt->getBlockAddr(blkSize);
+            demand_event.lineAddrValid = true;
+            demand_event.hit = satisfied;
+            demand_event.hitValid = true;
+            demand_event.secure = pkt->isSecure();
+            demand_event.secureValid = true;
+            demand_event.requestKind = branch_prediction::btb_pred::
+                BtbpTraceEvent::DemandRequest;
+            demand_event.requestKindValid = true;
+            demand_event.lifecycleKind = static_cast<uint32_t>(
+                branch_prediction::btb_pred::BtbpTraceEvent::
+                    LifecycleKind::DemandUse);
+            demand_event.lifecycleKindValid = true;
+            if (satisfied && blk) {
+                const auto blk_meta = blk->getXsMetadata();
+                if (blk_meta.l1iResidencyId != 0) {
+                    demand_event.residencyId = blk_meta.l1iResidencyId;
+                    demand_event.residencyIdValid = true;
+                    panic_if(!markBtbpL1iDemandUse(
+                                 btbpLifecycleLedger,
+                                 {regenerateBlkAddr(blk), blk->isSecure()},
+                                 *blk),
+                             "BTBP demand use references inactive L1I "
+                             "residency %llu",
+                             blk_meta.l1iResidencyId);
+                }
+            }
+            populateBtbpRequestIdentity(demand_event, pkt->req, blkSize);
+            btbp_demand_event_valid = true;
+        }
     }
 
     if (!satisfied && forceHit && !pkt->req->isInstFetch() && pkt->isRead() && pkt->req->hasPC() &&
@@ -980,6 +1394,48 @@ BaseCache::recvTimingReq(PacketPtr pkt)
         }
     }
 
+    MSHR *btbp_existing_mshr = nullptr;
+    if (!satisfied && isL1I() && pkt->req && pkt->req->isInstFetch() &&
+        !pkt->req->isPrefetch()) {
+        btbp_existing_mshr = mshrQueue.findMatch(
+            pkt->getBlockAddr(blkSize), pkt->isSecure());
+    }
+    if (isL1I() && pkt->req && pkt->req->isInstFetch() &&
+        !pkt->req->isPrefetch() && pkt->req->hasXsMetadata()) {
+        using TerminalReason = branch_prediction::btb_pred::BtbpTraceEvent::
+            TerminalReason;
+        auto xs_meta = pkt->req->getXsMetadata();
+        if (satisfied) {
+            xs_meta.traceDemandOutcome = static_cast<uint32_t>(
+                TerminalReason::CacheHit);
+            if (blk) {
+                const auto blk_meta = blk->getXsMetadata();
+                xs_meta.l1iResidencyId = blk_meta.l1iResidencyId;
+                if (blk_meta.instPrefetchDecisionId != 0) {
+                    xs_meta.instPrefetchDecisionId =
+                        blk_meta.instPrefetchDecisionId;
+                    xs_meta.prefetchSource = blk_meta.prefetchSource;
+                }
+            }
+        } else if (btbp_existing_mshr) {
+            if (btbp_existing_mshr->allocatedByInstPrefetch()) {
+                xs_meta.traceDemandOutcome = static_cast<uint32_t>(
+                    TerminalReason::MergeWithPrefetch);
+                xs_meta.instPrefetchDecisionId =
+                    btbp_existing_mshr->getInstPrefetchDecisionId();
+                xs_meta.prefetchSource =
+                    btbp_existing_mshr->getInstPrefetchSource();
+            } else {
+                xs_meta.traceDemandOutcome = static_cast<uint32_t>(
+                    TerminalReason::MergeWithDemand);
+            }
+        } else {
+            xs_meta.traceDemandOutcome = static_cast<uint32_t>(
+                TerminalReason::Fill);
+        }
+        pkt->req->setXsMetadata(xs_meta);
+    }
+
     if (satisfied) {
         if (isL1I() && pkt->cmd.isSWPrefetch() && isFdipPkt(pkt)) {
             stats.fdipProbeHit++;
@@ -998,7 +1454,11 @@ BaseCache::recvTimingReq(PacketPtr pkt)
             DPRINTF(Cache, "Hit on prefetch for addr %#x (%s), source: %i\n", pkt->getAddr(),
                     pkt->isSecure() ? "s" : "ns", blk->getXsMetadata().prefetchSource);
             // pass the pf source from block to req, it may be used by either load inst or L(n-1) cache
-            pkt->req->setPFSource(blk->getXsMetadata().prefetchSource);
+            // v2.5 §4.2 repair class 1: do not overwrite a real req pfSource from a (possibly
+            // zero) block; block metadata is a fallback for unidentified requests only.
+            if (pfSourcePropagateFromBlock(pkt->req->getPFSource())) {
+                pkt->req->setPFSource(blk->getXsMetadata().prefetchSource);
+            }
             DPRINTF(Cache, "Mark req %p pf source: %i\n", pkt->req, pkt->req->getPFSource());
             pkt->req->setPFDepth(0);
             if (isL1I() && pkt->isDemand() && isFdipBlk(blk)) {
@@ -1074,7 +1534,72 @@ BaseCache::recvTimingReq(PacketPtr pkt)
 
         handleTimingReqMiss(pkt, blk, forward_time, request_time);
 
+        if (isL1I() && pkt->req && pkt->req->isInstFetch() &&
+            !pkt->req->isPrefetch() && pkt->req->hasXsMetadata() &&
+            (pkt->mshrArbFailed() || pkt->mshrAliasFailed())) {
+            auto xs_meta = pkt->req->getXsMetadata();
+            xs_meta.traceDemandOutcome = static_cast<uint32_t>(
+                branch_prediction::btb_pred::BtbpTraceEvent::
+                    TerminalReason::Blocked);
+            pkt->req->setXsMetadata(xs_meta);
+        }
+
+        if (btbp_demand_event_valid) {
+            const auto *owner_mshr = mshrQueue.findMatch(
+                pkt->getBlockAddr(blkSize), pkt->isSecure());
+            btbp_demand_event.prefetchOwnedMshr = owner_mshr &&
+                owner_mshr->allocatedByInstPrefetch();
+            btbp_demand_event.prefetchOwnedMshrValid = true;
+            if (owner_mshr && owner_mshr->allocatedByInstPrefetch()) {
+                const uint64_t decision_id =
+                    owner_mshr->getInstPrefetchDecisionId();
+                const auto source = owner_mshr->getInstPrefetchSource();
+                panic_if(decision_id == 0 || !isInstPrefetchSource(source),
+                         "prefetch-owned L1I MSHR lacks decision identity");
+                btbp_demand_event.prefetchDecisionId = decision_id;
+                btbp_demand_event.prefetchDecisionIdValid = true;
+                btbp_demand_event.prefetchSource =
+                    static_cast<uint32_t>(source);
+                btbp_demand_event.prefetchSourceValid = true;
+            }
+        }
+
         ppMiss->notify(pkt);
+    }
+
+    const bool btbp_demand_accepted = btbp_demand_event_valid &&
+        !pkt->mshrArbFailed() && !pkt->mshrAliasFailed() &&
+        !pkt->isHitInWriteBuffer();
+    if (btbp_demand_accepted) {
+        btbp_demand_event.ownerPrefetchDecisionIds.clear();
+        populateBtbpRequestIdentity(
+            btbp_demand_event, pkt->req, blkSize);
+        btbp_demand_cpu->notifyBtbpTrace(btbp_demand_event);
+
+        if (pkt->req->hasXsMetadata()) {
+            auto xs_meta = pkt->req->getXsMetadata();
+            if (xs_meta.eipDemandId != 0 && !xs_meta.eipDemandObserved) {
+                if (pkt->req->hasContextId() && pkt->req->hasVaddr() &&
+                    pkt->req->hasPaddr()) {
+                    const ContextID context_id = pkt->req->contextId();
+                    if (auto *cpu = resolveO3Cpu(system, context_id);
+                        cpu && cpu->eipEnabled()) {
+                        // access() copies the first-use prefetch source onto
+                        // the demand request before clearing it on the block.
+                        const bool prefetch_hit = satisfied &&
+                            pkt->req->getPFSource() == PF_EIP;
+                        const bool wrong_path = xs_meta.instXsMetadata &&
+                            xs_meta.instXsMetadata->squashed;
+                        cpu->notifyEipDemand(
+                            context_id, pkt->req->getVaddr(),
+                            pkt->req->getPaddr(), xs_meta.eipDemandId,
+                            satisfied, prefetch_hit, wrong_path, xs_meta);
+                    }
+                }
+                xs_meta.eipDemandObserved = true;
+                pkt->req->setXsMetadata(xs_meta);
+            }
+        }
     }
 
 
@@ -1247,6 +1772,7 @@ BaseCache::recvTimingResp(PacketPtr pkt)
             // have been using the reserved entries already
             const bool was_full = mshrQueue.isFull();
             mshrQueue.deallocate(mshr);
+            emitL1IMshrOccupancy(pkt);
             if (was_full && !mshrQueue.isFull()) {
                 clearBlocked(Blocked_NoMSHRs);
             }
@@ -2465,11 +2991,105 @@ BaseCache::handleFill(PacketPtr pkt, CacheBlk *blk, PacketList &writebacks,
                         pkt->payloadDelay);
     }
 
-    Request::XsMetadata blk_meta = blk->getXsMetadata();
+    Request::XsMetadata blk_meta = pkt->req->hasXsMetadata() ?
+        pkt->req->getXsMetadata() : Request::XsMetadata();
     blk_meta.prefetchSource = pkt->req->getPFSource();
-    blk->setXsMetadata(blk_meta);
+    blk_meta.btbpRoiOrigin = pkt->req->hasXsMetadata() &&
+        pkt->req->getXsMetadata().btbpRoiOrigin;
+    blk_meta.l1iResidencyId = 0;
+    if (isL1I() && pkt->req && pkt->req->isInstFetch() &&
+        pkt->req->hasContextId()) {
+        blk_meta.eipContextId = pkt->req->contextId();
+        if (blk != tempBlock) {
+            blk_meta.l1iResidencyId = nextL1iResidencyId++;
+        }
+    }
+    if (isL1I() && blk != tempBlock) {
+        const BtbpL1iLifecycleLedger::LineKey key{addr, is_secure};
+        transitionBtbpL1iFillMetadata(
+            btbpLifecycleLedger, key, *blk, blk_meta, has_old_data,
+            isInstPrefetchSource(blk_meta.prefetchSource),
+            [&](const Request::XsMetadata &old_metadata) {
+                emitL1ILineEvict(
+                    blk,
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        LifecycleKind::SameLineRefill,
+                    pkt);
+                btbpRoiResidencies.erase(
+                    old_metadata.l1iResidencyId);
+            });
+    } else {
+        blk->setXsMetadata(blk_meta);
+    }
+    if (isL1I() && pkt->req && pkt->req->isInstFetch() &&
+        pkt->req->hasXsMetadata() && blk_meta.l1iResidencyId != 0) {
+        auto request_meta = pkt->req->getXsMetadata();
+        request_meta.l1iResidencyId = blk_meta.l1iResidencyId;
+        pkt->req->setXsMetadata(request_meta);
+    }
     if (isL1I() && isFdipSource(pkt->req->getPFSource())) {
         stats.fdipInstalled++;
+    }
+    if (isL1I() && blk != tempBlock && pkt->req &&
+        pkt->req->isInstFetch() && pkt->req->hasContextId() &&
+        pkt->req->hasVaddr() && pkt->req->hasPaddr()) {
+        const ContextID context_id = pkt->req->contextId();
+        if (auto *cpu = resolveO3Cpu(system, context_id);
+            cpu && cpu->eipEnabled()) {
+            cpu->notifyEipFill(context_id, pkt->req->getVaddr(),
+                               pkt->req->getPaddr());
+        }
+    }
+    if (isL1I() && pkt->req && pkt->req->isInstFetch()) {
+        ThreadID tid = 0;
+        if (auto *cpu = resolveBtbpTraceCpu(system, pkt->req, tid)) {
+            branch_prediction::btb_pred::BtbpTraceEvent lifecycle_event;
+            lifecycle_event.tick = curTick();
+            lifecycle_event.eventType = branch_prediction::btb_pred::
+                BtbpTraceEvent::LineLifecycle;
+            lifecycle_event.threadId = tid;
+            lifecycle_event.lineAddr = addr;
+            lifecycle_event.lineAddrValid = true;
+            lifecycle_event.secure = is_secure;
+            lifecycle_event.secureValid = true;
+            lifecycle_event.fillBytesTick = curTick();
+            lifecycle_event.fillBytesTickValid = true;
+            lifecycle_event.l1iReadyTick = blk->getWhenReady();
+            lifecycle_event.l1iReadyTickValid = true;
+            lifecycle_event.scanCompleteTick = curTick();
+            lifecycle_event.scanCompleteTickValid = true;
+            lifecycle_event.requestKind =
+                isInstPrefetchSource(pkt->req->getPFSource()) ?
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        PrefetchRequest :
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        DemandRequest;
+            lifecycle_event.requestKindValid = true;
+            lifecycle_event.lifecycleKind = static_cast<uint32_t>(
+                isInstPrefetchSource(pkt->req->getPFSource()) ?
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        LifecycleKind::PrefetchFill :
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        LifecycleKind::DemandFill);
+            lifecycle_event.lifecycleKindValid = true;
+            lifecycle_event.supplySource =
+                isInstPrefetchSource(pkt->req->getPFSource()) ?
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        PrefetchFillSupply :
+                    branch_prediction::btb_pred::BtbpTraceEvent::
+                        DemandFillSupply;
+            lifecycle_event.supplySourceValid = true;
+            if (blk_meta.l1iResidencyId != 0) {
+                lifecycle_event.residencyId = blk_meta.l1iResidencyId;
+                lifecycle_event.residencyIdValid = true;
+            }
+            populateBtbpRequestIdentity(lifecycle_event, pkt->req, blkSize);
+            cpu->notifyBtbpTrace(lifecycle_event);
+            if (lifecycle_event.residencyIdValid) {
+                btbpRoiResidencies[lifecycle_event.residencyId] = {
+                    pkt->req->contextId(), lifecycle_event};
+            }
+        }
     }
     DPRINTF(Cache, "%s: Mark blk as prefetched by source %i, form req %p\n", __func__,
             pkt->req->getPFSource(), pkt->req);
@@ -2517,7 +3137,12 @@ BaseCache::allocateBlock(const PacketPtr pkt, PacketList &writebacks)
     DPRINTF(CacheRepl, "Replacement victim: %s\n", victim->print());
 
     // Try to evict blocks; if it fails, give up on allocation
-    if (!handleEvictions(evict_blks, writebacks)) {
+    panic_if(btbpReplacementPacket,
+             "nested cache replacement measurement context");
+    btbpReplacementPacket = pkt;
+    const bool evictions_handled = handleEvictions(evict_blks, writebacks);
+    btbpReplacementPacket = nullptr;
+    if (!evictions_handled) {
         return nullptr;
     }
 
@@ -2538,6 +3163,31 @@ void
 BaseCache::invalidateBlock(CacheBlk *blk)
 {
     static uint64_t _inval_cnt{0};
+    const uint64_t residency_id = blk && blk->isValid() ?
+        blk->getXsMetadata().l1iResidencyId : 0;
+    if (isL1I() && blk && blk->isValid() && blk != tempBlock &&
+        residency_id != 0) {
+        panic_if(!closeBtbpL1iBlockResidency(
+                     btbpLifecycleLedger,
+                     {regenerateBlkAddr(blk), blk->isSecure()}, *blk),
+                 "BTBP eviction references inactive L1I residency %llu",
+                 residency_id);
+    }
+    emitL1ILineEvict(blk,
+        branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind::Evict,
+        btbpReplacementPacket);
+    if (residency_id != 0) {
+        btbpRoiResidencies.erase(residency_id);
+    }
+    if (isL1I() && blk && blk->isValid() && blk != tempBlock) {
+        const auto xs_meta = blk->getXsMetadata();
+        if (xs_meta.eipContextId != InvalidContextID) {
+            if (auto *cpu = resolveO3Cpu(system, xs_meta.eipContextId)) {
+                cpu->notifyEipEvict(xs_meta.eipContextId,
+                                    regenerateBlkAddr(blk));
+            }
+        }
+    }
     // notify prefetcher to send some info to lower level per 128 cache invalidations
     if ((_inval_cnt++ % 128) == 127) {
         if (prefetcher) {
@@ -3178,6 +3828,16 @@ BaseCache::CacheStats::CacheStats(BaseCache &c)
              "average number of allocated MSHR entries"),
     ADD_STAT(mshrOccupancyRatio, statistics::units::Ratio::get(),
              "average allocated MSHR entry ratio"),
+    ADD_STAT(mshrEntryTicks, statistics::units::Tick::get(),
+             "allocated MSHR entry*tick integral"),
+    ADD_STAT(mshrDemandEntryTicks, statistics::units::Tick::get(),
+             "demand-owned MSHR entry*tick integral"),
+    ADD_STAT(mshrInstPrefetchEntryTicks, statistics::units::Tick::get(),
+             "instruction-prefetch-owned MSHR entry*tick integral"),
+    ADD_STAT(mshrFullTicks, statistics::units::Tick::get(),
+             "ticks at full MSHR occupancy"),
+    ADD_STAT(mshrFourteenEntryFullTicks, statistics::units::Tick::get(),
+             "ticks at Stage-A total MSHR occupancy fourteen"),
     ADD_STAT(noMshrBlockedCycles, statistics::units::Cycle::get(),
              "number of cycles blocked by no MSHR entries"),
     ADD_STAT(bytesRecvPerCycle, statistics::units::Ratio::get(),
@@ -3559,6 +4219,26 @@ BaseCache::CacheStats::regStats()
         .flags(nonan)
         .functor([this]() { return cache.getMshrOccupancyRatio(); });
 
+    mshrEntryTicks
+        .flags(nonan)
+        .functor([this]() { return cache.getMshrEntryTicks(); });
+
+    mshrDemandEntryTicks
+        .flags(nonan)
+        .functor([this]() { return cache.getMshrDemandEntryTicks(); });
+
+    mshrInstPrefetchEntryTicks
+        .flags(nonan)
+        .functor([this]() { return cache.getMshrInstPrefetchEntryTicks(); });
+
+    mshrFullTicks
+        .flags(nonan)
+        .functor([this]() { return cache.getMshrFullTicks(); });
+
+    mshrFourteenEntryFullTicks
+        .flags(nonan)
+        .functor([this]() { return cache.getMshrFourteenEntryFullTicks(); });
+
     bytesRecvPerCycle.flags(total | nozero | nonan);
     bytesRecvPerCycle = bytesRecv / simTicks * cache.clockPeriod();
 
@@ -3645,6 +4325,15 @@ BaseCache::CpuSidePort::recvTimingReq(PacketPtr pkt)
         pkt->clearMshrAliasFailed();
         pkt->clearHitInWriteBuffer();
         cache->recvTimingReq(pkt);
+        const bool inst_prefetch_terminal_response =
+            pkt->isResponse() && pkt->mshrArbFailed() &&
+            cache->isL1I() && cache->isInstPrefetchPkt(pkt);
+        if (inst_prefetch_terminal_response) {
+            // The cache consumed this request and queued its terminal
+            // response. Returning false would make the requestor free and
+            // retry a packet that is already owned by the response queue.
+            return true;
+        }
         if (pkt->mshrArbFailed() || pkt->mshrAliasFailed() ||
             pkt->isHitInWriteBuffer()) {
             // If the MSHR arbitration failed, we need to retry later.

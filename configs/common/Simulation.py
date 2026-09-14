@@ -274,6 +274,22 @@ def benchCheckpoints(testsys, options, maxtick, cptdir):
         exit_event = m5.simulate(maxtick - m5.curTick())
         exit_cause = exit_event.getCause()
 
+    if exit_cause == "BTBP ROI end":
+        roi_end_tick = m5.curTick()
+        print("BTBP ROI_END @ tick %d" % roi_end_tick)
+        if options.btbp_roi_drain_ticks <= 0:
+            fatal("--btbp-roi-drain-ticks must be positive")
+        print("BTBP ROI_DRAIN_BEGIN max_ticks=%d" %
+              options.btbp_roi_drain_ticks)
+        drain_event = m5.simulate(options.btbp_roi_drain_ticks)
+        drain_cause = drain_event.getCause()
+        if drain_cause == "BTBP ROI drain complete":
+            print("BTBP ROI_DRAIN_COMPLETE @ tick %d" % m5.curTick())
+        else:
+            print("BTBP ROI_DRAIN_FAILED @ tick %d cause=%s" %
+                  (m5.curTick(), drain_cause))
+        return drain_event
+
     num_checkpoints = 0
     if hasattr(options, 'max_checkpoints'):
         max_checkpoints = options.max_checkpoints
@@ -516,6 +532,10 @@ def run(options, root, testsys, cpu_class):
         for i in range(np):
             if options.warmup_insts_no_switch != None:
                 testsys.cpu[i].warmupInstCount = options.warmup_insts_no_switch
+            if options.roi_insts is not None:
+                if options.roi_insts <= 0:
+                    fatal("--roi-insts must be positive")
+                testsys.cpu[i].roiInstCount = options.roi_insts
 
     if options.repeat_switch:
         switch_class = getCPUClass(options.cpu_type)[0]
@@ -818,6 +838,10 @@ def run_vanilla(options, root, testsys, cpu_class):
     for i in range(np):
         if options.warmup_insts_no_switch != None:
             testsys.cpu[i].warmupInstCount = options.warmup_insts_no_switch
+        if options.roi_insts is not None:
+            if options.roi_insts <= 0:
+                fatal("--roi-insts must be positive")
+            testsys.cpu[i].roiInstCount = options.roi_insts
 
     checkpoint_dir = None
     root.apply_config(options.param)

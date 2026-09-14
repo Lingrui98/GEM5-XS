@@ -162,6 +162,7 @@ BaseCPU::BaseCPU(const Params &p, bool is_checker)
       powerGatingOnIdle(p.power_gating_on_idle),
       enterPwrGatingEvent([this] { enterPwrGating(); }, name()),
       warmupInstCount(p.warmupInstCount),
+      roiInstCount(p.roiInstCount),
       enableDifftest(p.enable_difftest),
       dumpCommitFlag(p.dump_commit),
       dumpStartNum(p.dump_start),

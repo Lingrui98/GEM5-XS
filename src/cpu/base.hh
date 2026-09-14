@@ -692,6 +692,7 @@ class BaseCPU : public ClockedObject
     EventFunctionWrapper enterPwrGatingEvent;
 
     const uint64_t warmupInstCount;
+    const uint64_t roiInstCount;
 
     //const uint64_t repeatDumpInstCount;
 

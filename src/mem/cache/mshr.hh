@@ -74,6 +74,22 @@ class BaseCache;
 class MSHR : public QueueEntry, public Printable
 {
 
+  public:
+
+    enum class AllocationOwner
+    {
+        Unallocated,
+        Demand,
+        InstPrefetch
+    };
+
+    static constexpr AllocationOwner
+    allocationOwnerAfterMerge(AllocationOwner current,
+                              AllocationOwner)
+    {
+        return current;
+    }
+
     /**
      * Consider the queues friends to avoid making everything public.
      */
@@ -117,6 +133,13 @@ class MSHR : public QueueEntry, public Printable
 
     /** Did we snoop a read while waiting for data? */
     bool postDowngrade;
+
+    /** Request class that allocated this entry. Merges do not change it. */
+    AllocationOwner allocationOwner;
+
+    /** Identity of the instruction prefetch that allocated this entry. */
+    uint64_t allocationInstPrefetchDecisionId;
+    PrefetchSourceType allocationInstPrefetchSource;
 
   public:
 
@@ -385,9 +408,29 @@ class MSHR : public QueueEntry, public Printable
         return targets.hasFromFDIP;
     }
 
+    AllocationOwner getAllocationOwner() const
+    {
+        assert(allocationOwner != AllocationOwner::Unallocated);
+        return allocationOwner;
+    }
+
+    bool allocatedByInstPrefetch() const
+    {
+        return getAllocationOwner() == AllocationOwner::InstPrefetch;
+    }
+
+    bool allocatedByDemand() const
+    {
+        return getAllocationOwner() == AllocationOwner::Demand;
+    }
+
     PrefetchSourceType getPFSource() const {
         return targets.pfSource;
     }
+
+    uint64_t getInstPrefetchDecisionId() const;
+
+    PrefetchSourceType getInstPrefetchSource() const;
 
 
     int getPFDepth() const {

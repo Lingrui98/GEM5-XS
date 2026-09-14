@@ -20,6 +20,27 @@ from common import Simulation
 from common.Caches import *
 from common.xiangshan import *
 
+def extract_btbp_trace_out(argv):
+    trace_out = None
+    filtered = [argv[0]]
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--btbp-trace-out":
+            if i + 1 >= len(argv):
+                fatal("--btbp-trace-out requires a path")
+            trace_out = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--btbp-trace-out="):
+            trace_out = arg.split("=", 1)[1]
+            i += 1
+            continue
+        filtered.append(arg)
+        i += 1
+    return trace_out, filtered
+
+
 def setKmhV3Params(args, system):
     for cpu in system.cpu:
 
@@ -123,10 +144,13 @@ def setKmhV3Params(args, system):
         # l1 cache per core
         if args.caches:
             cpu.icache.size = '64kB'
-            if args.enable_fdip:
+            inst_prefetch_enabled = (
+                args.enable_fdip or args.eip_algorithm != 'disabled'
+            )
+            if inst_prefetch_enabled:
                 cpu.icache.mshrs = 14
                 cpu.icache.demand_fetch_mshrs = 4
-                cpu.icache.fdip_prefetch_mshrs = 10
+                cpu.icache.inst_prefetch_mshrs = 10
                 cpu.fdipIcacheAccessor = cpu.icache
             cpu.dcache.size = '64kB'
             cpu.dcache.tag_load_read_ports = 3
@@ -182,7 +206,9 @@ def setKmhV3Params(args, system):
 if __name__ == '__m5_main__':
     FutureClass = None
 
+    btbp_trace_out, sys.argv = extract_btbp_trace_out(sys.argv)
     args = xiangshan_system_init()
+    args.btbp_trace_out = btbp_trace_out
 
     assert not args.external_memory_system
 
@@ -200,6 +226,12 @@ if __name__ == '__m5_main__':
         configure_xiangshan_linux_workload(test_sys, args)
     # Set ideal parameters here with the highest priority, over command-line arguments
     setKmhV3Params(args, test_sys)
+    if args.btbp_trace_out:
+        if len(test_sys.cpu) != 1:
+            fatal("--btbp-trace-out currently supports one CPU per trace file")
+        test_sys.cpu[0].btbpTracer = BtbpTracer(
+            manager=test_sys.cpu[0],
+            output_file=args.btbp_trace_out)
 
     root = Root(full_system=True, system=test_sys)
 

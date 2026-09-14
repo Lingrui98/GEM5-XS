@@ -52,6 +52,8 @@ SimObject('BranchPredictor.py', sim_objects=[
     'TimedBaseBTBPredictor', 'BTBRAS', 'BTBTAGE', 'BTBTAGEUpperBound',
     'MicroTAGE',
     'BTBITTAGE', 'BTBMGSC'], enums=["BpType", "SMTFTQMode", "SMTFTQPolicy"])
+SimObject('btb/probe/BtbpTracer.py', sim_objects=['BtbpTracer'],
+          tags='protobuf')
 
 DebugFlag('Indirect')
 Source('bpred_unit.cc')
@@ -110,6 +112,7 @@ Source('btb/folded_hist.cc')
 Source('btb/ras.cc')
 Source('btb/btb_ubtb.cc')
 Source('btb/ftq.cc')
+Source('btb/probe/btbp_tracer.cc', tags='protobuf')
 # Source('btb/uras.cc')
 Source('general_arch_db.cc')
 DebugFlag('FreeList')

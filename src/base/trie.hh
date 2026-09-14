@@ -307,6 +307,32 @@ class Trie
     }
 
     /**
+     * Look up the Value stored at an exact prefix width.
+     *
+     * Unlike lookup(), this skips values on less-specific matching prefixes.
+     * @param key The key to look up.
+     * @param width How many bits of the key (from msb) must match.
+     * @return The Value at the exact key/width pair, or NULL if none exists.
+     */
+    Value *
+    lookupExact(Key key, unsigned width)
+    {
+        Key exact_mask = ~(Key)0;
+        if (width < MaxBits)
+            exact_mask <<= (MaxBits - width);
+        key &= exact_mask;
+
+        Node *node = &head;
+        while (goesAfter(&node, node->kids[0], key, exact_mask) ||
+               goesAfter(&node, node->kids[1], key, exact_mask))
+        {}
+
+        if (node->mask == exact_mask && node->key == key)
+            return node->value;
+        return NULL;
+    }
+
+    /**
      * Method to delete a value from the trie.
      * @param node A Handle to remove.
      * @return The Value pointer from the removed entry.

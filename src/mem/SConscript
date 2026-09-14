@@ -104,6 +104,8 @@ Source('mem_delay.cc')
 Source('port_terminator.cc')
 
 GTest('translation_gen.test', 'translation_gen.test.cc')
+GTest('request_copy_ctor.test', 'request_copy_ctor.test.cc',
+      '../base/debug.cc', '../sim/cur_tick.cc')
 
 if env['CONF']['TARGET_ISA'] != 'null':
     Source('translating_port_proxy.cc')
