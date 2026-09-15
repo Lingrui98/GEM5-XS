@@ -1102,6 +1102,14 @@ Commit::commit()
             DPRINTF(Commit, "[tid:%i] Redirecting to PC %#x\n",
                     tid, *fromIEW->pc[tid]);
 
+            // D4-B lifecycle observation (S7 nested squash,
+            // statistics-only): this new squash request was accepted
+            // while a previous ROB squash walk was still in progress
+            // (the done-squashing transition above did not clear the
+            // status this tick).  Never a pipeline decision input.
+            if (commitStatus[tid] == ROBSquashing)
+                cpu->ledgerNoteNestedSquash();
+
             commitStatus[tid] = ROBSquashing;
 
             // If we want to include the squashing instruction in the squash,

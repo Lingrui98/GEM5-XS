@@ -918,6 +918,12 @@ CPU::tick()
 
     //Tick each of the stages
 
+    // D4-B lifecycle observation (statistics-only): open the per-tick
+    // window for the S22b boundary sample before any stage runs, so the
+    // commit-phase settles and IEW-phase registrations of THIS tick are
+    // attributable to the snapshot tick.  No-op for a disabled ledger.
+    ledgerObserveTick();
+
     commit.tick();
     iew.tick();
     rename.tick();
@@ -1794,7 +1800,7 @@ CPU::ledgerSettleRetired(const DynInstPtr &inst)
 {
     if (!ledgerAccounting())
         return;
-    topdownLedger->settleRetired(inst->ledgerTag, inst.get());
+    topdownLedger->settleRetired(inst->ledgerTag, inst.get(), curTick());
 }
 
 void
@@ -1802,7 +1808,24 @@ CPU::ledgerSettleSquashed(const DynInstPtr &inst, SettleOrigin origin)
 {
     if (!ledgerAccounting())
         return;
-    topdownLedger->settleSquashed(inst->ledgerTag, inst.get(), origin);
+    topdownLedger->settleSquashed(inst->ledgerTag, inst.get(), origin,
+                                  curTick());
+}
+
+void
+CPU::ledgerObserveTick()
+{
+    if (!ledgerAccounting())
+        return;
+    topdownLedger->observeTick(curTick());
+}
+
+void
+CPU::ledgerNoteNestedSquash()
+{
+    if (!ledgerAccounting())
+        return;
+    topdownLedger->noteNestedSquash();
 }
 
 void

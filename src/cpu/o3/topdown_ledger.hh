@@ -116,8 +116,12 @@ enum class SettleOrigin : uint8_t
     ExecSkip,       // IEW::executeInsts squashed skip
     DispQue,        // IEW::squash dispQue marking (dead path when
                     // enableDispatchStage=false, hooked anyway)
-    BufferSquash    // IEW::moveInstsToBuffer squash marking (pre-C4 belt)
+    BufferSquash,   // IEW::moveInstsToBuffer squash marking (pre-C4 belt)
+    NumSettleOrigins  // sentinel count (9); NOT an origin
 };
+
+/** Subname for one SettleOrigin (lifecycle-observation stats vectors). */
+const char *settleOriginName(SettleOrigin origin);
 
 /**
  * Stats-only tag embedded in DynInst.  Never read by any timing or
@@ -375,6 +379,25 @@ class TopdownLedger : public statistics::Group
     LedgerRunState runState() const;
 
     // ------------------------------------------------------------------
+    // Lifecycle observation (statistics-only; contract sections 1.4/1.2b).
+    // These hooks never feed any pipeline decision and never mutate the
+    // ledger's accounting state; they exist so the production coverage
+    // evidence can distinguish "counter reads zero" from "path never
+    // fired" (S7/S16/S17/S18/epoch-row4/S22b).  All observation counters
+    // freeze with the snapshot exactly like the live group.
+    // ------------------------------------------------------------------
+
+    /** Start-of-CPU-tick observation reset (called from CPU::tick before
+     *  the commit phase; maintains the per-tick scratch that the S22b
+     *  boundary sample reads at the Option-B end-of-tick snapshot). */
+    void observeTick(uint64_t whenTick);
+
+    /** S7 nested-squash observation: a new squash request was accepted by
+     *  commit while a previous ROB squash walk was still in progress
+     *  (commitStatus == ROBSquashing at the arbitration point). */
+    void noteNestedSquash();
+
+    // ------------------------------------------------------------------
     // Core hooks (DynInst-free; the CPU wrappers pass the tag + identity).
     // ------------------------------------------------------------------
 
@@ -394,8 +417,11 @@ class TopdownLedger : public statistics::Group
      * Observation point 1: successful retirement (ROB::retireHead).
      * Settlement is idempotent: only a Live instruction settles, exactly
      * once (INV-2).  Routing by epoch stamp (contract section 1.2b(d)).
+     * whenTick (default 0 = not tracked) only feeds the statistics-only
+     * S22b per-tick boundary scratch; it never influences routing.
      */
-    void settleRetired(LedgerTag &tag, const void *instId);
+    void settleRetired(LedgerTag &tag, const void *instId,
+                       uint64_t whenTick = 0);
 
     /**
      * Observation points 2-8 (squash terminations).  Same idempotence and
@@ -403,7 +429,7 @@ class TopdownLedger : public statistics::Group
      * squashedAtCommit L2 split.
      */
     void settleSquashed(LedgerTag &tag, const void *instId,
-                        SettleOrigin origin);
+                        SettleOrigin origin, uint64_t whenTick = 0);
 
     /**
      * Per-cycle identity-I aggregation and INV-0/INV-4 guard execution
@@ -485,7 +511,7 @@ class TopdownLedger : public statistics::Group
   private:
     /** Common settlement routing; returns true if a Live member settled. */
     bool settle(LedgerTag &tag, const void *instId, bool retired,
-                SettleOrigin origin);
+                SettleOrigin origin, uint64_t whenTick);
 
     /** Recompute the guarded ratios + sumCheck from the current counters.
      *  Called at every accountCycle, at snapshot, at resetStats and on
@@ -522,6 +548,13 @@ class TopdownLedger : public statistics::Group
     std::map<const void *, std::pair<uint32_t, uint64_t>> liveMap_;
     /** Registrations since the last accountCycle (cross-check). */
     unsigned registrationsSinceAccount_ = 0;
+
+    // -- lifecycle observation scratch ------------------------------------
+    /** Tick stamp of the current observation window (observeTick resets). */
+    uint64_t observedTick_ = 0;
+    bool haveObservedTick_ = false;
+    unsigned tickRegistrations_ = 0;
+    unsigned tickSettlesPre_ = 0;
 
     // -- lossless audit table --------------------------------------------
     std::map<DispatchCycleInputs, PatternRecord> patternTable_;
@@ -584,6 +617,62 @@ class TopdownLedger : public statistics::Group
     statistics::Scalar replayCompleteStat;
     statistics::Scalar replayDistinctTuples;
     statistics::Scalar replayTableOverflowTuples;
+
+    // ---- lifecycle observation (S7/S16/S17/S18/epoch row4/S22b) ------
+    // Raw hook-entry counts vs effective (state-transitioning) settles,
+    // with per-origin and per-prior-state splits.  All of these freeze
+    // with the snapshot (live-group discipline): after the snapshot only
+    // the registered may-grow diagnostics keep growing.  Independently
+    // verifiable identities (hold at every dump while collecting, and at
+    // the ROI-end dump where the snapshot lands):
+    //   settleRetiredEffective == retiredCohort + settledOutOfEpochRetired
+    //   settleSquashedEffective == squashedCohort
+    //                               + settledOutOfEpochSquashed
+    //   settle*Absorbed == settle*HookCalls - settle*Effective
+    //   settleOriginEffective total == squashedCohort
+    //   settleOriginOutOfEpoch total == settledOutOfEpochSquashed
+    //   settleOriginAbsorbed total == settleSquashedAbsorbed
+    //   settleAbsorbed{Unallocated,Retired,Squashed} total
+    //       == settleRetiredAbsorbed + settleSquashedAbsorbed
+    // (settledAfterClose* start growing only after the snapshot, when
+    //  these observation counters are already frozen, so they are not
+    //  part of the identities; seg3 may show the may-grow counters above
+    //  the frozen observation totals -- expected, not a violation.)
+    statistics::Scalar registerHookCalls;
+    statistics::Scalar settleRetiredHookCalls;
+    statistics::Scalar settleSquashedHookCalls;
+    statistics::Scalar settleRetiredEffective;
+    statistics::Scalar settleSquashedEffective;
+    statistics::Scalar settleRetiredAbsorbed;
+    statistics::Scalar settleSquashedAbsorbed;
+    /** Absorbed settles split by the tag state the hook observed:
+     *  Unallocated = pre-C4 population (drift-protection no-ops, e.g.
+     *  the pre-cut belt hooks), Retired/Squashed = duplicate
+     *  notifications after a first effective settle (S16 evidence). */
+    statistics::Scalar settleAbsorbedUnallocated;
+    statistics::Scalar settleAbsorbedRetired;
+    statistics::Scalar settleAbsorbedSquashed;
+    /** Effective squashed settles per observation point (S18 class x
+     *  origin matrix; in-segment current-epoch routing only). */
+    statistics::Vector settleOriginEffective;
+    /** Effective squashed settles routed out-of-epoch / after-close. */
+    statistics::Vector settleOriginOutOfEpoch;
+    /** No-op (absorbed) settleSquashed hook calls per observation point. */
+    statistics::Vector settleOriginAbsorbed;
+    /** S7: squashes accepted while a previous squash walk was running. */
+    statistics::Scalar nestedSquashObservations;
+
+    // ---- S22b ROI-end boundary disambiguation sample -------------------
+    // Written once at the Option-B end-of-tick snapshot; proves which
+    // same-tick phase events landed inside the frozen segment.  The
+    // snapshot block runs after every stage of the ROI-end tick, so
+    // snapshotTickSettlesPost is structurally 0 (no stage runs after the
+    // snapshot within the same tick) and post-snapshot settles appear in
+    // later ticks as settledAfterClose* instead.
+    statistics::Scalar snapshotBoundaryTick;
+    statistics::Scalar snapshotTickRegistrations;
+    statistics::Scalar snapshotTickSettlesPre;
+    statistics::Scalar snapshotTickSettlesPost;
 
     // ---- derived L1 ratios (contract section 1.3; explicit validity
     // guard: unsupported / zero-budget -> quiet NaN, never 0 or inf) ----

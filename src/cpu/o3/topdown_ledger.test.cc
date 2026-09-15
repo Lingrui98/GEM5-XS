@@ -1734,3 +1734,165 @@ TEST(AuditExport, OverflowMarksIncompleteInHeader)
     EXPECT_TRUE(contains(text, "\"dropped_patterns\": 1"));
     std::remove(path.c_str());
 }
+
+// ===========================================================================
+// Lifecycle observation counters (production coverage: S7/S16/S17/S18/
+// epoch row4/S22b).  Statistics-only hooks whose purpose is to make
+// "counter is zero" distinguishable from "path never fired": raw hook
+// entry counts, absorbed duplicates by prior tag state, per-origin
+// effective/absorbed splits, the nested-squash marker, and the S22b
+// ROI-end boundary sample.  All of them obey the frozen live-group
+// discipline: after the snapshot only the registered may-grow
+// diagnostics keep growing.
+// ===========================================================================
+
+TEST(LifecycleObservation, IdempotenceAbsorptionAccounting)
+{
+    TopdownLedger ledger(nullptr, baseConfig(), true);
+
+    // Two registrations, one retirement, one squash, then the S16-style
+    // duplicate notifications and a pre-C4 belt no-op.
+    LedgerTag a, b, prec;
+    ledger.registerAlloc(a, true, &a, 100);
+    ledger.registerAlloc(b, true, &b, 100);
+    ledger.settleRetired(a, &a, 100);              // effective retire
+    ledger.settleRetired(a, &a, 100);              // duplicate: absorbed
+    ledger.settleSquashed(b, &b, SettleOrigin::IQ, 100);       // effective
+    ledger.settleSquashed(b, &b, SettleOrigin::RobWalk, 100);  // duplicate
+    ledger.settleSquashed(prec, &prec, SettleOrigin::PreCutBelt, 100);
+
+    EXPECT_EQ(ledger.registerHookCalls.value(), 2.0);
+    EXPECT_EQ(ledger.settleRetiredHookCalls.value(), 2.0);
+    EXPECT_EQ(ledger.settleRetiredEffective.value(), 1.0);
+    EXPECT_EQ(ledger.settleRetiredAbsorbed.value(), 1.0);
+    EXPECT_EQ(ledger.settleSquashedHookCalls.value(), 3.0);
+    EXPECT_EQ(ledger.settleSquashedEffective.value(), 1.0);
+    EXPECT_EQ(ledger.settleSquashedAbsorbed.value(), 2.0);
+    EXPECT_EQ(ledger.settleAbsorbedUnallocated.value(), 1.0);
+    EXPECT_EQ(ledger.settleAbsorbedRetired.value(), 1.0);
+    EXPECT_EQ(ledger.settleAbsorbedSquashed.value(), 1.0);
+
+    // Per-origin splits.
+    EXPECT_EQ(ledger.settleOriginEffective[static_cast<unsigned>(
+                  SettleOrigin::IQ)].value(), 1.0);
+    EXPECT_EQ(ledger.settleOriginEffective[static_cast<unsigned>(
+                  SettleOrigin::RobWalk)].value(), 0.0);
+    EXPECT_EQ(ledger.settleOriginAbsorbed[static_cast<unsigned>(
+                  SettleOrigin::RobWalk)].value(), 1.0);
+    EXPECT_EQ(ledger.settleOriginAbsorbed[static_cast<unsigned>(
+                  SettleOrigin::PreCutBelt)].value(), 1.0);
+
+    // Documented identities (collecting, not frozen).
+    EXPECT_EQ(ledger.settleRetiredEffective.value(),
+              ledger.retiredCohort.value() +
+              ledger.settledOutOfEpochRetired.value());
+    EXPECT_EQ(ledger.settleSquashedEffective.value(),
+              ledger.squashedCohort.value() +
+              ledger.settledOutOfEpochSquashed.value());
+    EXPECT_EQ(ledger.settleRetiredHookCalls.value() -
+              ledger.settleRetiredEffective.value(),
+              ledger.settleRetiredAbsorbed.value());
+    EXPECT_EQ(ledger.settleSquashedHookCalls.value() -
+              ledger.settleSquashedEffective.value(),
+              ledger.settleSquashedAbsorbed.value());
+}
+
+TEST(LifecycleObservation, OutOfEpochRoutingIsObserved)
+{
+    // epoch row4 material: a pre-segment registration settling squashed
+    // inside the segment lands in settledOutOfEpochSquashed AND in the
+    // settleOriginOutOfEpoch vector.
+    TopdownLedger ledger(nullptr, baseConfig(), true);
+    LedgerTag pre;
+    ledger.registerAlloc(pre, true, &pre, 10);
+    ledger.resetStats();   // beginEpoch: pre is now a pre-segment member
+    ledger.settleSquashed(pre, &pre, SettleOrigin::LSQ, 20);
+
+    EXPECT_EQ(ledger.settledOutOfEpochSquashed.value(), 1.0);
+    EXPECT_EQ(ledger.settleOriginOutOfEpoch[static_cast<unsigned>(
+                  SettleOrigin::LSQ)].value(), 1.0);
+    EXPECT_EQ(ledger.settleOriginEffective[static_cast<unsigned>(
+                  SettleOrigin::LSQ)].value(), 0.0);
+    EXPECT_EQ(ledger.settleSquashedEffective.value(), 1.0);
+}
+
+TEST(LifecycleObservation, BoundarySampleAtSnapshot)
+{
+    TopdownLedger ledger(nullptr, baseConfig(), true);
+
+    // Tick 100: two registrations during the tick, one settle during the
+    // tick (pre-snapshot phase), then the Option-B end-of-tick snapshot.
+    ledger.observeTick(100);
+    LedgerTag a, b;
+    ledger.registerAlloc(a, true, &a, 100);
+    ledger.registerAlloc(b, true, &b, 100);
+    ledger.settleRetired(a, &a, 100);
+    DispatchCycleInputs in = baseInputs();
+    in.arrivals = 2;
+    in.crossings = 2;
+    ledger.accountCycle(in);
+    ledger.snapshot(100);
+
+    EXPECT_EQ(ledger.snapshotBoundaryTick.value(), 100.0);
+    EXPECT_EQ(ledger.snapshotTickRegistrations.value(), 2.0);
+    EXPECT_EQ(ledger.snapshotTickSettlesPre.value(), 1.0);
+    EXPECT_EQ(ledger.snapshotTickSettlesPost.value(), 0.0);
+
+    // A settle in a LATER tick lands in settledAfterClose (may-grow) and
+    // never moves the frozen boundary sample.
+    ledger.settleSquashed(b, &b, SettleOrigin::RobWalk, 200);
+    EXPECT_EQ(ledger.settledAfterCloseSquashed.value(), 1.0);
+    EXPECT_EQ(ledger.snapshotTickSettlesPre.value(), 1.0);
+    EXPECT_EQ(ledger.snapshotTickRegistrations.value(), 2.0);
+
+    // Same-tick observation with no events: a snapshot on an eventless
+    // tick reports zeros, not stale scratch.
+    TopdownLedger quiet(nullptr, baseConfig(), true);
+    quiet.observeTick(500);
+    LedgerTag c;
+    quiet.registerAlloc(c, true, &c, 400);   // previous tick's event
+    quiet.snapshot(500);
+    EXPECT_EQ(quiet.snapshotBoundaryTick.value(), 500.0);
+    EXPECT_EQ(quiet.snapshotTickRegistrations.value(), 0.0);
+    EXPECT_EQ(quiet.snapshotTickSettlesPre.value(), 0.0);
+}
+
+TEST(LifecycleObservation, NestedSquashMarkerAndFrozenDiscipline)
+{
+    TopdownLedger ledger(nullptr, baseConfig(), true);
+    ledger.noteNestedSquash();
+    ledger.noteNestedSquash();
+    EXPECT_EQ(ledger.nestedSquashObservations.value(), 2.0);
+
+    LedgerTag a;
+    ledger.registerAlloc(a, true, &a, 10);
+    ledger.snapshot(10);
+
+    // Frozen live-group discipline: post-snapshot hook entries only feed
+    // the registered may-grow diagnostics, never the observation group.
+    ledger.noteNestedSquash();
+    LedgerTag post;
+    ledger.registerAlloc(post, true, &post, 20);
+    ledger.settleRetired(a, &a, 20);
+    EXPECT_EQ(ledger.nestedSquashObservations.value(), 2.0);
+    EXPECT_EQ(ledger.registerHookCalls.value(), 1.0);
+    EXPECT_EQ(ledger.postSnapshotRegistrations.value(), 1.0);
+    EXPECT_EQ(ledger.settleRetiredHookCalls.value(), 0.0);
+    EXPECT_EQ(ledger.settleRetiredEffective.value(), 0.0);
+    EXPECT_EQ(ledger.settledAfterCloseRetired.value(), 1.0);
+}
+
+TEST(LifecycleObservation, SettleOriginNamesMatchEnum)
+{
+    EXPECT_STREQ(settleOriginName(SettleOrigin::Retire), "Retire");
+    EXPECT_STREQ(settleOriginName(SettleOrigin::CommitBelt), "CommitBelt");
+    EXPECT_STREQ(settleOriginName(SettleOrigin::PreCutBelt), "PreCutBelt");
+    EXPECT_STREQ(settleOriginName(SettleOrigin::RobWalk), "RobWalk");
+    EXPECT_STREQ(settleOriginName(SettleOrigin::IQ), "IQ");
+    EXPECT_STREQ(settleOriginName(SettleOrigin::LSQ), "LSQ");
+    EXPECT_STREQ(settleOriginName(SettleOrigin::ExecSkip), "ExecSkip");
+    EXPECT_STREQ(settleOriginName(SettleOrigin::DispQue), "DispQue");
+    EXPECT_STREQ(settleOriginName(SettleOrigin::BufferSquash),
+                 "BufferSquash");
+    EXPECT_EQ(static_cast<unsigned>(SettleOrigin::NumSettleOrigins), 9u);
+}
