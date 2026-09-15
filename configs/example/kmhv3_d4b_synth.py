@@ -49,6 +49,7 @@ from common.FSConfig import *
 from common.SysPaths import *
 from common import Simulation
 from common.xiangshan import *
+from kmhv3 import setKmhV3Params
 
 
 def extract_btbp_trace_out(argv):
