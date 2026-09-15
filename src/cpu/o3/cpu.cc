@@ -158,6 +158,11 @@ CPU::CPU(const BaseO3CPUParams &params)
       d4bDiagEnabled(params.enable_d4b_diag),
       valuePred(params.valuePred)
 {
+    // D4-B persistent audit export path (empty = disabled; the ledger
+    // is quiescent when the enable param is false, so a stray path on a
+    // disabled ledger is inert by construction).
+    topdownLedger->setAuditExportPath(params.d4b_topdown_audit_export_path);
+
     if (!params.switched_out) {
         _status = Running;
     } else {
@@ -466,14 +471,34 @@ CPU::D4bDiagStats::D4bDiagStats(CPU *cpu)
                "window, robSquashing over, fetch unblocked and zero "
                "delivery (diagnostic only: no additivity, no main-cause "
                "claim)"),
-      ADD_STAT(backendInOldRecoveryWindowSlots, statistics::units::Count::get(),
-               "H3 overlap proxy: slots of cycles inside the commit interval "
-               "(squash more recent than the last commit — the window the "
-               "recovery_bubble arithmetic charges) with delivery resumed "
-               "and zero commits (backend stalls absorbed into the "
-               "commit-interval accounting; the R4 window itself closes at "
-               "first delivery, so the post-delivery tail lives here; "
-               "diagnostic only)"),
+      ADD_STAT(oldRecoveryChargeWindowCharges, statistics::units::Count::get(),
+               "H3: windows the old recovery_bubble arithmetic charged "
+               "(ismispred latch closed by the next commit; = closed "
+               "charging windows)"),
+      ADD_STAT(oldRecoveryChargeWindowCycles, statistics::units::Cycle::get(),
+               "H3: sum of charged intervals in cycles (curCycle - "
+               "lastCommitCycle at each charge)"),
+      ADD_STAT(oldRecoveryChargeWindowSlots, statistics::units::Count::get(),
+               "H3: sum of charged intervals in slots (interval x "
+               "renameWidth); per-stat-segment reconciliation key against "
+               "commit.recovery_bubble"),
+      ADD_STAT(oldRecoveryChargeWindowOpenCycles, statistics::units::Cycle::get(),
+               "H3: extension cycles of an open charging window (ismispred "
+               "latched, no commit this cycle), including boundary-frozen "
+               "and cross-reset open windows"),
+      ADD_STAT(oldRecoveryChargeWindowOpenSlots, statistics::units::Count::get(),
+               "H3: openRecoveryChargeWindowOpenCycles x issueWidth "
+               "(diagnostic only)"),
+      ADD_STAT(oldRecoveryChargeWindowBEOverlapCycles,
+               statistics::units::Cycle::get(),
+               "H3: open-window extension cycles with a same-cycle DIRECT "
+               "admission-side Backend-family block signal (blockIEW with "
+               "a Backend-family reason). Overlap existence only: this is "
+               "NOT an eliminable-loss or backend-attribution measure"),
+      ADD_STAT(oldRecoveryChargeWindowBEOverlapSlots,
+               statistics::units::Count::get(),
+               "H3: oldRecoveryChargeWindowBEOverlapCycles x issueWidth "
+               "(overlap existence only, no additivity claim)"),
       ADD_STAT(squashBlindWindowSlots, statistics::units::Count::get(),
                "H4 overlap proxy: slots of cycles between squash-signal "
                "issue and robSquashing arrival at fetch (commitToFetchDelay), "
@@ -548,34 +573,64 @@ CPU::D4bDiagStats::closeCycle()
     // Cycle conditions (operational proxies, contract section 2.4).
     const bool h1 = recovery_active && !rob_squashing &&
                     !block_fetch_any && delivery0;
-    // H3 uses the COMMIT-INTERVAL window (squash more recent than the last
-    // commit — the window recovery_bubble arithmetic actually charges),
-    // NOT the R4 window flag: the R4 recovery window closes at first
-    // delivery, so "window open AND delivery resumed" is structurally
-    // empty.  H3 measures post-delivery, pre-commit cycles inside the
-    // commit interval (backend stalls absorbed by the commit-interval
-    // accounting).
-    const Tick last_commit = cpu->commit.ledgerLastCommitTick();
-    const bool in_commit_interval = last_squash != 0 &&
-        last_squash > last_commit;
-    const bool h3 = in_commit_interval && !delivery0 && !commit_ge1;
+
+    // H3 (review-fixes rewrite, production/review-fixes/H3_MAPPING.md):
+    // observe the window the OLD recovery_bubble arithmetic actually
+    // charges.  The charging predicate is the ismispred latch ("the last
+    // RETIRED instruction was mispredicted"), snapshotted by Commit at
+    // tick start; the interval runs from the previous commit's cycle to
+    // the closing commit's cycle and is charged interval*renameWidth at
+    // the first commit of the closing cycle (commit.cc recovery_bubble
+    // site).  The 0e154e094a proxy (last_squash > last_commit &&
+    // delivery>0 && commits==0) was proven NOT equivalent to this
+    // window (MAIN_HOOK_REVIEW) and is removed; delivery>0/commit==0 is
+    // not backend evidence and never appears in these predicates.
+    const bool old_window_active = cpu->commit.ledgerOldWindowActive();
+    const unsigned charge_interval =
+        cpu->commit.ledgerOldChargeWindowCyclesThisCycle();
+    const bool h3_open = old_window_active && !commit_ge1;
     const bool h4 = blind_active && !block_fetch_any && delivery0;
+
+    if (charge_interval > 0) {
+        oldRecoveryChargeWindowCharges++;
+        oldRecoveryChargeWindowCycles += charge_interval;
+        oldRecoveryChargeWindowSlots +=
+            charge_interval * cpu->issueWidth;
+    }
+    if (h3_open) {
+        oldRecoveryChargeWindowOpenCycles++;
+        oldRecoveryChargeWindowOpenSlots += cpu->issueWidth;
+        // Co-presence of a DIRECT same-cycle admission-side Backend-family
+        // block (contract section 1.5a evidence): overlap existence only.
+        bool admission_backend_block = false;
+        for (ThreadID i = 0; i < cpu->numThreads; i++) {
+            if (cpu->stallSig.blockIEW[i] &&
+                classifyStallReason(cpu->stallSig.iewBlockReason[i],
+                                    /*upstreamRole=*/false) ==
+                    SlotClass::Backend) {
+                admission_backend_block = true;
+                break;
+            }
+        }
+        if (admission_backend_block) {
+            oldRecoveryChargeWindowBEOverlapCycles++;
+            oldRecoveryChargeWindowBEOverlapSlots += cpu->issueWidth;
+        }
+    }
 
     if (h1)
         recoveryProxyOverlapSlots += cpu->issueWidth;
-    if (h3)
-        backendInOldRecoveryWindowSlots += cpu->issueWidth;
     if (h4)
         squashBlindWindowSlots += cpu->issueWidth;
     if (delivery0 && commit_ge1)
         cyclesDelivery0CommitGE1++;
-    if (h1 && h3)
+    if (h1 && h3_open)
         overlapH1H3Cycles++;
     if (h1 && h4)
         overlapH1H4Cycles++;
-    if (h3 && h4)
+    if (h3_open && h4)
         overlapH3H4Cycles++;
-    if (h1 && h3 && h4)
+    if (h1 && h3_open && h4)
         overlapH1H3H4Cycles++;
 }
 

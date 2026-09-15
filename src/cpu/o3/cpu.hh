@@ -855,8 +855,27 @@ class CPU : public BaseCPU
 
         /** H1: recovery-window FE/BS double-billing overlap (slots). */
         statistics::Scalar recoveryProxyOverlapSlots;
-        /** H3: backend stalls absorbed inside an open recovery window. */
-        statistics::Scalar backendInOldRecoveryWindowSlots;
+
+        /**
+         * H3 (review-fixes rewrite, H3_MAPPING.md): observation counters
+         * bound to the window the OLD recovery_bubble arithmetic actually
+         * charges — the ismispred latch ("the last retired instruction
+         * was mispredicted") closed by the next commit, charged
+         * (curCycle - lastCommitCycle) * renameWidth.  These are
+         * diagnostics over the old charging semantics; they make NO
+         * backend-loss claim.  BEOverlap reports only the co-presence of
+         * a direct admission-side Backend-family block inside an open
+         * window (overlap existence, never eliminable loss).
+         */
+        ///@{ H3 old-window observation counters.
+        statistics::Scalar oldRecoveryChargeWindowCharges;
+        statistics::Scalar oldRecoveryChargeWindowCycles;
+        statistics::Scalar oldRecoveryChargeWindowSlots;
+        statistics::Scalar oldRecoveryChargeWindowOpenCycles;
+        statistics::Scalar oldRecoveryChargeWindowOpenSlots;
+        statistics::Scalar oldRecoveryChargeWindowBEOverlapCycles;
+        statistics::Scalar oldRecoveryChargeWindowBEOverlapSlots;
+        ///@}
         /** H4: squash-signal to robSquashing-arrival blind window. */
         statistics::Scalar squashBlindWindowSlots;
         /** H2 (descriptive only): delivery-0 cycles with commits. */
