@@ -973,6 +973,7 @@ Commit::tick()
     // old recovery_bubble charging-window predicate.
     ledgerCommittedThisCycle_ = 0;
     ledgerOldChargeWindowCyclesThisCycle_ = 0;
+    ledgerOldChargeCountThisCycle_ = 0;
     ledgerOldWindowActive_ = ismispred;
 
     if (activeThreads->empty())
@@ -1638,13 +1639,16 @@ Commit::commitInsts()
                             renameWidth;
                         // D4-B d4bDiag H3 evidence (statistics-only): the
                         // interval just charged, captured BEFORE
-                        // lastCommitCycle is refreshed below.  Only the
-                        // first commit of this tick can charge (the latch
-                        // was consumed), matching the old arithmetic
+                        // lastCommitCycle is refreshed below, ACCUMULATED
+                        // over the tick (several commits can retire in one
+                        // cycle and each may close a window; a same-cycle
+                        // close charges a zero-length interval), so the
+                        // per-tick sum matches recovery_bubble's increment
                         // exactly (H3_MAPPING.md section 1).
-                        ledgerOldChargeWindowCyclesThisCycle_ =
+                        ledgerOldChargeWindowCyclesThisCycle_ +=
                             static_cast<unsigned>(
                                 cpu->curCycle() - lastCommitCycle[tid]);
+                        ledgerOldChargeCountThisCycle_++;
                     }
                     if (head_inst->mispredicted()) {
                         ismispred[tid] = true;
