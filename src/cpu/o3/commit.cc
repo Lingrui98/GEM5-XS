@@ -968,7 +968,12 @@ Commit::tick()
 
     // D4-B d4bDiag evidence (reset before any early return so every tick
     // samples a full cycle; statistics-only, never a decision input).
+    // H3: snapshot the ismispred latch at tick start — it only changes
+    // inside the commit path, so this is the whole-tick truth for the
+    // old recovery_bubble charging-window predicate.
     ledgerCommittedThisCycle_ = 0;
+    ledgerOldChargeWindowCyclesThisCycle_ = 0;
+    ledgerOldWindowActive_ = ismispred;
 
     if (activeThreads->empty())
         return;
@@ -1612,7 +1617,6 @@ Commit::commitInsts()
                     recordCommittedInst(head_inst);
                     // D4-B d4bDiag evidence (statistics-only).
                     ledgerCommittedThisCycle_++;
-                    ledgerLastCommitTick_ = curTick();
                     cpu->perfCCT->updateInstPos(head_inst->seqNum,
                                                 PerfRecord::AtCommit);
                     auto res = head_inst->getResult();
@@ -1632,6 +1636,15 @@ Commit::commitInsts()
                         stats.recovery_bubble[tid] +=
                             (cpu->curCycle() - lastCommitCycle[tid]) *
                             renameWidth;
+                        // D4-B d4bDiag H3 evidence (statistics-only): the
+                        // interval just charged, captured BEFORE
+                        // lastCommitCycle is refreshed below.  Only the
+                        // first commit of this tick can charge (the latch
+                        // was consumed), matching the old arithmetic
+                        // exactly (H3_MAPPING.md section 1).
+                        ledgerOldChargeWindowCyclesThisCycle_ =
+                            static_cast<unsigned>(
+                                cpu->curCycle() - lastCommitCycle[tid]);
                     }
                     if (head_inst->mispredicted()) {
                         ismispred[tid] = true;

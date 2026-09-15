@@ -472,9 +472,21 @@ class Commit
     /** Last tick at which a commit-side squash signal was written (H4
      *  blind-window diagnostic; 0 = never). */
     Tick ledgerLastSquashSignalTick_ = 0;
-    /** Last tick at which any instruction committed (H3 commit-interval
-     *  diagnostic; 0 = never). */
-    Tick ledgerLastCommitTick_ = 0;
+    /**
+     * H3 evidence (review-fixes, H3_MAPPING.md): snapshot of the ismispred
+     * latch taken at tick start — true iff the last retired instruction
+     * was mispredicted, i.e. the charging window of the OLD
+     * recovery_bubble arithmetic (commit.cc charge site) is currently
+     * open.  ismispred only changes inside the commit path, so the
+     * tick-start snapshot is the whole-tick truth.
+     */
+    bool ledgerOldWindowActive_ = false;
+    /** Interval (cycles) closed by this tick's first charge, i.e.
+     *  (curCycle - lastCommitCycle) captured at the recovery_bubble
+     *  charge site before lastCommitCycle updates.  0 = no charge this
+     *  tick.  Only the FIRST commit of a tick can charge (ismispred is
+     *  consumed at the first charge). */
+    unsigned ledgerOldChargeWindowCyclesThisCycle_ = 0;
 
   public:
     /** d4bDiag evidence getter (per-cycle commit successes). */
@@ -483,8 +495,13 @@ class Commit
     /** d4bDiag evidence getter (last commit-side squash signal tick). */
     Tick ledgerLastSquashSignalTick() const
     { return ledgerLastSquashSignalTick_; }
-    /** d4bDiag evidence getter (last commit tick). */
-    Tick ledgerLastCommitTick() const { return ledgerLastCommitTick_; }
+    /** d4bDiag H3 evidence: ismispred latch at tick start (the old
+     *  recovery_bubble charging window is open). */
+    bool ledgerOldWindowActive() const { return ledgerOldWindowActive_; }
+    /** d4bDiag H3 evidence: interval closed by this tick's charge (0 if
+     *  no charge this tick). */
+    unsigned ledgerOldChargeWindowCyclesThisCycle() const
+    { return ledgerOldChargeWindowCyclesThisCycle_; }
 
   private:
 
