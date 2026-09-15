@@ -61,6 +61,7 @@ if env['CONF']['TARGET_ISA'] != 'null':
     Source('thread_state.cc')
     Source('issue_queue.cc')
     Source('perfCCT.cc')
+    Source('topdown_ledger.cc')
 
     # Trace reader sources for trace-driven simulation
     Source('trace/TraceReader.cc')
@@ -119,6 +120,29 @@ if env['CONF']['TARGET_ISA'] == 'null':
     # function tests, no gem5 link deps.
     GTest('topdown_stats.test',
           'topdown_stats.test.cc')
+    # D4-B topdown ledger: direct-linked GTest of the PRODUCTION code
+    # (topdown_ledger.cc), per the design contract section 5a -- inline
+    # duplicated models are explicitly NOT acceptable as correctness
+    # evidence.  Both NULL and real-ISA variants link the same production
+    # unit plus the stats/SimObject glue (mirrors champsim_trace_reader).
+    GTest('topdown_ledger.test',
+          'topdown_ledger.test.cc',
+          'topdown_ledger.cc',
+          '../../base/stats/group.cc',
+          '../../base/stats/info.cc',
+          '../../base/stats/storage.cc',
+          '../../base/statistics.cc',
+          '../../base/time.cc',
+          '../../base/hostinfo.cc',
+          '../../base/output.cc',
+          '../../sim/core.cc',
+          '../../sim/sim_object.cc',
+          '../../sim/globals.cc',
+          '../../sim/tags.cc',
+          # Stats Root is required when constructing statistics::Group in
+          # tests
+          '../../sim/root.cc',
+          with_tag('gem5 trace'))
     GTest('entangling_prefetcher.test',
           'entangling_prefetcher.test.cc',
           'entangling_prefetcher.cc')
@@ -167,6 +191,28 @@ else:
     # function tests, no gem5 link deps.
     GTest('topdown_stats.test',
           'topdown_stats.test.cc')
+    # D4-B topdown ledger: direct-linked GTest of the PRODUCTION code
+    # (topdown_ledger.cc), per the design contract section 5a -- inline
+    # duplicated models are explicitly NOT acceptable as correctness
+    # evidence.  Real-ISA variant mirrors the NULL branch.
+    GTest('topdown_ledger.test',
+          'topdown_ledger.test.cc',
+          'topdown_ledger.cc',
+          '../../base/stats/group.cc',
+          '../../base/stats/info.cc',
+          '../../base/stats/storage.cc',
+          '../../base/statistics.cc',
+          '../../base/time.cc',
+          '../../base/hostinfo.cc',
+          '../../base/output.cc',
+          '../../sim/core.cc',
+          '../../sim/sim_object.cc',
+          '../../sim/globals.cc',
+          '../../sim/tags.cc',
+          # Stats Root is required when constructing statistics::Group in
+          # tests
+          '../../sim/root.cc',
+          with_tag('gem5 trace'))
     GTest('entangling_prefetcher.test',
           'entangling_prefetcher.test.cc',
           'entangling_prefetcher.cc')
