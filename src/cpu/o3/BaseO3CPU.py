@@ -181,6 +181,11 @@ class BaseO3CPU(BaseCPU):
                "Issue/Execute/Writeback delay")
 
     enableDispatchStage = Param.Bool(False, "Enable the dispatch stage")
+    enable_d4b_topdown_ledger = Param.Bool(False,
+        "Enable the D4-B dispatch-slot conservation ledger (topdownV2 "
+        "statistical group). Statistics-only: no output feeds any pipeline "
+        "decision. The unsupported domain (SMT / enableDispatchStage / "
+        "decodeWidth != renameWidth) reports ledgerState=1 with NaN ratios.")
     numDQEntries = VectorParam.Unsigned([32, 16, 16], "Number of entries in the dispQue, (Int, Float/Vector, Mem)")
     dispWidth = VectorParam.Unsigned([8, 6, 6], "Each DispQue dispatch width")
 
