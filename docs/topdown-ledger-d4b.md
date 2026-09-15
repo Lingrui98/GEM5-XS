@@ -26,9 +26,16 @@ untouched; both new groups default to OFF.
 --enable-d4b-diag              # d4bDiag H-counter sampling (default off)
 ```
 
-The groups always print (they are constructed unconditionally); when
-disabled every counter is 0 and every ratio is `nan`
-(`topdownV2.statEnabled=0` self-describes the quiescent arm).
+The groups always print (they are constructed unconditionally).  The
+two default-off arms differ: for `topdownV2`, disabled means every
+counter is 0 and every ratio is `nan`
+(`topdownV2.statEnabled=0` self-describes the quiescent arm).  For
+`d4bDiag`, the switch gates the per-cycle H-condition sampling
+(`closeCycle()`) only; the E1/E2 identity and B1/B2/B3 bridge
+*formulas* are evaluated from the existing old statistics (and the
+topdownV2 snapshot where present) and can be nonzero with
+`--enable-d4b-diag` off — a disabled d4bDiag arm shows the H scalars
+at 0, not zero formulas.
 
 ## Supported domain (owner-frozen D-2)
 
@@ -79,14 +86,35 @@ numerical acceptance requires `ledgerState==0` first.**
 - The d4bDiag H1/H3/H4 counters are overlap proxies: no additivity,
   no "main cause" claims; mutual exclusivity is a measured conclusion
   (see the pairwise overlap matrix), not an assumption.
+- The seven `oldRecoveryChargeWindow*` fields observe the OLD
+  `ismispred` charging window (the window the `recovery_bubble`
+  arithmetic actually charges).  A charged interval can be ZERO (a
+  window closed by a same-cycle commit), and one tick can close
+  SEVERAL windows — the latch can be re-armed by a later mispredicted
+  retire in the same tick, and the hook sums every charge event.
+  `*BEOverlap*` counts only the co-presence of a direct admission-side
+  Backend block (blockIEW with a Backend-family reason) inside an open
+  window: overlap existence, never an eliminable-loss or backend-
+  attribution measure.  Charge accounting uses 64-bit intermediates
+  end to end (a charged interval can exceed 2^32 cycles); stat values
+  are exact integers only below 2^53 (double counters, the
+  CounterPrecision test boundary) — an existing output-domain
+  constraint, unchanged by the width fix.
 
 ## Replay / audit layer
 
-Each classified cycle's complete evidence tuple (all section 1.5a
-inputs) is retained in an in-memory lossless table (resource-capped at
-16384 distinct tuples; on overflow `replayComplete` goes 0 and
+Each classified cycle's evidence tuple (all section 1.5a inputs) is
+retained in an in-memory table (resource-capped at 16384 distinct
+tuples; on overflow `replayComplete` goes 0 and
 `replayTableOverflowTuples` counts the dropped records — no silent
-truncation).  `slotPatternDist` (8×8) is only a display summary.
-Replay covers policy changes expressible over the retained tuples;
-policies needing new signals or cross-cycle history require a schema
-bump and re-collection.
+truncation).  The table is lossless with respect to the frozen
+policy's inputs, not to raw per-slot evidence: the audit's
+`renameUpReasons` / `decodeUpReasons` / `fetchUpReasons` fields are
+per-hop distinct-reason BIT SETS (bit r set iff reason r occurred
+in that hop, alongside one representative reason per hop), not the
+raw per-slot reason vectors or multisets.  `slotPatternDist` (8×8)
+is only a display summary.  Replay covers set-level, history-free
+policy changes expressible over the retained tuples; it cannot
+restore the original per-slot reason order or per-reason counts,
+and policies needing per-slot multiplicity, cross-cycle history or
+new signals require a schema bump and re-collection.

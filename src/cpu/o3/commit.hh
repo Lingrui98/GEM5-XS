@@ -471,8 +471,11 @@ class Commit
      *  summed: several commits can retire in one cycle and each may
      *  close a window (a same-cycle close charges a zero-length
      *  interval); the sum matches the per-tick slice of
-     *  recovery_bubble's increment exactly.  0 = no charge this tick. */
-    unsigned ledgerOldChargeWindowCyclesThisCycle_ = 0;
+     *  recovery_bubble's increment exactly.  0 = no charge this tick.
+     *  uint64_t: a single interval can exceed 2^32 cycles, and a
+     *  uint32 accumulator would wrap long before the stats counters'
+     *  2^53 exact-integer domain. */
+    uint64_t ledgerOldChargeWindowCyclesThisCycle_ = 0;
     /** Number of charge events this tick (every charge adds one, even
      *  when its interval is zero). */
     unsigned ledgerOldChargeCountThisCycle_ = 0;
@@ -488,8 +491,9 @@ class Commit
      *  recovery_bubble charging window is open). */
     bool ledgerOldWindowActive() const { return ledgerOldWindowActive_; }
     /** d4bDiag H3 evidence: sum of the intervals charged this tick
-     *  (0 if no charge this tick). */
-    unsigned ledgerOldChargeWindowCyclesThisCycle() const
+     *  (0 if no charge this tick).  64-bit: a single charged interval
+     *  can exceed 2^32 cycles. */
+    uint64_t ledgerOldChargeWindowCyclesThisCycle() const
     { return ledgerOldChargeWindowCyclesThisCycle_; }
     /** d4bDiag H3 evidence: number of charge events this tick. */
     unsigned ledgerOldChargeCountThisCycle() const
