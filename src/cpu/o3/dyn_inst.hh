@@ -153,6 +153,14 @@ class DynInst : public ExecContext, public RefCounted
     /** Pointer to the Impl's CPU object. */
     CPU *cpu = nullptr;
 
+    /**
+     * D4-B topdown ledger tag (STATS-ONLY).  Owned exclusively by
+     * TopdownLedger through the CPU wrappers; never read by any timing,
+     * arbitration, supply or prediction decision.  See
+     * cpu/o3/topdown_ledger.hh.
+     */
+    LedgerTag ledgerTag;
+
     BaseCPU *getCpuPtr() { return cpu; }
 
     /** Pointer to the thread state. */

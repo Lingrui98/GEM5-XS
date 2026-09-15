@@ -521,6 +521,10 @@ ROB::retireHead(ThreadID tid)
     head_inst->clearInROB();
     head_inst->setCommitted();
 
+    // D4-B observation point 1: successful retirement settles the
+    // cohort member (idempotent; routing by registration epoch).
+    cpu->ledgerSettleRetired(head_inst);
+
     //Update "Global" Head of ROB
     updateHead();
 
@@ -554,6 +558,10 @@ ROB::drainSquashedHead(ThreadID tid)
     commitGroup(head_inst, tid);
 
     head_inst->clearInROB();
+
+    // D4-B observation point 2: commit-side belt — squashed head
+    // draining out of the ROB.
+    cpu->ledgerSettleSquashed(head_inst, SettleOrigin::CommitBelt);
 
     updateHead();
 
@@ -670,6 +678,12 @@ ROB::doSquash(ThreadID tid)
         (*squashIt[tid])->setSquashed();
 
         (*squashIt[tid])->setCanCommit();
+
+        // D4-B observation point 8: ROB walk erase.  Consolidated over
+        // the "commit.cc 1305/1971" sketch (retireHead/drainSquashedHead
+        // are each called from exactly one site, so hooking inside ROB
+        // covers every caller).
+        cpu->ledgerSettleSquashed(*squashIt[tid], SettleOrigin::RobWalk);
 
         // printf("[ROB] squash seqNum %ld\n", (*squashIt[tid])->seqNum);
 

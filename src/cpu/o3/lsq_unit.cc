@@ -1905,6 +1905,9 @@ LSQUnit::executeStorePipeSx()
                     inst->seqNum);
                 inst->setExecuted();
                 inst->setCanCommit();
+                // D4-B observation point: squashed issued store skipped
+                // inside the store pipeline (execute-side skip).
+                cpu->ledgerSettleSquashed(inst, SettleOrigin::ExecSkip);
                 inst = nullptr;
                 continue;
             }
@@ -2557,6 +2560,9 @@ LSQUnit::squash(const InstSeqNum &squashed_num)
 
         // Clear the smart pointer to make sure it is decremented.
         loadQueue.back().instruction()->setSquashed();
+        // D4-B observation point 5: LSQ load-queue squash pop.
+        cpu->ledgerSettleSquashed(loadQueue.back().instruction(),
+                                  SettleOrigin::LSQ);
         loadQueue.back().clear();
 
         loadQueue.pop_back();
@@ -2665,6 +2671,9 @@ LSQUnit::squash(const InstSeqNum &squashed_num)
 
         // Clear the smart pointer to make sure it is decremented.
         storeQueue.back().instruction()->setSquashed();
+        // D4-B observation point 5: LSQ store-queue squash pop.
+        cpu->ledgerSettleSquashed(storeQueue.back().instruction(),
+                                  SettleOrigin::LSQ);
 
         // Must delete request now that it wasn't handed off to
         // memory.  This is quite ugly.  @todo: Figure out the proper

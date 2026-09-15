@@ -131,6 +131,25 @@ CPU::CPU(const BaseO3CPUParams &params)
       ipc_r("ipc", "", 1000, archDBer),
       cpi_r("cpi", "", 1000, archDBer),
       issueWidth(params.decodeWidth),
+      // D4-B ledger: member-initialised in declaration order (declared
+      // right after issueWidth in cpu.hh).  Constructed unconditionally
+      // so the topdownV2 stats group exists; quiescent when the
+      // enable_d4b_topdown_ledger param is false (default).
+      topdownLedger(new TopdownLedger(
+          this,
+          [&params]() {
+              TopdownLedger::Config cfg;
+              // W_C4 = renameWidth = min(decodeWidth, renameWidth) in the
+              // supported same-width domain (contract section 1.2).
+              cfg.slotWidth = params.renameWidth;
+              cfg.numThreads = params.numThreads;
+              cfg.enableDispatchStage = params.enableDispatchStage;
+              cfg.robCapacity = params.numROBEntries;
+              cfg.upstreamWidthMatches =
+                  params.decodeWidth == params.renameWidth;
+              return cfg;
+          }(),
+          params.enable_d4b_topdown_ledger)),
       enableMoveElimination(params.enableMoveElimination),
       enableConstantFolding(params.enableConstantFolding),
       enableMovImmElimination(params.enableMovImmElimination),
@@ -732,6 +751,16 @@ CPU::tick()
         event.roiInsts = btbpMeasuredRoiInsts;
         event.roiInstsValid = true;
         notifyBtbpTrace(event);
+
+        // D4-B topdownV2 ROI-end snapshot, Option B end-of-tick anchor
+        // (design contract section 1.2b(c)): this block runs exactly once
+        // at the request tick after every CPU-side phase of that tick
+        // (commit, IEW, rename, decode, fetch), so the snapshot sees the
+        // full tick's registrations and settlements with no half-tick
+        // mismatch against the W x numCycles budget domain.  The ledger
+        // freezes here; late settlements only feed the dedicated
+        // settledAfterClose/settledOutOfEpoch diagnostics.
+        ledgerSnapshot();
     }
 
     fetchTimebuffer.advance();
@@ -1530,6 +1559,46 @@ CPU::addInst(const DynInstPtr &inst)
     return --(instList.end());
 }
 
+// ---- D4-B topdown ledger wrappers ---------------------------------------
+// Thin adapters from DynInst to the ledger's DynInst-free core API (the
+// ledger itself is directly unit-testable without a CPU).  All hooks are
+// observation-only: no output feeds any pipeline decision.
+
+void
+CPU::ledgerRegisterAlloc(const DynInstPtr &inst)
+{
+    if (!ledgerAccounting())
+        return;
+    // INV-6 hook contract: the same-tick commit-side ROB insert precedes
+    // the IEW dispatch registration point.
+    topdownLedger->registerAlloc(inst->ledgerTag, inst->isInROB(),
+                                 inst.get(), curTick());
+}
+
+void
+CPU::ledgerSettleRetired(const DynInstPtr &inst)
+{
+    if (!ledgerAccounting())
+        return;
+    topdownLedger->settleRetired(inst->ledgerTag, inst.get());
+}
+
+void
+CPU::ledgerSettleSquashed(const DynInstPtr &inst, SettleOrigin origin)
+{
+    if (!ledgerAccounting())
+        return;
+    topdownLedger->settleSquashed(inst->ledgerTag, inst.get(), origin);
+}
+
+void
+CPU::ledgerSnapshot()
+{
+    if (!ledgerAccounting())
+        return;
+    topdownLedger->snapshot(curTick());
+}
+
 void
 CPU::instDone(ThreadID tid, const DynInstPtr &inst,
               Counter traceRecordIndex)
@@ -1727,6 +1796,13 @@ CPU::squashInstIt(ListIt &instIt, ThreadID tid)
 
         // Mark it as squashed.
         (*instIt)->setSquashed();
+
+        // D4-B drift-guard hook: instructions removed here are "not in
+        // the ROB" (pre-insert or already ROB-removed) so a registered
+        // Live member can normally never pass through — the settle is a
+        // no-op unless future drift breaks that premise, in which case
+        // the cohort closes anyway instead of silently vanishing.
+        ledgerSettleSquashed(*instIt, SettleOrigin::PreCutBelt);
 
         // @todo: Formulate a consistent method for deleting
         // instructions from the instruction list

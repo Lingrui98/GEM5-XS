@@ -2084,6 +2084,10 @@ Commit::moveInstsToBuffer()
             DPRINTF(Commit, "[tid:%i] [sn:%llu] "
                     "Instruction PC %s was squashed, skipping.\n",
                     tid, inst->seqNum, inst->pcState());
+            // D4-B pre-cut belt hook: instructions skipped here never
+            // entered the ROB and have not crossed C4 — the settle is a
+            // no-op unless drift breaks that premise.
+            cpu->ledgerSettleSquashed(inst, SettleOrigin::PreCutBelt);
         }
 
         fixedbuffer[tid].pop_front();
@@ -2113,6 +2117,9 @@ Commit::squashInflightAndUpdateVersion(ThreadID tid)
                 "instruction PC %s\n",
                 inst->threadNumber, inst->seqNum, inst->pcState());
         inst->setSquashed();
+        // D4-B pre-cut belt hook (commit-side fixedbuffer squash):
+        // pre-C4 population, no-op settle for drift protection.
+        cpu->ledgerSettleSquashed(inst, SettleOrigin::PreCutBelt);
     }
 
     fixedbuffer[tid].clear();

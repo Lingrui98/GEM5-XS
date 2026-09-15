@@ -46,6 +46,7 @@
 #include <array>
 #include <iostream>
 #include <list>
+#include <memory>
 #include <queue>
 #include <set>
 #include <vector>
@@ -70,6 +71,7 @@
 #include "cpu/o3/rob.hh"
 #include "cpu/o3/scoreboard.hh"
 #include "cpu/o3/thread_state.hh"
+#include "cpu/o3/topdown_ledger.hh"
 #include "cpu/pred/btb/probe/btbp_trace_event.hh"
 #include "cpu/simple_thread.hh"
 #include "cpu/timebuf.hh"
@@ -702,6 +704,35 @@ class CPU : public BaseCPU
 
     /** Issue Width, using for intel topdown stats */
     int issueWidth; // issueWidth = decodeWidth = renameWidth!!!
+
+    // ---- D4-B dispatch-slot conservation ledger (stats-only) ----
+    /**
+     * Owned TopdownLedger.  Constructed unconditionally so the
+     * topdownV2 statistics group always exists (all-zero/NaN when
+     * enable_d4b_topdown_ledger is false — the A/B off-arm
+     * self-describes via topdownV2.enabled).  None of the ledger hooks
+     * feed any pipeline decision.
+     */
+    std::unique_ptr<TopdownLedger> topdownLedger;
+
+    /** Fast gate used by the per-instruction/per-cycle hooks. */
+    bool ledgerAccounting() const
+    { return topdownLedger && topdownLedger->accounting(); }
+
+    /** Accessor for the per-cycle accountCycle hook (IEW). */
+    TopdownLedger *ledger() { return topdownLedger.get(); }
+
+    /** Same-cycle ROI drain mode evidence input (fetch-side flag). */
+    bool ledgerDrainMode() const { return fetch.inBtbpRoiDrainMode(); }
+
+    /** C4 registration (iew.cc dispatchedInsts point; cpu.cc wrapper). */
+    void ledgerRegisterAlloc(const DynInstPtr &inst);
+    /** Observation point 1 settlement (ROB retireHead). */
+    void ledgerSettleRetired(const DynInstPtr &inst);
+    /** Observation points 2-8 settlement (squash terminations). */
+    void ledgerSettleSquashed(const DynInstPtr &inst, SettleOrigin origin);
+    /** ROI-end Option-B end-of-tick snapshot (cpu.cc ROI-end anchor). */
+    void ledgerSnapshot();
 
     bool enableMoveElimination; // Control flag of register move elimination
     bool enableConstantFolding; // Control flag of Constant Folding (add-immediate elimination)

@@ -543,6 +543,10 @@ IEW::squash(ThreadID tid)
         for (auto& it : dp) {
             if (it->seqNum > fromCommit->commitInfo[tid].doneSeqNum && (it->threadNumber == tid)) {
                 it->setSquashed();
+                // D4-B observation point: dispQue squash marking (dead
+                // path when enableDispatchStage=false — hooked anyway,
+                // "a dead path is no excuse for a missing hook").
+                cpu->ledgerSettleSquashed(it, SettleOrigin::DispQue);
             }
         }
     }
@@ -876,6 +880,10 @@ IEW::moveInstsToBuffer()
         assert(inst->threadNumber == tid);
         if (localSquashVer[tid].largerThan(inst->getVersion())) {
             inst->setSquashed();
+            // D4-B pre-cut belt hook (dispatch-buffer squash marking):
+            // these instructions have not crossed C4 yet, so the settle
+            // is a no-op unless drift breaks that premise.
+            cpu->ledgerSettleSquashed(inst, SettleOrigin::BufferSquash);
         } else {
             fixedbuffer[tid].push_back(inst);
         }
@@ -936,6 +944,66 @@ IEW::setDispatchAgeCtr(const DynInstPtr& inst, int dispatch_pos)
     DPRINTF(IEW, "[tid:%i] [sn:%llu] ageCtr=%llu at dispatch pos %d.\n",
             inst->threadNumber, inst->seqNum,
             static_cast<unsigned long long>(inst->ageCtr), dispatch_pos);
+}
+
+/**
+ * D4-B evidence assembly for one dispatch cycle (contract section 1.5a).
+ * Every input is read at the same classification point (IEW phase, right
+ * after the dispatch loop):
+ *   - blockIEW/iewBlockReason: set by commit.tick() earlier in the same
+ *     CPU tick through the shared stallSignals object (no wire delay);
+ *   - blockRename/renameBlockReason: set by dispatchInsts() earlier in
+ *     this same IEW phase (including the residue backpressure path);
+ *   - breakReason: this tick's dispatch-loop break cause (NoStall if the
+ *     loop drained without a break);
+ *   - the lagged upstream chain hops and commit squash wires come from
+ *     the rename/fromCommit wires (informational, 1-3 tick lag);
+ *   - drainMode: fetch-side same-cycle flag.
+ * Single-thread domain: per-thread scans OR the flags (identical to the
+ * tid-0 sample when numThreads == 1; multi-thread is explicitly
+ * unsupported and the raw counters are debug-only).
+ */
+void
+IEW::ledgerAccountCycle()
+{
+    namespace td = ::gem5::o3;
+
+    auto firstNonNoStall = [](const std::vector<StallReason> &v) {
+        for (StallReason r : v)
+            if (r != StallReason::NoStall)
+                return r;
+        return StallReason::NoStall;
+    };
+
+    td::DispatchCycleInputs in;
+    in.budget = renameWidth;               // W_C4 (supported same-width domain)
+    in.residueAtStart = ledgerResidueAtStart;
+    in.arrivals = static_cast<unsigned>(fromRename->size);
+    in.crossings = ledgerCrossings;
+    in.poppedSquashed = ledgerPoppedSquashed;
+    in.drainMode = cpu->ledgerDrainMode();
+    in.breakReason = blockReason;
+
+    for (int i = 0; i < numThreads; i++) {
+        if (stallSig->blockIEW[i] && !in.blockIEW) {
+            in.blockIEW = true;
+            in.iewBlockReason = stallSig->iewBlockReason[i];
+        }
+        if (stallSig->blockRename[i] && !in.blockRename) {
+            in.blockRename = true;
+            in.renameBlockReason = stallSig->renameBlockReason[i];
+        }
+        in.commitSquashWire = in.commitSquashWire ||
+                              fromCommit->commitInfo[i].squash;
+        in.robSquashingWire = in.robSquashingWire ||
+                              fromCommit->commitInfo[i].robSquashing;
+    }
+
+    in.renameUp = firstNonNoStall(fromRename->renameStallReason);
+    in.decodeUp = firstNonNoStall(fromRename->decodeStallReason);
+    in.fetchUp = firstNonNoStall(fromRename->fetchStallReason);
+
+    cpu->ledger()->accountCycle(in);
 }
 
 void
@@ -1056,6 +1124,8 @@ IEW::dispatchInstFromRename(ThreadID tid)
 
         if (inst->isSquashed()) {
             ++iewStats.dispSquashedInsts;
+            // D4-B evidence: pre-cut squashed pop (poppedSquashed term).
+            ledgerPoppedSquashed++;
             insts_to_dispatch.pop_front();
 
             dispatch_stalls.push(StallReason::InstSquashed);
@@ -1188,6 +1258,14 @@ IEW::dispatchInstFromRename(ThreadID tid)
         ppDispatch->notify(inst);
 
         ++iewStats.dispatchedInsts;
+        // D4-B C4 registration: the dispatch event itself (contract
+        // section 1.1).  Covers every class that crosses C4, including
+        // the ones that do not occupy IQ/LSQ entries (nop/eliminated,
+        // barriers, non-spec non-mem, SC/atomic): their resource
+        // semantics is the same-tick ROB occupancy.
+        cpu->ledgerRegisterAlloc(inst);
+        // D4-B evidence: crossings term (same event, same site).
+        ledgerCrossings++;
 
         insts_to_dispatch.pop_front();
         dispatched++;
@@ -1252,6 +1330,8 @@ IEW::classifyInstToDispQue(ThreadID tid)
         if (dispQue[id].size() < dqSize[id]) {
             if (inst->isSquashed()) {
                 ++iewStats.dispSquashedInsts;
+                // D4-B evidence: pre-cut squashed pop (classify path).
+                ledgerPoppedSquashed++;
                 insts_to_dispatch.pop_front();
 
                 dispatch_stalls.push(StallReason::InstSquashed);
@@ -1289,6 +1369,12 @@ IEW::classifyInstToDispQue(ThreadID tid)
                 }
             }
             ++iewStats.dispatchedInsts;
+            // D4-B C4 registration, classifyInstToDispQue path
+            // (enableDispatchStage=true; unsupported domain for the
+            // ledger, but the hook keeps the count honest).
+            cpu->ledgerRegisterAlloc(inst);
+            // D4-B evidence: crossings term (classify path).
+            ledgerCrossings++;
             dispQue[id].push_back(inst);
 
             if (!inst->isNop() && !inst->isEliminated()) {
@@ -1679,6 +1765,10 @@ IEW::executeInsts()
 
             ++iewStats.executedInstStats.numSquashedInsts;
 
+            // D4-B observation point 7: squashed already-issued
+            // instruction skipped at execute.
+            cpu->ledgerSettleSquashed(inst, SettleOrigin::ExecSkip);
+
             continue;
         }
 
@@ -1857,6 +1947,15 @@ IEW::tick()
     wroteToTimeBuffer = false;
     updatedQueues = false;
 
+    // D4-B evidence sampling: reset the per-tick counters and capture the
+    // dispatch-buffer residue BEFORE moveInstsToBuffer() appends this
+    // tick's rename arrivals (delivered = residueAtStart + arrivals).
+    ledgerResidueAtStart = 0;
+    ledgerCrossings = 0;
+    ledgerPoppedSquashed = 0;
+    for (int i = 0; i < numThreads; i++)
+        ledgerResidueAtStart += fixedbuffer[i].size();
+
     scheduler->tick();
     ldstQueue.tick();
 
@@ -1868,6 +1967,12 @@ IEW::tick()
     for (int i = 0;i < dispatchStalls.size();i++) {
         iewStats.dispatchStallReason[dispatchStalls[i]]++;
     }
+
+    // D4-B cycle-ledger cut point (contract section 1.2b(a)): after the
+    // dispatch loop, with the same-cycle admission/block signals and the
+    // lagged chain/wire evidence assembled into the full tuple.
+    if (cpu->ledgerAccounting())
+        ledgerAccountCycle();
 
     // update the LSQ and scheduler before we check for ready instructions to execute
     ldstQueue.processWriteback();

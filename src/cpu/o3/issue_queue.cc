@@ -989,6 +989,10 @@ IssueQue::doSquash(SquashInfo squashInfo)
             (*it)->clearScheduled();
             (*it)->setCancel();
             vectorReadyQSeqs.erase((*it)->seqNum);
+            // D4-B observation point 4/5: IssueQue squash erase.  The
+            // instruction is still in the ROB and will drain via the
+            // walk/belt; the first observation settles it (idempotent).
+            (*it)->cpu->ledgerSettleSquashed(*it, SettleOrigin::IQ);
             it = instList.erase(it);
             assert(instList.size() >= instNum);
         } else {

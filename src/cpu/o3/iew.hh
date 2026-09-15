@@ -597,6 +597,19 @@ class IEW
 
     StallReason blockReason{NoStall};
 
+    // ---- D4-B topdown ledger per-cycle evidence (contract section 1.5a) --
+    // Sampled during this IEW tick and consumed by ledgerAccountCycle()
+    // right after the dispatch loop (the cycle-ledger cut point).
+    /** Dispatch-buffer residue at cycle start (before arrivals). */
+    unsigned ledgerResidueAtStart = 0;
+    /** C4 crossings (dispatch events) this tick. */
+    unsigned ledgerCrossings = 0;
+    /** Pre-cut squashed pops from the dispatch buffer this tick. */
+    unsigned ledgerPoppedSquashed = 0;
+
+    /** Build the evidence tuple and drive TopdownLedger::accountCycle. */
+    void ledgerAccountCycle();
+
     ROB* rob;
 
     void setAllStalls(StallReason dispatchStall);

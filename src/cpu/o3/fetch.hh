@@ -1636,6 +1636,13 @@ public:
     const FetchStatGroup &getFetchStats() { return fetchStats; }
 
     /**
+     * D4-B topdown ledger evidence input (stats-only read): same-cycle
+     * ROI drain mode for the P1 classification rule.  Never a decision
+     * input anywhere.
+     */
+    bool inBtbpRoiDrainMode() const { return btbpRoiDrainMode; }
+
+    /**
      * D4-A R3: count one BTB-miss decode-redirect event.  Called from
      * Decode's selfSquash classification points when the redirecting
      * instruction's fetch-time snapshot (predBtbHit) says its PC hit no
