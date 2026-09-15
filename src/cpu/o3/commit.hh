@@ -466,6 +466,23 @@ class Commit
      */
     bool wroteToTimeBuffer;
 
+    // ---- D4-B d4bDiag evidence (statistics-only; reset each tick) ------
+    /** commitHead successes this tick (H2/H3 overlap diagnostics). */
+    unsigned ledgerCommittedThisCycle_ = 0;
+    /** Last tick at which a commit-side squash signal was written (H4
+     *  blind-window diagnostic; 0 = never). */
+    Tick ledgerLastSquashSignalTick_ = 0;
+
+  public:
+    /** d4bDiag evidence getter (per-cycle commit successes). */
+    unsigned ledgerCommittedThisCycle() const
+    { return ledgerCommittedThisCycle_; }
+    /** d4bDiag evidence getter (last commit-side squash signal tick). */
+    Tick ledgerLastSquashSignalTick() const
+    { return ledgerLastSquashSignalTick_; }
+
+  private:
+
     /** Records if the number of ROB entries has changed this cycle. If it has,
      * then the number of free entries must be re-broadcast.
      */

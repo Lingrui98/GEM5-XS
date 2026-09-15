@@ -155,6 +155,8 @@ CPU::CPU(const BaseO3CPUParams &params)
       enableConstantFolding(params.enableConstantFolding),
       enableMovImmElimination(params.enableMovImmElimination),
       cpuStats(this),
+      d4bDiagStats(this),
+      d4bDiagEnabled(params.enable_d4b_diag),
       valuePred(params.valuePred)
 {
     if (!params.switched_out) {
@@ -435,6 +437,137 @@ CPU::notifyBtbpTrace(
         // Unreachable: requireBtbpTraceRouteable panicked on Unsupported.
         break;
     }
+}
+
+CPU::D4bDiagStats::D4bDiagStats(CPU *cpu)
+    : statistics::Group(cpu, "d4bDiag"),
+      ADD_STAT(e1ExcessSlots, statistics::units::Count::get(),
+               "Identity E1 excess slots: fetchBubbles + dispatchedInsts + "
+               "recovery_bubble - issueWidth*numCycles (algebraic "
+               "consequence of the three counters; positive = the old L1 "
+               "sum exceeds the budget)"),
+      ADD_STAT(e1ExcessRatio, statistics::units::Ratio::get(),
+               "Identity E1 as a ratio of the slot budget (= sum of the old "
+               "L1 FE+BS+Ret triple minus 1; equals -backendBound)"),
+      ADD_STAT(e2Residual, statistics::units::Count::get(),
+               "Identity E2 residual: dispatchedInsts - committedInsts - "
+               "(squashedCohort + liveAtClose - settledOutOfEpochRetired); "
+               "0 expected at every dump of a topdownV2 segment"),
+      ADD_STAT(bridgeB1AllocatedDelta, statistics::units::Count::get(),
+               "Bridge B1: topdownV2.snapshot.allocated - iew.dispatchedInsts "
+               "(0 at the ROI-end dump; nonzero in segments before any "
+               "snapshot)"),
+      ADD_STAT(bridgeB2CommittedDelta, statistics::units::Count::get(),
+               "Bridge B2: topdownV2.snapshot.retiredCohort + "
+               "topdownV2.settledOutOfEpochRetired - committedInsts "
+               "(0 at the ROI-end dump and after: commit is frozen "
+               "post-ROI-end)"),
+      ADD_STAT(bridgeB3BudgetDelta, statistics::units::Count::get(),
+               "Bridge B3: topdownV2.snapshot.slotBudget - "
+               "issueWidth*numCycles (0 at the ROI-end dump; the final dump "
+               "shows the documented drain-tail drift, roughly -2*W)"),
+      ADD_STAT(recoveryProxyOverlapSlots, statistics::units::Count::get(),
+               "H1 overlap proxy: slots of cycles with an open recovery "
+               "window, robSquashing over, fetch unblocked and zero "
+               "delivery (diagnostic only: no additivity, no main-cause "
+               "claim)"),
+      ADD_STAT(backendInOldRecoveryWindowSlots, statistics::units::Count::get(),
+               "H3 overlap proxy: slots of cycles with an open recovery "
+               "window, delivery resumed and zero commits (backend stalls "
+               "absorbed into the recovery window; diagnostic only)"),
+      ADD_STAT(squashBlindWindowSlots, statistics::units::Count::get(),
+               "H4 overlap proxy: slots of cycles between squash-signal "
+               "issue and robSquashing arrival at fetch (commitToFetchDelay), "
+               "unblocked fetch with zero delivery (diagnostic only)"),
+      ADD_STAT(cyclesDelivery0CommitGE1, statistics::units::Cycle::get(),
+               "H2 descriptive statistic: cycles with zero decode delivery "
+               "and >=1 commit (same-tick retire/FE0 double attribution; "
+               "description only — Nret cancels algebraically in E1)"),
+      ADD_STAT(overlapH1H3Cycles, statistics::units::Cycle::get(),
+               "Pairwise overlap: cycles where the H1 and H3 conditions "
+               "co-occur"),
+      ADD_STAT(overlapH1H4Cycles, statistics::units::Cycle::get(),
+               "Pairwise overlap: cycles where the H1 and H4 conditions "
+               "co-occur"),
+      ADD_STAT(overlapH3H4Cycles, statistics::units::Cycle::get(),
+               "Pairwise overlap: cycles where the H3 and H4 conditions "
+               "co-occur"),
+      ADD_STAT(overlapH1H3H4Cycles, statistics::units::Cycle::get(),
+               "Pairwise overlap: cycles where H1, H3 and H4 co-occur"),
+      cpu(cpu)
+{
+    const auto &iew_stats = cpu->iew.getIEWStats();
+    const auto &fetch_stats = cpu->fetch.getFetchStats();
+    const auto &commit_stats = cpu->commit.getCommitStats();
+    const auto budget = cpu->issueWidth * cpu->baseStats.numCycles;
+
+    // E1 (contract section 2.1): Nret cancels in the old L1 sum.
+    e1ExcessSlots = fetch_stats.fetchBubbles + iew_stats.dispatchedInsts +
+                     commit_stats.recovery_bubble - budget;
+    e1ExcessRatio = e1ExcessSlots / budget;
+
+    // E2 (section 2.2): cohort identity over the segment window.
+    e2Residual = iew_stats.dispatchedInsts -
+                  sum(cpu->cpuStats.committedInsts) -
+                  (cpu->topdownLedger->squashedCohort +
+                   cpu->topdownLedger->liveAtClose -
+                   cpu->topdownLedger->settledOutOfEpochRetired);
+
+    // B1/B2/B3 bridges (section 2.3): machine checks at the ROI-end dump.
+    bridgeB1AllocatedDelta =
+        cpu->topdownLedger->snapshotStats.allocated -
+        iew_stats.dispatchedInsts;
+    bridgeB2CommittedDelta =
+        cpu->topdownLedger->snapshotStats.retiredCohort +
+        cpu->topdownLedger->settledOutOfEpochRetired -
+        sum(cpu->cpuStats.committedInsts);
+    bridgeB3BudgetDelta =
+        cpu->topdownLedger->snapshotStats.slotBudget - budget;
+}
+
+void
+CPU::D4bDiagStats::closeCycle()
+{
+    const bool delivery0 = cpu->fetch.ledgerDeliveredThisCycle() == 0;
+    const bool commit_ge1 = cpu->commit.ledgerCommittedThisCycle() >= 1;
+    const bool recovery_active =
+        cpu->fetch.getFetchStats().anyRecoveryWindowActive();
+    const bool rob_squashing = cpu->fetch.ledgerRobSquashingSeen();
+
+    bool block_fetch_any = false;
+    for (ThreadID i = 0; i < cpu->numThreads; i++)
+        block_fetch_any = block_fetch_any || cpu->stallSig.blockFetch[i];
+
+    // H4 blind window: from squash-signal issue until robSquashing reaches
+    // fetch (commitToFetchDelay cycles), while fetch has not yet seen it.
+    const Tick last_squash = cpu->commit.ledgerLastSquashSignalTick();
+    const Cycles delay = cpu->fetch.getCommitToFetchDelay();
+    const bool blind_active = last_squash != 0 && !rob_squashing &&
+        (curTick() - last_squash) <
+            static_cast<Tick>(delay) * cpu->clockPeriod();
+
+    // Cycle conditions (operational proxies, contract section 2.4).
+    const bool h1 = recovery_active && !rob_squashing &&
+                    !block_fetch_any && delivery0;
+    const bool h3 = recovery_active && !delivery0 && !commit_ge1;
+    const bool h4 = blind_active && !block_fetch_any && delivery0;
+
+    if (h1)
+        recoveryProxyOverlapSlots += cpu->issueWidth;
+    if (h3)
+        backendInOldRecoveryWindowSlots += cpu->issueWidth;
+    if (h4)
+        squashBlindWindowSlots += cpu->issueWidth;
+    if (delivery0 && commit_ge1)
+        cyclesDelivery0CommitGE1++;
+    if (h1 && h3)
+        overlapH1H3Cycles++;
+    if (h1 && h4)
+        overlapH1H4Cycles++;
+    if (h3 && h4)
+        overlapH3H4Cycles++;
+    if (h1 && h3 && h4)
+        overlapH1H3H4Cycles++;
 }
 
 CPU::CPUStats::CPUStats(CPU *cpu)
@@ -765,6 +898,12 @@ CPU::tick()
     rename.tick();
     decode.tick();
     fetch.tick();
+
+    // D4-B d4bDiag per-cycle H-condition sampling: after every stage has
+    // run for this tick (evidence members are reset by each stage at its
+    // own tick start).  Statistics-only.
+    if (d4bDiagEnabled)
+        d4bDiagStats.closeCycle();
 
     // v2.7 §4.2: emit roi_begin/roi_end trace records at the end of the
     // request tick, after all pipeline stages have run, stamped with the

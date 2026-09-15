@@ -748,6 +748,16 @@ def addXiangshanTraceOptions(parser):
     # Decoupled branch predictor options for trace mode
     parser.add_argument('--trace-enable-decoupled-bp', action='store_true',
                        help='Enable decoupled branch predictor in trace mode')
+    # D4-B topdown ledger / overlap diagnostics (statistics-only groups;
+    # default off = original behavior)
+    parser.add_argument('--enable-d4b-topdown-ledger', action='store_true',
+                       help='Enable the D4-B dispatch-slot conservation '
+                            'ledger (topdownV2 stats group; observation-'
+                            'only, never feeds pipeline decisions)')
+    parser.add_argument('--enable-d4b-diag', action='store_true',
+                       help='Enable the D4-B d4bDiag overlap diagnostics '
+                            '(H1/H3/H4 counters + E1/E2/B1/B2/B3 machine-'
+                            'checked identities; evidence runs only)')
     parser.add_argument('--trace-checkpoint-interval', type=int, default=64,
                        help='Checkpoint interval for trace rollback (default: 64)')
     parser.add_argument('--trace-disable-bp-validation', action='store_true',

@@ -842,6 +842,60 @@ class CPU : public BaseCPU
     //difftest virtual function
     void readGem5Regs(ThreadID tid) override;
 
+    // ---- D4-B d4bDiag: overlap diagnostics + machine-checked ----
+    // ---- identities (statistics-only; default OFF) ----------------
+  public:
+    /**
+     * E1/E2 identities and B1/B2/B3 bridge formulas (contract sections
+     * 2.1-2.3) plus the H1/H3/H4 overlap counters (section 2.4, proxy
+     * semantics: no additivity, no "main cause" claims).  The formulas
+     * are machine checks over existing counters; the H counters sample
+     * per cycle through closeCycle() only when enable_d4b_diag is on.
+     */
+    struct D4bDiagStats : public statistics::Group
+    {
+        D4bDiagStats(CPU *cpu);
+
+        /** E1: fetchBubbles + dispatched + recovery_bubble - W*Cyc. */
+        statistics::Formula e1ExcessSlots;
+        /** E1 as a ratio of the slot budget. */
+        statistics::Formula e1ExcessRatio;
+        /** E2 residual: D - Nret - (Squashed + Live - PreIn); 0 expected. */
+        statistics::Formula e2Residual;
+        /** B1: snapshot.allocated - iew.dispatchedInsts (0 at ROI-end dump). */
+        statistics::Formula bridgeB1AllocatedDelta;
+        /** B2: snapshot.retiredCohort + settledOutOfEpochRetired
+         * - committedInsts (0 at ROI-end dump). */
+        statistics::Formula bridgeB2CommittedDelta;
+        /** B3: snapshot.slotBudget - issueWidth*numCycles (0 at ROI-end
+         * dump; seg3 shows the documented drain-tail drift). */
+        statistics::Formula bridgeB3BudgetDelta;
+
+        /** H1: recovery-window FE/BS double-billing overlap (slots). */
+        statistics::Scalar recoveryProxyOverlapSlots;
+        /** H3: backend stalls absorbed inside an open recovery window. */
+        statistics::Scalar backendInOldRecoveryWindowSlots;
+        /** H4: squash-signal to robSquashing-arrival blind window. */
+        statistics::Scalar squashBlindWindowSlots;
+        /** H2 (descriptive only): delivery-0 cycles with commits. */
+        statistics::Scalar cyclesDelivery0CommitGE1;
+        /** Pairwise overlap matrix (cycle counts; mutual exclusivity of
+         * the H-populations is a measured conclusion, not an input). */
+        statistics::Scalar overlapH1H3Cycles;
+        statistics::Scalar overlapH1H4Cycles;
+        statistics::Scalar overlapH3H4Cycles;
+        statistics::Scalar overlapH1H3H4Cycles;
+
+        /** Per-cycle H-condition sampling (CPU::tick end of stages). */
+        void closeCycle();
+
+      private:
+        CPU *cpu;
+    } d4bDiagStats;
+
+    /** enable_d4b_diag param (default false; evidence runs enable it). */
+    bool d4bDiagEnabled = false;
+
   private:
     /** Value predictor */
     valuepred::VPUnit *valuePred;

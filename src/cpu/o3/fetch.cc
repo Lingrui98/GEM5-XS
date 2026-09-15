@@ -3721,6 +3721,10 @@ Fetch::initializeTickState()
     wroteToTimeBuffer = false;
     setAllFetchStalls(StallReason::NoStall);
 
+    // D4-B d4bDiag evidence (statistics-only; reset at tick start).
+    ledgerDeliveredToDecode_ = 0;
+    ledgerRobSquashingAtFetch_ = false;
+
     // get the distribution of fetch status
     fetchStats.fetchStatusDist[fetchStatus[0]]++;
 
@@ -3749,6 +3753,10 @@ Fetch::initializeTickState()
         if (fromCommit->commitInfo[tid].emptyROB) {
             waitForVsetvl[tid] = false;
         }
+        // D4-B d4bDiag evidence: the fetch-side view of robSquashing this
+        // tick (lagged wire; H1/H4 overlap diagnostics).
+        ledgerRobSquashingAtFetch_ = ledgerRobSquashingAtFetch_ ||
+            fromCommit->commitInfo[tid].robSquashing;
     }
 
     handleIEWSignals();
@@ -4077,6 +4085,10 @@ Fetch::sendInstructionsToDecode()
     updateStallReasons(total_insts_to_decode, primary_tid);
     fetchStats.decodeThreadsPerCycle.sample(selected_tids.size());
     fetchStats.instsSentToDecodePerCycle.sample(total_insts_to_decode);
+
+    // D4-B d4bDiag evidence: instructions delivered to decode this tick
+    // (the H1/H3/H2 overlap diagnostics' delivery signal).
+    ledgerDeliveredToDecode_ = static_cast<unsigned>(total_insts_to_decode);
 
     // D4-A R3/R4: delivering >= 1 instruction to decode for this tid is
     // the end condition of any open frontend window (BTB-miss redirect
