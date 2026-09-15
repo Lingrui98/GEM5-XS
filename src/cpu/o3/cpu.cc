@@ -591,7 +591,11 @@ CPU::D4bDiagStats::closeCycle()
     // window (MAIN_HOOK_REVIEW) and is removed; delivery>0/commit==0 is
     // not backend evidence and never appears in these predicates.
     const bool old_window_active = cpu->commit.ledgerOldWindowActive();
-    const unsigned charge_interval =
+    // 64-bit width end to end: a single charged interval can exceed
+    // 2^32 cycles, and interval * issueWidth must be a 64-bit product
+    // (a uint32 interval would wrap in the multiply before ever
+    // reaching the stats counters' 2^53 exact-integer domain).
+    const uint64_t charge_interval =
         cpu->commit.ledgerOldChargeWindowCyclesThisCycle();
     const unsigned charge_count =
         cpu->commit.ledgerOldChargeCountThisCycle();
@@ -602,7 +606,7 @@ CPU::D4bDiagStats::closeCycle()
         oldRecoveryChargeWindowCharges += charge_count;
         oldRecoveryChargeWindowCycles += charge_interval;
         oldRecoveryChargeWindowSlots +=
-            charge_interval * cpu->issueWidth;
+            charge_interval * static_cast<uint64_t>(cpu->issueWidth);
     }
     if (h3_open) {
         oldRecoveryChargeWindowOpenCycles++;

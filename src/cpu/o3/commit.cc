@@ -1644,9 +1644,14 @@ Commit::commitInsts()
                         // cycle and each may close a window; a same-cycle
                         // close charges a zero-length interval), so the
                         // per-tick sum matches recovery_bubble's increment
-                        // exactly (H3_MAPPING.md section 1).
+                        // exactly (H3_MAPPING.md section 1).  64-bit
+                        // width: a charged interval can exceed 2^32
+                        // cycles; the OLD recovery_bubble arithmetic
+                        // above already computes it in uint64
+                        // (curCycle - lastCommitCycle), so the mirror
+                        // must not truncate it back to 32 bits.
                         ledgerOldChargeWindowCyclesThisCycle_ +=
-                            static_cast<unsigned>(
+                            static_cast<uint64_t>(
                                 cpu->curCycle() - lastCommitCycle[tid]);
                         ledgerOldChargeCountThisCycle_++;
                     }
