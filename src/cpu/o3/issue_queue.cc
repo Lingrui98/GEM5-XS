@@ -19,6 +19,7 @@
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/inst_queue.hh"
+#include "cpu/o3/topdown_stats_helpers.hh"
 #include "cpu/reg_class.hh"
 #include "debug/Counters.hh"
 #include "debug/Dispatch.hh"
@@ -1305,25 +1306,20 @@ Scheduler::issueAndSelect()
     }
     if (instsToFu.size() == 0) {
         int misslevel = lsq->anyInflightLoadsNotComplete();
-        if (misslevel != 0)
+        // Cumulative ("at least level k in flight") classification; the
+        // bit encoding and the semantics live in the production helper
+        // tdstats::classifyMisslevel (bit0..2 = missed level 1..3, bit3 =
+        // any outstanding; depth==k necessarily missed every level below
+        // it), linked directly by the unit tests.
+        const tdstats::MisslevelCharge c =
+            tdstats::classifyMisslevel(misslevel);
+        if (c.any_load)
             stats.memstall_any_load++;
-        // misslevel bit encoding (LSQ::anyInflightLoadsNotComplete, lsq.cc):
-        //   bit0 set = an inflight load has missed cache level 1 (depth==1),
-        //   bit1 set = an inflight load has missed cache level 2 (depth==2),
-        //   bit2 set = an inflight load has missed cache level 3 (depth==3),
-        //   bit3 set = any outstanding miss.
-        // depth==k means the request has already missed cache level k (each
-        // cache-level miss bumps Request::depth once), so a level-k miss
-        // necessarily missed every level below it.  Count with cumulative
-        // ("at least level k in flight") semantics:
-        //   l1miss: any depth>=1 miss in flight  (any of bits 0..2 set)
-        //   l2miss: any depth>=2 miss in flight  (bit1 or bit2 set)
-        //   l3miss: any depth>=3 miss in flight  (bit2 set)
-        if (misslevel & 0x7)
+        if (c.l1)
             stats.memstall_l1miss++;
-        if (misslevel & 0x6)
+        if (c.l2)
             stats.memstall_l2miss++;
-        if (misslevel & 0x4)
+        if (c.l3)
             stats.memstall_l3miss++;
     } else if (instsToFu.size() < intel_fewops) {
         if (lsq->anyStoreNotExecute())

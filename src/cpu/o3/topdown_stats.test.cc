@@ -1,14 +1,27 @@
 // Unit tests for the D4-A topdown statistics fixes (batch 1: R1/R2/R6/R7).
 //
 // These tests exercise the *decision logic* of each statistics-accounting
-// fix as pure functions, deliberately avoiding a full gem5 simulation build,
-// following the self-contained pattern of trace_mode_regression.test.cc
-// (commit 4433a5a60b).  All logic is duplicated inline so that the test is
-// self-contained; each part is annotated with the production source it
-// guards so that drift can be detected by inspection.
+// fix, deliberately avoiding a full gem5 simulation build, following the
+// self-contained pattern of trace_mode_regression.test.cc (commit
+// 4433a5a60b).
 //
-// NOTE: No production files are modified by this test.  If the production
-//       logic changes, the inlined copies here must be updated in lockstep.
+// DIRECT-LINK STATUS (D4-B contract section 5a: an inline copy model is
+// not a verification of production; see
+// btb_prefetch_paper/.local/btb-morphology-spike-20260910/
+// d4b-implementation/production/coverage/TEST_REFACTOR_SCOPE.md):
+//   - R1, R3, R4, R7: the decision logic now lives in the PRODUCTION
+//     header cpu/o3/topdown_stats_helpers.hh and the production call
+//     sites (fetch.cc/decode.cc/issue_queue.cc) call it; the models
+//     below are thin adapters over those production functions, so these
+//     tests execute the production code paths directly.
+//   - R2, R6: gem5 Formula-DSL composition sites (cpu.cc/fetch.cc/
+//     commit.cc ADD_STAT expressions).  Extraction would change the stat
+//     evaluation machinery; the fixed/legacy formula models remain with
+//     a deferred-scope annotation.
+//   - R5: event-site accounting discipline (which call sites increment
+//     which counters) — there is no decision function to extract; the
+//     sequence models remain, guarded at full-sim scale by the A/B
+//     stats diff gates.
 //
 // Build (NULL ISA):
 //   scons build/NULL/cpu/o3/topdown_stats.test.opt --unit-test -j$(nproc)
@@ -18,6 +31,12 @@
 #include <gtest/gtest.h>
 
 #include <vector>
+
+#include "cpu/o3/topdown_stats_helpers.hh"
+
+using gem5::o3::tdstats::countsAsBtbMissResteer;
+using gem5::o3::tdstats::predBtbHitSnapshot;
+using gem5::o3::tdstats::SelfSquashTrigger;
 
 // ===========================================================================
 // PART R1 — cycle-level frontend-bubble attribution (empty-queue path)
@@ -63,41 +82,40 @@ struct BubbleDelta
     long fetchBubbles_max = 0;
 };
 
-// Exact reimplementation of Fetch::measureFrontendBubbles (fetch.cc):
-// per-thread accounting, gated on !blockFetch && !robSquashing.
+// PRODUCTION-DIRECTED (R1): these adapters forward to the production
+// helpers in cpu/o3/topdown_stats_helpers.hh — the same functions
+// fetch.cc's measureFrontendBubbles / measureFrontendBubblesEmptyQueueCycle
+// call — so every test below exercises the production decision logic.
+
+BubbleDelta
+fromProduction(const gem5::o3::tdstats::FrontendBubbleDelta &d)
+{
+    return BubbleDelta{d.fetchBubbles, d.fetchBubblesMax};
+}
+
 BubbleDelta
 measureFrontendBubblesFake(unsigned insts_to_decode,
                            const FakeThreadState &t,
                            unsigned decode_width)
 {
-    BubbleDelta d;
-    if (!t.blockFetch && !t.robSquashing) {
-        const int unused_slots =
-            static_cast<int>(decode_width) - static_cast<int>(insts_to_decode);
-        if (unused_slots > 0) {
-            d.fetchBubbles = unused_slots;
-            if (unused_slots == static_cast<int>(decode_width)) {
-                d.fetchBubbles_max = 1;
-            }
-        }
-    }
-    return d;
+    return fromProduction(gem5::o3::tdstats::accountFrontendBubblesPerThread(
+        {t.blockFetch, t.robSquashing}, insts_to_decode, decode_width));
 }
 
-// Exact reimplementation of Fetch::measureFrontendBubblesEmptyQueueCycle
-// (fetch.cc, added by this fix): cycle-level aggregate; charges one
-// full-width bubble iff some thread is both unblocked and outside squash
-// recovery; returns after the first charge (no double counting).
 BubbleDelta
 measureFrontendBubblesEmptyQueueCycleFake(
     const std::vector<FakeThreadState> &threads, unsigned decode_width)
 {
+    std::vector<gem5::o3::tdstats::FrontendThreadCycleState> states;
+    states.reserve(threads.size());
     for (const auto &t : threads) {
-        if (!t.blockFetch && !t.robSquashing) {
-            return BubbleDelta{static_cast<long>(decode_width), 1};
-        }
+        states.push_back({t.blockFetch, t.robSquashing});
     }
-    return BubbleDelta{0, 0};
+    return fromProduction(gem5::o3::tdstats::
+                              accountFrontendBubblesEmptyQueueCycle(
+                                  states.data(),
+                                  static_cast<unsigned>(states.size()),
+                                  decode_width));
 }
 
 // Exact reimplementation of the cycle-level path selection in
@@ -344,6 +362,13 @@ TEST(G4bDownstreamBlocked, NoFrontendBubblesCharged)
 namespace
 {
 
+// DEFERRED DIRECT-LINK (see TEST_REFACTOR_SCOPE.md): these are gem5
+// Formula-DSL composition sites (cpu.cc O3CPUStats / fetch.cc
+// FetchStatGroup ADD_STAT expressions); extracting them would change the
+// stat evaluation machinery.  The fixed/legacy models below pin the
+// composed expressions so drift is still detected by inspection, and the
+// numeric behavior is guarded at full-sim scale by the A/B stats gates.
+
 // Fixed cpu.cc formula for frontendLatencyBound.
 double
 frontendLatencyBoundFixed(long fetch_bubbles_max, double decode_width,
@@ -470,6 +495,11 @@ TEST(G6Budget, LatencyNeverExceedsFrontendAcrossMixes)
 namespace
 {
 
+// DEFERRED DIRECT-LINK (see TEST_REFACTOR_SCOPE.md): totalSquash is a
+// gem5 Formula (commit.cc CommitStatGroup ADD_STAT expression); the
+// models below pin its operand list (the R6 guard: the value-prediction
+// term must be present).
+
 // Fixed commit.cc formula.
 long
 totalSquashFixed(long branch, long order_violation, long value_prediction,
@@ -559,13 +589,15 @@ struct MemstallDelta
     int l3miss = 0;
 };
 
-// Fixed issue_queue.cc decisions (cumulative semantics).
+// PRODUCTION-DIRECTED (R7): the cumulative decision is
+// tdstats::classifyMisslevel (topdown_stats_helpers.hh) — the function
+// issue_queue.cc's issueAndSelect calls.  The adapter only reshapes the
+// booleans into the MemstallDelta counters the tests assert on.
 MemstallDelta
 memstallDecisionFixed(int misslevel)
 {
-    return MemstallDelta{(misslevel & 0x7) ? 1 : 0,
-                         (misslevel & 0x6) ? 1 : 0,
-                         (misslevel & 0x4) ? 1 : 0};
+    const auto c = gem5::o3::tdstats::classifyMisslevel(misslevel);
+    return MemstallDelta{c.l1 ? 1 : 0, c.l2 ? 1 : 0, c.l3 ? 1 : 0};
 }
 
 // Pre-fix (legacy) issue_queue.cc decisions: exact-mask equality on the
@@ -733,59 +765,36 @@ struct FakeBTBEntry
     uint64_t pc = 0;
 };
 
-// Exact replica of the fetch-time snapshot predicate (fetch.cc,
-// Fetch::lookupAndUpdateNextPC): PC membership among valid entries.
-bool
-predBtbHitSnapshot(uint64_t pc, const std::vector<FakeBTBEntry> &entries)
-{
-    for (const auto &entry : entries) {
-        if (entry.valid && entry.pc == pc) {
-            return true;
-        }
-    }
-    return false;
-}
+// The snapshot predicate is the PRODUCTION template
+// tdstats::predBtbHitSnapshot (topdown_stats_helpers.hh; the fetch.cc
+// lookupAndUpdateNextPC site calls it) — FakeBTBEntry mirrors the
+// BTBEntry {valid, pc} surface it consumes.
 
 // The three Decode::selfSquash trigger points (decode.cc):
 //   trigger 1 ~@719  readPredTaken() && !isControl()        (false-hit)
 //   trigger 2 ~@774  direct ctrl, target != readPredTarg()
 //   trigger 3 ~@836  isReturn() && !readPredTaken()         (RAS fixup)
-enum class SelfSquashTrigger
-{
-    FalseHitNonControl,
-    DirectTargetMismatch,
-    ReturnRasFixup,
-};
+// The classification is the PRODUCTION function
+// tdstats::countsAsBtbMissResteer (topdown_stats_helpers.hh; the
+// decode.cc trigger-2/trigger-3 sites call it).  Trigger 1 has no
+// counting hook: a predicted-taken match implies the PC matched a taken
+// predBTBEntry, so predBtbHit is necessarily true and the row is never a
+// BTB miss.
 
-// Exact replica of the decode-side event classification (decode.cc,
-// trigger points 2 and 3: `if (!inst->readPredBtbHit())
-// fetch_ptr->countBtbMissResteer();`).  Trigger 1 has no counting hook:
-// a predicted-taken match implies the PC matched a taken predBTBEntry, so
-// predBtbHit is necessarily true and the row is never a BTB miss.
-bool
-countsAsBtbMissResteer(SelfSquashTrigger trigger, bool pred_btb_hit)
-{
-    switch (trigger) {
-    case SelfSquashTrigger::FalseHitNonControl:
-        return false;
-    case SelfSquashTrigger::DirectTargetMismatch:
-    case SelfSquashTrigger::ReturnRasFixup:
-        return !pred_btb_hit;
-    }
-    return false;  // unreachable
-}
-
-// Per-tid redirect window machine: exact replica of
-// Fetch::FetchStatGroup::{openBtbMissWindow, closeBtbMissWindow,
-// resetStats} (fetch.cc) driven through the per-tick hook ordering of
-// Fetch::tick -> initializeTickState (checkSignalsAndUpdate:
-// handleCommitSignals then handleDecodeSquash) then
-// fetchAndProcessInstructions (sendInstructionsToDecode).
+// Per-tid redirect window machine: the interval/overlap/discard rules
+// are the PRODUCTION tdstats::RedirectWindow (topdown_stats_helpers.hh;
+// fetch.cc's FetchStatGroup::{openBtbMissWindow, closeBtbMissWindow,
+// resetStats} drive exactly this machine), sequenced here through the
+// per-tick hook ordering of Fetch::tick -> initializeTickState
+// (checkSignalsAndUpdate: handleCommitSignals then handleDecodeSquash)
+// then fetchAndProcessInstructions (sendInstructionsToDecode).
 struct BtbMissWindowMachine
 {
-    // Window state (fetch.cc FetchStatGroup::btbMissWindow[tid]).
+    // PRODUCTION window state (fetch.cc FetchStatGroup::btbMissWindow[tid]
+    // is a tdstats::RedirectWindow).
+    gem5::o3::tdstats::RedirectWindow window;
+    // Mirror of window.active for the test assertions.
     bool active = false;
-    long start = 0;
 
     // Charged counters (reset together by the stats reset).
     long btbMissResteers = 0;         // events (classified in decode)
@@ -797,27 +806,23 @@ struct BtbMissWindowMachine
     // handleDecodeSquash on the following tick).
     bool prev_tick_squash = false;
 
-    // Replica of FetchStatGroup::closeBtbMissWindow.
+    // Same binding as FetchStatGroup::closeBtbMissWindow (the helper's
+    // returned elapsed charge feeds the btbMissResteerCycles counter).
     void
     close()
     {
-        if (!active) {
-            return;
-        }
-        const long elapsed = cur_cycle - start;
-        if (elapsed > 0) {
-            btbMissResteerCycles += elapsed;
-        }
-        active = false;
+        btbMissResteerCycles += window.close(cur_cycle);
+        active = window.active;
     }
 
-    // Replica of FetchStatGroup::openBtbMissWindow (overlap rule).
+    // Same binding as FetchStatGroup::openBtbMissWindow: the helper's
+    // open() implements the overlap rule (close-then-open) and returns
+    // the embedded close's charge, which binds to the counter.
     void
     open()
     {
-        close();
-        active = true;
-        start = cur_cycle;
+        btbMissResteerCycles += window.open(cur_cycle);
+        active = window.active;
     }
 
     // Events visible to fetch within one tick, in processing order.
@@ -871,7 +876,7 @@ struct BtbMissWindowMachine
     }
 
     // Stats-reset ROI boundary (fetch.cc FetchStatGroup::resetStats):
-    // the reset zeroes the counters and truncates an open window WITHOUT
+    // the reset zeroes the counters and discards an open window WITHOUT
     // charging it — no window is billed across the boundary.  Pipeline
     // state (prev_tick_squash) survives: the reset only clears statistics.
     void
@@ -879,6 +884,7 @@ struct BtbMissWindowMachine
     {
         btbMissResteers = 0;
         btbMissResteerCycles = 0;
+        window.discard();
         active = false;
     }
 };
@@ -1187,18 +1193,20 @@ TEST(R3WindowSmt, IndependentPerTidWindows)
 namespace
 {
 
-// Full per-tid window machine replica (R3 BTB-miss window + R4 recovery
-// window), mirroring the FetchStatGroup helpers (fetch.cc) and the per-tick
-// hook ordering of Fetch::tick (handleCommitSignals -> handleDecodeSquash
-// -> sendInstructionsToDecode).
+// Full per-tid window machine (R3 BTB-miss window + R4 recovery window):
+// both windows are the PRODUCTION tdstats::RedirectWindow
+// (topdown_stats_helpers.hh; fetch.cc's FetchStatGroup drives exactly
+// these machines), sequenced here through the per-tick hook ordering of
+// Fetch::tick (handleCommitSignals -> handleDecodeSquash ->
+// sendInstructionsToDecode).
 struct FrontendWindowMachine
 {
-    // R3 window.
+    // R3 window (production state; btb_active is the assertion mirror).
+    gem5::o3::tdstats::RedirectWindow btb_window;
     bool btb_active = false;
-    long btb_start = 0;
-    // R4 window.
+    // R4 window (production state; rec_active is the assertion mirror).
+    gem5::o3::tdstats::RedirectWindow rec_window;
     bool rec_active = false;
-    long rec_start = 0;
 
     long btbMissResteerCycles = 0;
     long frontendRecoveryCycles = 0;
@@ -1211,44 +1219,33 @@ struct FrontendWindowMachine
     void
     close_btb()
     {
-        if (!btb_active) {
-            return;
-        }
-        const long elapsed = cur_cycle - btb_start;
-        if (elapsed > 0) {
-            btbMissResteerCycles += elapsed;
-        }
-        btb_active = false;
+        btbMissResteerCycles += btb_window.close(cur_cycle);
+        btb_active = btb_window.active;
     }
 
     void
     open_btb()
     {
-        close_btb();
-        btb_active = true;
-        btb_start = cur_cycle;
+        btbMissResteerCycles += btb_window.open(cur_cycle);
+        btb_active = btb_window.active;
     }
 
     void
     close_rec()
     {
-        if (!rec_active) {
-            return;
-        }
-        const long elapsed = cur_cycle - rec_start;
-        if (elapsed > 0) {
-            frontendRecoveryCycles += elapsed;
-            frontendRecoverySlots += elapsed * decode_width;
-        }
-        rec_active = false;
+        const long elapsed = rec_window.close(cur_cycle);
+        frontendRecoveryCycles += elapsed;
+        frontendRecoverySlots += elapsed * decode_width;
+        rec_active = rec_window.active;
     }
 
     void
     open_rec()
     {
-        close_rec();
-        rec_active = true;
-        rec_start = cur_cycle;
+        const long elapsed = rec_window.open(cur_cycle);
+        frontendRecoveryCycles += elapsed;
+        frontendRecoverySlots += elapsed * decode_width;
+        rec_active = rec_window.active;
     }
 
     struct TickEvents
@@ -1301,6 +1298,8 @@ struct FrontendWindowMachine
         btbMissResteerCycles = 0;
         frontendRecoveryCycles = 0;
         frontendRecoverySlots = 0;
+        btb_window.discard();
+        rec_window.discard();
         btb_active = false;
         rec_active = false;
     }
