@@ -1340,18 +1340,21 @@ IEW::recordThreadSquash(ThreadID tid)
  * Single-thread domain: per-thread scans OR the flags (identical to the
  * tid-0 sample when numThreads == 1; multi-thread is explicitly
  * unsupported and the raw counters are debug-only).
+ *
+ * Chain hops are PER-SLOT VECTORS (rename.cc:433-440 propagates the
+ * upstream per-slot reasons slot-by-slot; a delivered slot carries
+ * NoStall while the tail keeps the upstream causes).  They are folded
+ * with the production helper foldChainHop: same-hop heterogeneity
+ * becomes the kChainMixedStall sentinel (ambiguity -> Unknown), and
+ * the distinct-reason multiset is kept losslessly in *UpReasons for
+ * the audit export.  The previous firstNonNoStall fold discarded the
+ * rest of the vector -- swapping [IcacheStall, ROBFull] changed the
+ * selected cause (information loss, MAIN_HOOK_REVIEW finding 2).
  */
 void
 IEW::ledgerAccountCycle()
 {
     namespace td = ::gem5::o3;
-
-    auto firstNonNoStall = [](const std::vector<StallReason> &v) {
-        for (StallReason r : v)
-            if (r != StallReason::NoStall)
-                return r;
-        return StallReason::NoStall;
-    };
 
     td::DispatchCycleInputs in;
     in.budget = renameWidth;               // W_C4 (supported same-width domain)
@@ -1377,9 +1380,15 @@ IEW::ledgerAccountCycle()
                               fromCommit->commitInfo[i].robSquashing;
     }
 
-    in.renameUp = firstNonNoStall(fromRename->renameStallReason);
-    in.decodeUp = firstNonNoStall(fromRename->decodeStallReason);
-    in.fetchUp = firstNonNoStall(fromRename->fetchStallReason);
+    const auto renameEv = td::foldChainHop(fromRename->renameStallReason);
+    const auto decodeEv = td::foldChainHop(fromRename->decodeStallReason);
+    const auto fetchEv = td::foldChainHop(fromRename->fetchStallReason);
+    in.renameUp = renameEv.representative;
+    in.decodeUp = decodeEv.representative;
+    in.fetchUp = fetchEv.representative;
+    in.renameUpReasons = renameEv.reasonsMask;
+    in.decodeUpReasons = decodeEv.reasonsMask;
+    in.fetchUpReasons = fetchEv.reasonsMask;
 
     cpu->ledger()->accountCycle(in);
 }

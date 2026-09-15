@@ -758,6 +758,12 @@ def addXiangshanTraceOptions(parser):
                        help='Enable the D4-B d4bDiag overlap diagnostics '
                             '(H1/H3/H4 counters + E1/E2/B1/B2/B3 machine-'
                             'checked identities; evidence runs only)')
+    parser.add_argument('--d4b-topdown-audit-export', default='',
+                       metavar='PATH',
+                       help='Write the D4-B lossless-tuple audit export '
+                            '(topdownV2_audit.json, d4b-audit-export-v1) '
+                            'to PATH; requires --enable-d4b-topdown-ledger '
+                            '(empty = no export, default)')
     parser.add_argument('--trace-checkpoint-interval', type=int, default=64,
                        help='Checkpoint interval for trace rollback (default: 64)')
     parser.add_argument('--trace-disable-bp-validation', action='store_true',
