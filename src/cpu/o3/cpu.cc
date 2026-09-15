@@ -588,11 +588,13 @@ CPU::D4bDiagStats::closeCycle()
     const bool old_window_active = cpu->commit.ledgerOldWindowActive();
     const unsigned charge_interval =
         cpu->commit.ledgerOldChargeWindowCyclesThisCycle();
+    const unsigned charge_count =
+        cpu->commit.ledgerOldChargeCountThisCycle();
     const bool h3_open = old_window_active && !commit_ge1;
     const bool h4 = blind_active && !block_fetch_any && delivery0;
 
-    if (charge_interval > 0) {
-        oldRecoveryChargeWindowCharges++;
+    if (charge_count > 0) {
+        oldRecoveryChargeWindowCharges += charge_count;
         oldRecoveryChargeWindowCycles += charge_interval;
         oldRecoveryChargeWindowSlots +=
             charge_interval * cpu->issueWidth;

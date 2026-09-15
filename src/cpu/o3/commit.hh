@@ -467,12 +467,15 @@ class Commit
      * tick-start snapshot is the whole-tick truth.
      */
     bool ledgerOldWindowActive_ = false;
-    /** Interval (cycles) closed by this tick's first charge, i.e.
-     *  (curCycle - lastCommitCycle) captured at the recovery_bubble
-     *  charge site before lastCommitCycle updates.  0 = no charge this
-     *  tick.  Only the FIRST commit of a tick can charge (ismispred is
-     *  consumed at the first charge). */
+    /** Total intervals (cycles) charged by THIS tick's charge events,
+     *  summed: several commits can retire in one cycle and each may
+     *  close a window (a same-cycle close charges a zero-length
+     *  interval); the sum matches the per-tick slice of
+     *  recovery_bubble's increment exactly.  0 = no charge this tick. */
     unsigned ledgerOldChargeWindowCyclesThisCycle_ = 0;
+    /** Number of charge events this tick (every charge adds one, even
+     *  when its interval is zero). */
+    unsigned ledgerOldChargeCountThisCycle_ = 0;
 
   public:
     /** d4bDiag evidence getter (per-cycle commit successes). */
@@ -484,10 +487,13 @@ class Commit
     /** d4bDiag H3 evidence: ismispred latch at tick start (the old
      *  recovery_bubble charging window is open). */
     bool ledgerOldWindowActive() const { return ledgerOldWindowActive_; }
-    /** d4bDiag H3 evidence: interval closed by this tick's charge (0 if
-     *  no charge this tick). */
+    /** d4bDiag H3 evidence: sum of the intervals charged this tick
+     *  (0 if no charge this tick). */
     unsigned ledgerOldChargeWindowCyclesThisCycle() const
     { return ledgerOldChargeWindowCyclesThisCycle_; }
+    /** d4bDiag H3 evidence: number of charge events this tick. */
+    unsigned ledgerOldChargeCountThisCycle() const
+    { return ledgerOldChargeCountThisCycle_; }
 
   private:
 
