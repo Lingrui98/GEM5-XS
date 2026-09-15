@@ -458,6 +458,9 @@ class Commit
     /** Last tick at which a commit-side squash signal was written (H4
      *  blind-window diagnostic; 0 = never). */
     Tick ledgerLastSquashSignalTick_ = 0;
+    /** Last tick at which any instruction committed (H3 commit-interval
+     *  diagnostic; 0 = never). */
+    Tick ledgerLastCommitTick_ = 0;
 
   public:
     /** d4bDiag evidence getter (per-cycle commit successes). */
@@ -466,6 +469,8 @@ class Commit
     /** d4bDiag evidence getter (last commit-side squash signal tick). */
     Tick ledgerLastSquashSignalTick() const
     { return ledgerLastSquashSignalTick_; }
+    /** d4bDiag evidence getter (last commit tick). */
+    Tick ledgerLastCommitTick() const { return ledgerLastCommitTick_; }
 
   private:
 

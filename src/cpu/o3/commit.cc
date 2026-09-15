@@ -1330,6 +1330,7 @@ Commit::commitInsts()
                 if (commit_success) {
                     // D4-B d4bDiag evidence (statistics-only).
                     ledgerCommittedThisCycle_++;
+                    ledgerLastCommitTick_ = curTick();
                     cpu->perfCCT->updateInstPos(head_inst->seqNum,
                                                 PerfRecord::AtCommit);
                     auto res = head_inst->getResult();
