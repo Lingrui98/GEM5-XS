@@ -726,6 +726,9 @@ Commit::squashAll(ThreadID tid)
     // Send back the squash signal to tell stages that they should
     // squash.
     toIEW->commitInfo[tid].squash = true;
+    // D4-B d4bDiag evidence: squash initiation tick for the H4 blind-
+    // window diagnostic (statistics-only).
+    ledgerLastSquashSignalTick_ = curTick();
 
     // Send back the rob squashing signal so other stages know that
     // the ROB is in the process of squashing.
@@ -853,6 +856,10 @@ Commit::tick()
 {
     wroteToTimeBuffer = false;
     _nextStatus = Inactive;
+
+    // D4-B d4bDiag evidence (reset before any early return so every tick
+    // samples a full cycle; statistics-only, never a decision input).
+    ledgerCommittedThisCycle_ = 0;
 
     if (activeThreads->empty())
         return;
@@ -1113,6 +1120,8 @@ Commit::commit()
             toIEW->commitInfo[tid].doneMemSeqNum = squashed_inst;
 
             toIEW->commitInfo[tid].squash = true;
+            // D4-B d4bDiag evidence (squash initiation tick, H4).
+            ledgerLastSquashSignalTick_ = curTick();
 
             // Send back the rob squashing signal so other stages know that
             // the ROB is in the process of squashing.
@@ -1319,6 +1328,8 @@ Commit::commitInsts()
                                                 num_committed_per_thread[tid]);
 
                 if (commit_success) {
+                    // D4-B d4bDiag evidence (statistics-only).
+                    ledgerCommittedThisCycle_++;
                     cpu->perfCCT->updateInstPos(head_inst->seqNum,
                                                 PerfRecord::AtCommit);
                     auto res = head_inst->getResult();

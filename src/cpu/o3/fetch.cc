@@ -3466,6 +3466,10 @@ Fetch::initializeTickState()
     wroteToTimeBuffer = false;
     setAllFetchStalls(StallReason::NoStall);
 
+    // D4-B d4bDiag evidence (statistics-only; reset at tick start).
+    ledgerDeliveredToDecode_ = 0;
+    ledgerRobSquashingAtFetch_ = false;
+
     // get the distribution of fetch status
     fetchStats.fetchStatusDist[fetchStatus[0]]++;
 
@@ -3480,6 +3484,10 @@ Fetch::initializeTickState()
         if (fromCommit->commitInfo[tid].emptyROB) {
             waitForVsetvl[tid] = false;
         }
+        // D4-B d4bDiag evidence: the fetch-side view of robSquashing this
+        // tick (lagged wire; H1/H4 overlap diagnostics).
+        ledgerRobSquashingAtFetch_ = ledgerRobSquashingAtFetch_ ||
+            fromCommit->commitInfo[tid].robSquashing;
     }
 
     DPRINTF(Fetch, "Running stage.\n");
@@ -3678,6 +3686,10 @@ Fetch::sendInstructionsToDecode()
     if (insts_to_decode == 0) {
         profileStall(tid);
     }
+
+    // D4-B d4bDiag evidence: instructions delivered to decode this tick
+    // (the H1/H3/H2 overlap diagnostics' delivery signal).
+    ledgerDeliveredToDecode_ = static_cast<unsigned>(insts_to_decode);
 
     // Intel TopDown method for measuring frontend bubbles
     measureFrontendBubbles(insts_to_decode, tid);

@@ -1310,6 +1310,10 @@ class Fetch
     bool btbpRoiDrainExitRequested = false;
     Tick btbpRoiDrainBeginTick = 0;
 
+    // ---- D4-B d4bDiag evidence (stats-only; reset each tick) ----------
+    unsigned ledgerDeliveredToDecode_ = 0;
+    bool ledgerRobSquashingAtFetch_ = false;
+
     /**
      * Check if the thread can fetch instructions
      * @param tid Thread ID
@@ -1588,6 +1592,18 @@ class Fetch
         FrontendWindow recoveryWindow[MaxThreads];
 
         /**
+         * D4-B d4bDiag evidence (stats-only): whether any per-tid recovery
+         * window is open (H1/H3 overlap diagnostics).
+         */
+        bool anyRecoveryWindowActive() const
+        {
+            for (const auto &w : recoveryWindow)
+                if (w.active)
+                    return true;
+            return false;
+        }
+
+        /**
          * R3: close the per-tid BTB-miss window if open, charging the
          * elapsed cycles to btbMissResteerCycles.  Closing happens on the
          * first delivery to decode for the tid, on a newer redirect
@@ -1641,6 +1657,16 @@ public:
      * input anywhere.
      */
     bool inBtbpRoiDrainMode() const { return btbpRoiDrainMode; }
+
+    /**
+     * D4-B d4bDiag evidence getters (stats-only; reset at tick start).
+     * Delivery count is instructions handed to decode this tick; the
+     * robSquashing view is what fetch saw on the lagged commit wire.
+     */
+    unsigned ledgerDeliveredThisCycle() const { return ledgerDeliveredToDecode_; }
+    bool ledgerRobSquashingSeen() const { return ledgerRobSquashingAtFetch_; }
+    /** commitToFetchDelay (H4 blind-window bound). */
+    Cycles getCommitToFetchDelay() const { return commitToFetchDelay; }
 
     /**
      * D4-A R3: count one BTB-miss decode-redirect event.  Called from

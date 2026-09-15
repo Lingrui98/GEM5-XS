@@ -44,6 +44,12 @@ def extract_btbp_trace_out(argv):
 def setKmhV3Params(args, system):
     for cpu in system.cpu:
 
+        # D4-B statistics-only groups (default off; explicit opt-in).
+        cpu.enable_d4b_topdown_ledger = bool(
+            getattr(args, 'enable_d4b_topdown_ledger', False))
+        cpu.enable_d4b_diag = bool(
+            getattr(args, 'enable_d4b_diag', False))
+
         # fetch (idealfetch not care)
         cpu.mmu.itb.size = 96
         cpu.fetchWidth = 32

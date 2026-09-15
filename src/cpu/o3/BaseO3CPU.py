@@ -152,6 +152,13 @@ class BaseO3CPU(BaseCPU):
         "statistical group). Statistics-only: no output feeds any pipeline "
         "decision. The unsupported domain (SMT / enableDispatchStage / "
         "decodeWidth != renameWidth) reports ledgerState=1 with NaN ratios.")
+    enable_d4b_diag = Param.Bool(False,
+        "Enable the D4-B d4bDiag overlap-diagnostics group (H1/H3/H4 "
+        "per-cycle overlap counters plus the E1/E2/B1/B2/B3 machine-checked "
+        "identities; the identities are algebraic over existing counters and "
+        "always print, the H counters sample only when this flag is on). "
+        "Evidence runs enable it explicitly; diagnostic proxy semantics, "
+        "no additivity or main-cause claims.")
     numDQEntries = VectorParam.Unsigned([32, 16, 16], "Number of entries in the dispQue, (Int, Float/Vector, Mem)")
     dispWidth = VectorParam.Unsigned([8, 6, 6], "Each DispQue dispatch width")
 
