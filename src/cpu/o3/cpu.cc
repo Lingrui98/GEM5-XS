@@ -472,9 +472,13 @@ CPU::D4bDiagStats::D4bDiagStats(CPU *cpu)
                "delivery (diagnostic only: no additivity, no main-cause "
                "claim)"),
       ADD_STAT(backendInOldRecoveryWindowSlots, statistics::units::Count::get(),
-               "H3 overlap proxy: slots of cycles with an open recovery "
-               "window, delivery resumed and zero commits (backend stalls "
-               "absorbed into the recovery window; diagnostic only)"),
+               "H3 overlap proxy: slots of cycles inside the commit interval "
+               "(squash more recent than the last commit — the window the "
+               "recovery_bubble arithmetic charges) with delivery resumed "
+               "and zero commits (backend stalls absorbed into the "
+               "commit-interval accounting; the R4 window itself closes at "
+               "first delivery, so the post-delivery tail lives here; "
+               "diagnostic only)"),
       ADD_STAT(squashBlindWindowSlots, statistics::units::Count::get(),
                "H4 overlap proxy: slots of cycles between squash-signal "
                "issue and robSquashing arrival at fetch (commitToFetchDelay), "
@@ -549,7 +553,17 @@ CPU::D4bDiagStats::closeCycle()
     // Cycle conditions (operational proxies, contract section 2.4).
     const bool h1 = recovery_active && !rob_squashing &&
                     !block_fetch_any && delivery0;
-    const bool h3 = recovery_active && !delivery0 && !commit_ge1;
+    // H3 uses the COMMIT-INTERVAL window (squash more recent than the last
+    // commit — the window recovery_bubble arithmetic actually charges),
+    // NOT the R4 window flag: the R4 recovery window closes at first
+    // delivery, so "window open AND delivery resumed" is structurally
+    // empty.  H3 measures post-delivery, pre-commit cycles inside the
+    // commit interval (backend stalls absorbed by the commit-interval
+    // accounting).
+    const Tick last_commit = cpu->commit.ledgerLastCommitTick();
+    const bool in_commit_interval = last_squash != 0 &&
+        last_squash > last_commit;
+    const bool h3 = in_commit_interval && !delivery0 && !commit_ge1;
     const bool h4 = blind_active && !block_fetch_any && delivery0;
 
     if (h1)
