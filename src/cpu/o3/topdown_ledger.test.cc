@@ -21,7 +21,10 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <fstream>
 #include <limits>
+#include <string>
 #include <vector>
 
 #include "cpu/o3/comm.hh"
@@ -30,6 +33,7 @@
 using gem5::o3::classifyDispatchCycle;
 using gem5::o3::classifyStallReason;
 using gem5::o3::DispatchCycleInputs;
+using gem5::o3::foldChainHop;
 using gem5::o3::guardedRatio;
 using gem5::o3::LedgerRunState;
 using gem5::o3::LedgerState;
@@ -147,17 +151,21 @@ TEST(ClassifyStallReason, BackendRowIncludingDeliberateDeviations)
 
 TEST(ClassifyStallReason, RecoveryRow)
 {
+    // BpStall is chain-role ONLY (R-16): admission role maps to Unknown.
     const StallReason recovery[] = {
         StallReason::SquashStall,
         StallReason::InstMisPred,
         StallReason::InstSquashed,
         StallReason::CommitSquash,
-        StallReason::BpStall,             // chain-role evidence only
     };
     for (StallReason r : recovery) {
         EXPECT_EQ(classifyStallReason(r, true), SlotClass::Recovery);
         EXPECT_EQ(classifyStallReason(r, false), SlotClass::Recovery);
     }
+    EXPECT_EQ(classifyStallReason(StallReason::BpStall, true),
+              SlotClass::Recovery);   // chain-role evidence
+    EXPECT_EQ(classifyStallReason(StallReason::BpStall, false),
+              SlotClass::Unknown);     // admission role: unclassified (F2)
 }
 
 TEST(ClassifyStallReason, UnknownRowAndNoStallSentinel)
@@ -333,6 +341,11 @@ TEST(ClassifyDispatch, S21AmbiguousChainGoesUnknown)
     const SlotSplit s = classifyDispatchCycle(in);
     EXPECT_EQ(cls(s, SlotClass::Unknown), 8u);
     EXPECT_EQ(s.upstreamRule, TermRule::P6Ambiguous);
+    // F7 (CORE_REVIEW): S21 must also pin the slotPatternDist bucket
+    // (contract section 1.5e: "Unknown += 8 (P6) + bucket chain=mixed").
+    const PatternBin bin = patternBin(in, s);
+    EXPECT_EQ(bin.x, 6u);
+    EXPECT_EQ(bin.y, static_cast<unsigned>(SlotClass::Unknown));
 }
 
 // --- S21b: silent chain + ready admission -> Frontend (P5, frozen) -----
@@ -423,6 +436,255 @@ TEST(ClassifyDispatch, BpStallNotUnconditionallyRecovery)
     const SlotSplit s = classifyDispatchCycle(in);
     EXPECT_EQ(cls(s, SlotClass::Unknown), 8u);
     EXPECT_EQ(s.upstreamRule, TermRule::P6Ambiguous);
+}
+
+// ===========================================================================
+// F2 + F4 linkage (CORE_REVIEW F2; main-session directive):
+//   admission-role BpStall / out-of-table sentinels / unsampled NoStall
+//   reasons are UNCLASSIFIED admission evidence -> Unknown (never P2 via
+//   a != Recovery predicate, never P3, never P5), while legitimate
+//   Backend-family and CommitSquash admission blocks keep P2/P3 and the
+//   P2-over-P3 priority is untouched.
+// ===========================================================================
+
+TEST(ClassifyDispatch, AdmissionBpStallIsUnclassifiedUnknown)
+{
+    // blockIEW + BpStall: NOT P3 (admission-role BpStall is not BS-family
+    // evidence per R-16) and NOT P2 -- unclassified admission -> Unknown.
+    {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.blockIEW = true;
+        in.iewBlockReason = StallReason::BpStall;
+        const SlotSplit s = classifyDispatchCycle(in);
+        EXPECT_EQ(cls(s, SlotClass::Unknown), 8u);
+        EXPECT_EQ(cls(s, SlotClass::Recovery), 0u);
+        EXPECT_EQ(cls(s, SlotClass::Backend), 0u);
+        EXPECT_EQ(s.upstreamRule, TermRule::AdmissionUnclassified);
+    }
+    // blockRename + BpStall: the OLD != Recovery predicate would have
+    // sent this to P2 Backend after the BpStall role split; the tightened
+    // == Backend predicate must not (order-independence of the linkage).
+    {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.blockRename = true;
+        in.renameBlockReason = StallReason::BpStall;
+        const SlotSplit s = classifyDispatchCycle(in);
+        EXPECT_EQ(cls(s, SlotClass::Unknown), 8u);
+        EXPECT_EQ(cls(s, SlotClass::Backend), 0u);
+        EXPECT_EQ(s.upstreamRule, TermRule::AdmissionUnclassified);
+    }
+}
+
+TEST(ClassifyDispatch, AdmissionUnknownSentinelAndUnsampledReasons)
+{
+    // Out-of-table sentinel in an admission field: unclassified -> Unknown
+    // (the F4 sentinel-forbidden-in-admission-fields discipline makes this
+    // unreachable from production wiring; the policy must still be safe).
+    {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.blockIEW = true;
+        in.iewBlockReason = static_cast<StallReason>(200);
+        const SlotSplit s = classifyDispatchCycle(in);
+        EXPECT_EQ(cls(s, SlotClass::Unknown), 8u);
+        EXPECT_EQ(s.upstreamRule, TermRule::AdmissionUnclassified);
+    }
+    // Block present but the reason was not sampled (NoStall): the old
+    // predicate read NoStall's sentinel as "!= Recovery" -> P2 Backend.
+    // The consumer provably refused, but there is no Backend-family
+    // evidence: Unknown, and P5 silent-ready must NOT fire either.
+    {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.blockIEW = true;
+        in.iewBlockReason = StallReason::NoStall;
+        const SlotSplit s = classifyDispatchCycle(in);
+        EXPECT_EQ(cls(s, SlotClass::Unknown), 8u);
+        EXPECT_EQ(cls(s, SlotClass::Frontend), 0u);
+        EXPECT_EQ(s.upstreamRule, TermRule::AdmissionUnclassified);
+    }
+    {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.blockRename = true;
+        in.renameBlockReason = StallReason::NoStall;
+        const SlotSplit s = classifyDispatchCycle(in);
+        EXPECT_EQ(cls(s, SlotClass::Unknown), 8u);
+        EXPECT_EQ(s.upstreamRule, TermRule::AdmissionUnclassified);
+    }
+}
+
+TEST(ClassifyDispatch, LegitimateAdmissionFamiliesKeepP2P3Priority)
+{
+    // P2 preserved: Backend-family admission block (both arms).
+    {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.blockIEW = true;
+        in.iewBlockReason = StallReason::ROBFull;
+        const SlotSplit s = classifyDispatchCycle(in);
+        EXPECT_EQ(cls(s, SlotClass::Backend), 8u);
+        EXPECT_EQ(s.upstreamRule, TermRule::P2AdmissionBE);
+    }
+    {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.blockRename = true;
+        in.renameBlockReason = StallReason::OtherFragStall;
+        const SlotSplit s = classifyDispatchCycle(in);
+        EXPECT_EQ(cls(s, SlotClass::Backend), 8u);
+        EXPECT_EQ(s.upstreamRule, TermRule::P2AdmissionBE);
+    }
+    // P3 preserved: CommitSquash admission block.
+    {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.blockIEW = true;
+        in.iewBlockReason = StallReason::CommitSquash;
+        const SlotSplit s = classifyDispatchCycle(in);
+        EXPECT_EQ(cls(s, SlotClass::Recovery), 8u);
+        EXPECT_EQ(s.upstreamRule, TermRule::P3AdmissionBS);
+    }
+    // P2 outranks P3 even when squash-scene evidence is present (S20b).
+    {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.blockIEW = true;
+        in.iewBlockReason = StallReason::ROBFull;
+        in.robSquashingWire = true;
+        const SlotSplit s = classifyDispatchCycle(in);
+        EXPECT_EQ(cls(s, SlotClass::Backend), 8u);
+        EXPECT_EQ(s.upstreamRule, TermRule::P2AdmissionBE);
+    }
+}
+
+// ===========================================================================
+// F4 chain-hop folding (foldChainHop): per-slot vectors keep delivered
+// NoStall slots and propagate per-slot causes (rename.cc:433-440).  A
+// same-hop heterogeneous vector folds to the kChainMixedStall sentinel —
+// slot order never selects the cause — and single-reason repeats collapse
+// to that reason (F3 stays frozen: multi-hop SAME-reason is still P6
+// ambiguity, only same-hop mixing is new evidence).
+// ===========================================================================
+
+TEST(FoldChainHop, OrderInvarianceAndMixedSentinel)
+{
+    using gem5::o3::kChainMixedStall;
+    const std::vector<StallReason> fwd = {
+        StallReason::IcacheStall, StallReason::ROBFull};
+    const std::vector<StallReason> rev = {
+        StallReason::ROBFull, StallReason::IcacheStall};
+    const auto f = foldChainHop(fwd);
+    const auto r = foldChainHop(rev);
+    EXPECT_EQ(f.representative, kChainMixedStall);
+    EXPECT_EQ(r.representative, kChainMixedStall);
+    EXPECT_EQ(f.reasonsMask, r.reasonsMask);
+    // [Icache, Icache] collapses to the sole reason (repeat = same reason,
+    // not ambiguity).
+    const auto rep = foldChainHop({StallReason::IcacheStall,
+                                   StallReason::IcacheStall});
+    EXPECT_EQ(rep.representative, StallReason::IcacheStall);
+    EXPECT_EQ(rep.reasonsMask, 1ULL << static_cast<unsigned>(
+                                   StallReason::IcacheStall));
+    // Silent and empty hops.
+    EXPECT_EQ(foldChainHop({}).representative, StallReason::NoStall);
+    EXPECT_EQ(foldChainHop({StallReason::NoStall,
+                            StallReason::NoStall}).representative,
+              StallReason::NoStall);
+    EXPECT_EQ(foldChainHop({}).reasonsMask, 0u);
+}
+
+TEST(FoldChainHop, DeliveredNoStallSlotsAreNotEvidence)
+{
+    // rename.cc:433-440 shape: delivered slots carry NoStall, the tail
+    // keeps the upstream per-slot reasons.  Only distinct causes matter.
+    const std::vector<StallReason> hop = {
+        StallReason::NoStall, StallReason::NoStall,
+        StallReason::IcacheStall, StallReason::NoStall,
+        StallReason::IcacheStall};
+    const auto e = foldChainHop(hop);
+    EXPECT_EQ(e.representative, StallReason::IcacheStall);
+    // One NoStall + one non-NoStall = sole cause (a NoStall slot is
+    // delivered-slot padding, not a second reason).
+    const auto pad = foldChainHop({StallReason::NoStall,
+                                   StallReason::ROBFull});
+    EXPECT_EQ(pad.representative, StallReason::ROBFull);
+}
+
+TEST(ClassifyDispatch, MixedHopFoldsToUnknownEvenAsSoleHop)
+{
+    using gem5::o3::kChainMixedStall;
+    // Same-hop heterogeneous evidence with admission provably ready and
+    // every other hop silent: the frozen ambiguity policy applies — the
+    // first non-NoStall entry (IcacheStall = Frontend) must NOT be picked.
+    DispatchCycleInputs in = baseInputs();
+    in.arrivals = 0;
+    in.crossings = 0;
+    in.fetchUp = kChainMixedStall;
+    in.fetchUpReasons = (1ULL << static_cast<unsigned>(
+                             StallReason::IcacheStall)) |
+                        (1ULL << static_cast<unsigned>(StallReason::ROBFull));
+    const SlotSplit s = classifyDispatchCycle(in);
+    EXPECT_EQ(cls(s, SlotClass::Unknown), 8u);
+    EXPECT_EQ(cls(s, SlotClass::Frontend), 0u);
+    EXPECT_EQ(cls(s, SlotClass::Backend), 0u);
+    EXPECT_EQ(s.upstreamRule, TermRule::P4MixedHop);
+    const PatternBin bin = patternBin(in, s);
+    EXPECT_EQ(bin.x, 6u);
+}
+
+TEST(ClassifyDispatch, MixedHopDominatesOtherHopReasons)
+{
+    using gem5::o3::kChainMixedStall;
+    // A mixed hop plus another non-silent hop is still ambiguity; the
+    // mixed sentinel is detected first so the recorded rule names the
+    // same-hop heterogeneity precisely (destination is Unknown either way).
+    DispatchCycleInputs in = baseInputs();
+    in.arrivals = 0;
+    in.crossings = 0;
+    in.fetchUp = kChainMixedStall;
+    in.renameUp = StallReason::ROBFull;
+    const SlotSplit s = classifyDispatchCycle(in);
+    EXPECT_EQ(cls(s, SlotClass::Unknown), 8u);
+    EXPECT_EQ(s.upstreamRule, TermRule::P4MixedHop);
+}
+
+TEST(ClassifyDispatch, ChainPathOutOfTableValueIsUnknown)
+{
+    // F4 contract pin: an out-of-table value (NOT the kChainMixedStall
+    // sentinel — a generic unclassified value, e.g. 150) in a CHAIN field
+    // falls to Unknown through both the sole-hop (P4) and multi-hop (P6)
+    // routes — the default arm is an explicit contract, not an accident.
+    {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.fetchUp = static_cast<StallReason>(150);
+        const SlotSplit s = classifyDispatchCycle(in);
+        EXPECT_EQ(cls(s, SlotClass::Unknown), 8u);
+        EXPECT_EQ(s.upstreamRule, TermRule::P4UniqueChain);
+    }
+    {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.fetchUp = static_cast<StallReason>(150);
+        in.renameUp = StallReason::IcacheStall;
+        const SlotSplit s = classifyDispatchCycle(in);
+        EXPECT_EQ(cls(s, SlotClass::Unknown), 8u);
+        EXPECT_EQ(s.upstreamRule, TermRule::P6Ambiguous);
+    }
 }
 
 // --- poppedSquashed term rules ------------------------------------------
@@ -863,6 +1125,19 @@ TEST(TopdownLedger, DisabledLedgerIsQuiescent)
     EXPECT_EQ(ledger.slotBudget.value(), 0.0);
     EXPECT_EQ(ledger.statEnabled.value(), 0.0);
     EXPECT_EQ(a.state, LedgerState::Unallocated);
+    // FAIL-1 (acceptance card): the off arm must stay 0/NaN across the
+    // WHOLE topdownV2 group.  replayComplete is a collection-completeness
+    // self-report: a disabled ledger has no table, so it reports 0, never
+    // 1 — the enabled state is carried by statEnabled alone.
+    EXPECT_EQ(ledger.replayCompleteStat.value(), 0.0);
+    EXPECT_FALSE(ledger.replayComplete());
+    // resetStats must not resurrect it (the ROI-begin dump+reset path is
+    // exactly where the acceptance FAIL-1 was observed).
+    ledger.resetStats();
+    EXPECT_EQ(ledger.replayCompleteStat.value(), 0.0);
+    EXPECT_EQ(ledger.statEnabled.value(), 0.0);
+    ledger.accountCycle(baseInputs());
+    EXPECT_EQ(ledger.replayCompleteStat.value(), 0.0);
 }
 
 TEST(TopdownLedger, UnsupportedConfigurationsExplicit)
@@ -1251,4 +1526,211 @@ TEST(LedgerRatios, FrozenSnapshotRatiosStable)
     ledger.accountCycle(tail);
     EXPECT_EQ(ledger.retiring.value(), retiring);
     EXPECT_EQ(ledger.boundary.value(), boundary);
+}
+
+// ===========================================================================
+// Persistent audit export (F1/F6, d4b-audit-export-v1): the lossless tuple
+// table must land on disk for production runs — summary stats alone are
+// not replay evidence (acceptance negative list).
+// ===========================================================================
+
+namespace
+{
+
+std::string
+readFile(const std::string &path)
+{
+    std::ifstream f(path);
+    return std::string((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+}
+
+bool
+contains(const std::string &haystack, const std::string &needle)
+{
+    return haystack.find(needle) != std::string::npos;
+}
+
+} // anonymous namespace
+
+TEST(AuditExport, WritesHeaderAndFullTupleTable)
+{
+    const std::string path = "topdownV2_audit_gtest.json";
+    std::remove(path.c_str());
+
+    TopdownLedger ledger(nullptr, baseConfig(), true);
+    ledger.setAuditExportPath(path);
+
+    // Cycle 1: S21b-family silent chain, ready admission -> Frontend 8.
+    DispatchCycleInputs c1 = baseInputs();
+    c1.arrivals = 0;
+    c1.crossings = 0;
+    ledger.accountCycle(c1);
+    // Cycle 2: S20-family admission BS block -> Recovery 8.
+    DispatchCycleInputs c2 = baseInputs();
+    c2.arrivals = 0;
+    c2.crossings = 0;
+    c2.blockIEW = true;
+    c2.iewBlockReason = StallReason::CommitSquash;
+    c2.blockRename = true;
+    c2.renameBlockReason = StallReason::CommitSquash;
+    ledger.accountCycle(c2);
+
+    EXPECT_TRUE(ledger.exportAudit());
+    const std::string text = readFile(path);
+    EXPECT_FALSE(text.empty());
+
+    // d4b-audit-export-v1 header with F6 version metadata.
+    EXPECT_TRUE(contains(text, "\"schema_version\": \"d4b-audit-export-v1\""));
+    EXPECT_TRUE(contains(text,
+        "\"impl_schema_version\": \"d4b-audit-export-v1.1-hopmultiset\""));
+    EXPECT_TRUE(contains(text, "\"policy_version\": \"d4b-policy-v4\""));
+    EXPECT_TRUE(contains(text, "\"replay_complete\": true"));
+    EXPECT_TRUE(contains(text, "\"dropped_patterns\": 0"));
+    EXPECT_TRUE(contains(text, "\"resource_cap\": {\"max_patterns\": 16384"));
+
+    // All 17 signal fields + slot weights + counts per pattern.
+    EXPECT_TRUE(contains(text, "\"budget\": 8"));
+    EXPECT_TRUE(contains(text, "\"residueAtStart\": 0"));
+    EXPECT_TRUE(contains(text, "\"arrivals\": 0"));
+    EXPECT_TRUE(contains(text, "\"crossings\": 0"));
+    EXPECT_TRUE(contains(text, "\"poppedSquashed\": 0"));
+    EXPECT_TRUE(contains(text, "\"drainMode\": false"));
+    EXPECT_TRUE(contains(text, "\"breakReason\": \"NoStall\""));
+    EXPECT_TRUE(contains(text, "\"blockIEW\": true"));
+    EXPECT_TRUE(contains(text, "\"iewBlockReason\": \"CommitSquash\""));
+    EXPECT_TRUE(contains(text, "\"blockRename\": true"));
+    EXPECT_TRUE(contains(text, "\"renameBlockReason\": \"CommitSquash\""));
+    EXPECT_TRUE(contains(text, "\"renameUpReasons\": []"));
+    EXPECT_TRUE(contains(text, "\"commitSquashWire\": false"));
+    EXPECT_TRUE(contains(text, "\"robSquashingWire\": false"));
+    EXPECT_TRUE(contains(text, "\"count\": 1"));
+    EXPECT_TRUE(contains(text, "\"Recovery\": 8"));
+    EXPECT_TRUE(contains(text, "\"Frontend\": 8"));
+
+    // Atomic write leaves no .tmp residue.
+    EXPECT_EQ(readFile(path + ".tmp").size(), 0u);
+    std::remove(path.c_str());
+}
+
+TEST(AuditExport, DistinguishesTuplesWithIdenticalSummaryBin)
+{
+    // Contract section 1.5c acceptance requirement: two cycles whose
+    // <=64-bin summary projection is identical but whose full tuples
+    // differ must be distinguishable in the exported table (this is what
+    // makes an offline alternate-policy replay able to recover different
+    // results).  Both cycles below classify Frontend=8 in the same
+    // slotPatternDist bin; they differ in the informational squash wires.
+    const std::string path = "topdownV2_audit_gtest2.json";
+    std::remove(path.c_str());
+
+    TopdownLedger ledger(nullptr, baseConfig(), true);
+    ledger.setAuditExportPath(path);
+
+    DispatchCycleInputs c1 = baseInputs();
+    c1.arrivals = 0;
+    c1.crossings = 0;
+    ledger.accountCycle(c1);
+
+    DispatchCycleInputs c2 = c1;
+    c2.commitSquashWire = true;   // same summary bin, different tuple
+    ledger.accountCycle(c2);
+
+    const auto &table = ledger.patternTable();
+    ASSERT_EQ(table.size(), 2u);
+
+    EXPECT_TRUE(ledger.exportAudit());
+    const std::string text = readFile(path);
+    // Both tuples present with their distinguishing field: exactly one
+    // pattern carries commitSquashWire=true.
+    const std::string needle = "\"commitSquashWire\": true";
+    size_t pos = text.find(needle);
+    ASSERT_NE(pos, std::string::npos);
+    EXPECT_EQ(text.find(needle, pos + needle.size()),
+              std::string::npos);
+    std::remove(path.c_str());
+}
+
+TEST(AuditExport, EpochSegmentsSurviveBeginEpochReset)
+{
+    const std::string path = "topdownV2_audit_gtest3.json";
+    std::remove(path.c_str());
+
+    TopdownLedger ledger(nullptr, baseConfig(), true);
+    ledger.setAuditExportPath(path);
+
+    DispatchCycleInputs c1 = baseInputs();
+    c1.arrivals = 0;
+    c1.crossings = 0;
+    ledger.accountCycle(c1);
+    EXPECT_TRUE(ledger.exportAudit());
+
+    // ROI begin: dump+reset opens the next segment (epoch 1 -> 2); the
+    // already-exported epoch must survive in the file.
+    ledger.resetStats();
+
+    DispatchCycleInputs c2 = baseInputs();
+    c2.arrivals = 0;
+    c2.crossings = 0;
+    c2.blockIEW = true;
+    c2.iewBlockReason = StallReason::ROBFull;
+    ledger.accountCycle(c2);
+    EXPECT_TRUE(ledger.exportAudit());
+
+    const std::string text = readFile(path);
+    EXPECT_TRUE(contains(text, "\"epoch\": 0"));
+    EXPECT_TRUE(contains(text, "\"epoch\": 1"));
+    // Epoch-1 pattern retained after the reset (Frontend 8), epoch-2
+    // pattern present (Backend 8 via P2).
+    EXPECT_TRUE(contains(text, "\"Frontend\": 8"));
+    EXPECT_TRUE(contains(text, "\"Backend\": 8"));
+    std::remove(path.c_str());
+}
+
+TEST(AuditExport, DisabledLedgerWritesNothing)
+{
+    const std::string path = "topdownV2_audit_gtest4.json";
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
+
+    TopdownLedger ledger(nullptr, baseConfig(), false);
+    ledger.setAuditExportPath(path);
+    ledger.accountCycle(baseInputs());
+    // A disabled ledger exports nothing (inert by construction) and
+    // reports success without touching the filesystem.
+    EXPECT_TRUE(ledger.exportAudit());
+    std::ifstream f(path);
+    EXPECT_FALSE(f.good());
+    EXPECT_EQ(ledger.replayCompleteStat.value(), 0.0);
+}
+
+TEST(AuditExport, OverflowMarksIncompleteInHeader)
+{
+    const std::string path = "topdownV2_audit_gtest5.json";
+    std::remove(path.c_str());
+
+    TopdownLedger ledger(nullptr, baseConfig(), true);
+    ledger.setAuditExportPath(path);
+
+    // Distinct tuples: vary residueAtStart (all classify FE=8; delivered
+    // <= budget holds).
+    for (unsigned i = 0; i < TopdownLedger::kPatternTableCap; i++) {
+        DispatchCycleInputs in = baseInputs();
+        in.arrivals = 0;
+        in.crossings = 0;
+        in.residueAtStart = i;
+        ledger.accountCycle(in);
+    }
+    // One more distinct tuple: dropped after the cap.
+    DispatchCycleInputs extra = baseInputs();
+    extra.arrivals = 0;
+    extra.crossings = 0;
+    extra.residueAtStart = TopdownLedger::kPatternTableCap + 1;
+    ledger.accountCycle(extra);
+
+    EXPECT_TRUE(ledger.exportAudit());
+    const std::string text = readFile(path);
+    EXPECT_TRUE(contains(text, "\"replay_complete\": false"));
+    EXPECT_TRUE(contains(text, "\"dropped_patterns\": 1"));
+    std::remove(path.c_str());
 }

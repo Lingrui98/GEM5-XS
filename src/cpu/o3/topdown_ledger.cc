@@ -29,7 +29,10 @@
 #include "cpu/o3/topdown_ledger.hh"
 
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 #include <limits>
+#include <sstream>
 
 #include "base/logging.hh"
 
@@ -44,6 +47,87 @@ namespace
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 
+/**
+ * StallReason value name for the audit export (comm.hh enum name,
+ * validation INTERFACE.md section 4: "StallReason 字段用枚举名文本").
+ * The mixed sentinel renders as its dedicated out-of-enum name so the
+ * export never injects a fake legal enum value.
+ */
+const char *
+stallReasonName(StallReason r)
+{
+    if (r == kChainMixedStall)
+        return "ChainMixed";
+    switch (r) {
+      case StallReason::NoStall:            return "NoStall";
+      case StallReason::IcacheStall:        return "IcacheStall";
+      case StallReason::ITlbStall:          return "ITlbStall";
+      case StallReason::DTlbStall:          return "DTlbStall";
+      case StallReason::BpStall:            return "BpStall";
+      case StallReason::IntStall:           return "IntStall";
+      case StallReason::TrapStall:          return "TrapStall";
+      case StallReason::FTQBubble:          return "FTQBubble";
+      case StallReason::FetchFragStall:     return "FetchFragStall";
+      case StallReason::OtherFetchStall:    return "OtherFetchStall";
+      case StallReason::OtherFragStall:     return "OtherFragStall";
+      case StallReason::SquashStall:        return "SquashStall";
+      case StallReason::FetchBufferInvalid: return "FetchBufferInvalid";
+      case StallReason::InstMisPred:        return "InstMisPred";
+      case StallReason::InstSquashed:       return "InstSquashed";
+      case StallReason::SerializeStall:     return "SerializeStall";
+      case StallReason::ScalarLongExecute:  return "ScalarLongExecute";
+      case StallReason::VectorLongExecute:  return "VectorLongExecute";
+      case StallReason::InstNotReady:       return "InstNotReady";
+      case StallReason::LoadL1Bound:        return "LoadL1Bound";
+      case StallReason::LoadL2Bound:        return "LoadL2Bound";
+      case StallReason::LoadL3Bound:        return "LoadL3Bound";
+      case StallReason::LoadMemBound:       return "LoadMemBound";
+      case StallReason::StoreL1Bound:       return "StoreL1Bound";
+      case StallReason::StoreL2Bound:       return "StoreL2Bound";
+      case StallReason::StoreL3Bound:       return "StoreL3Bound";
+      case StallReason::StoreMemBound:      return "StoreMemBound";
+      case StallReason::MemSquashed:        return "MemSquashed";
+      case StallReason::MemNotReady:        return "MemNotReady";
+      case StallReason::MemCommitRateLimit: return "MemCommitRateLimit";
+      case StallReason::Atomic:             return "Atomic";
+      case StallReason::OtherMemStall:     return "OtherMemStall";
+      case StallReason::MemDQBandwidth:     return "MemDQBandwidth";
+      case StallReason::IntDQBandwidth:     return "IntDQBandwidth";
+      case StallReason::FVDQBandwidth:     return "FVDQBandwidth";
+      case StallReason::VectorReadyButNotIssued:
+        return "VectorReadyButNotIssued";
+      case StallReason::ScalarReadyButNotIssued:
+        return "ScalarReadyButNotIssued";
+      case StallReason::ResumeUnblock:      return "ResumeUnblock";
+      case StallReason::CommitSquash:       return "CommitSquash";
+      case StallReason::ROBFull:            return "ROBFull";
+      case StallReason::RegFull:            return "RegFull";
+      case StallReason::OtherStall:         return "OtherStall";
+      case StallReason::NumStallReasons:    break;
+    }
+    return "<unknown-stall-reason>";
+}
+
+/** Render one uint64 reason-multiset mask as a JSON array of names. */
+std::string
+reasonsMaskJson(uint64_t mask)
+{
+    std::ostringstream os;
+    os << "[";
+    bool first = true;
+    for (unsigned r = 0; r < 64; r++) {
+        if (mask & (1ULL << r)) {
+            if (!first)
+                os << ", ";
+            os << "\"" << stallReasonName(static_cast<StallReason>(r))
+               << "\"";
+            first = false;
+        }
+    }
+    os << "]";
+    return os.str();
+}
+
 unsigned
 toUnsigned(int v)
 {
@@ -52,8 +136,15 @@ toUnsigned(int v)
 }
 
 /**
- * P2 predicate: admission-side same-cycle Backend-family block
- * (blockIEW with a Backend reason, or blockRename with a non-BS reason).
+ * P2 predicate (owner-frozen "backend provably blocks admission"):
+ * a same-cycle admission-side block whose reason maps to the Backend
+ * family via the section 1.5d table.  Both arms are checked against
+ * the Backend family EXACTLY (== Backend, not "!= Recovery"): an
+ * unclassified reason (Unknown class, admission-role BpStall,
+ * out-of-table values, or a block without a sampled reason) must not
+ * enter P2 as a Backend attribution on negative evidence
+ * (CORE_REVIEW F2/F4: the != Recovery form silently treated Unknown
+ * and even NoStall as Backend).
  */
 bool
 admissionBackendBlocked(const DispatchCycleInputs &in)
@@ -62,8 +153,35 @@ admissionBackendBlocked(const DispatchCycleInputs &in)
         classifyStallReason(in.iewBlockReason, false) == SlotClass::Backend)
         return true;
     if (in.blockRename &&
-        classifyStallReason(in.renameBlockReason, false) != SlotClass::Recovery)
+        classifyStallReason(in.renameBlockReason, false) == SlotClass::Backend)
         return true;
+    return false;
+}
+
+/**
+ * Admission block present but the reason is unclassified evidence:
+ * neither Backend family (P2) nor BS family (P3's blockIEW arm).  The
+ * consumer provably refused this cycle (blockIEW/blockRename true),
+ * so the shortage is NOT attributable upstream and the silent-ready
+ * premise of P5 does not hold; the honest destination is Unknown
+ * (main-session directive: "unclassified admission keeps the Unknown
+ * path, must not fall through to P5 silent-ready FE").  Covers
+ * admission-role BpStall (R-16), out-of-table sentinel values, and a
+ * block whose reason was not sampled (NoStall).
+ */
+bool
+admissionUnclassifiedBlocked(const DispatchCycleInputs &in)
+{
+    if (in.blockIEW) {
+        const SlotClass c = classifyStallReason(in.iewBlockReason, false);
+        if (c != SlotClass::Backend && c != SlotClass::Recovery)
+            return true;
+    }
+    if (in.blockRename) {
+        const SlotClass c = classifyStallReason(in.renameBlockReason, false);
+        if (c != SlotClass::Backend && c != SlotClass::Recovery)
+            return true;
+    }
     return false;
 }
 
@@ -140,11 +258,51 @@ DispatchCycleInputs::operator<(const DispatchCycleInputs &o) const
     if (renameUp != o.renameUp) return renameUp < o.renameUp;
     if (decodeUp != o.decodeUp) return decodeUp < o.decodeUp;
     if (fetchUp != o.fetchUp) return fetchUp < o.fetchUp;
+    if (renameUpReasons != o.renameUpReasons)
+        return renameUpReasons < o.renameUpReasons;
+    if (decodeUpReasons != o.decodeUpReasons)
+        return decodeUpReasons < o.decodeUpReasons;
+    if (fetchUpReasons != o.fetchUpReasons)
+        return fetchUpReasons < o.fetchUpReasons;
     if (commitSquashWire != o.commitSquashWire)
         return !commitSquashWire && o.commitSquashWire;
     if (robSquashingWire != o.robSquashingWire)
         return !robSquashingWire && o.robSquashingWire;
     return false;
+}
+
+ChainHopEvidence
+foldChainHop(const std::vector<StallReason> &hop)
+{
+    ChainHopEvidence e;
+    for (StallReason r : hop) {
+        if (r != StallReason::NoStall) {
+            assert(static_cast<unsigned>(r) <
+                   static_cast<unsigned>(StallReason::NumStallReasons));
+            e.reasonsMask |= 1ULL << static_cast<unsigned>(r);
+        }
+    }
+    // Distinct-count via popcount: 0 silent, 1 sole reason, >=2 mixed.
+    // Slot order never selects the representative (order-invariance is
+    // the whole point: [IcacheStall, ROBFull] and its reverse fold
+    // identically to the mixed sentinel).
+    unsigned distinct = 0;
+    uint64_t m = e.reasonsMask;
+    while (m) {
+        distinct += (m & 1u);
+        m >>= 1;
+    }
+    if (distinct == 0) {
+        e.representative = StallReason::NoStall;
+    } else if (distinct == 1) {
+        unsigned bit = 0;
+        while (!(e.reasonsMask & (1ULL << bit)))
+            bit++;
+        e.representative = static_cast<StallReason>(bit);
+    } else {
+        e.representative = kChainMixedStall;
+    }
+    return e;
 }
 
 unsigned
@@ -218,14 +376,19 @@ classifyStallReason(StallReason reason, bool upstreamRole)
         return SlotClass::Backend;
 
       // Recovery / bad-speculation family (section 1.5d).  BpStall is
-      // included only as chain-role evidence: admission-side consumption
-      // of BpStall never occurs in the supported configuration.
+      // included ONLY as chain-role evidence (R-16 removed it from the
+      // unconditional Recovery row): upstreamRole=true maps it to
+      // Recovery when P4 finds it causally unique.  In the admission
+      // role (upstreamRole=false) it maps to Unknown -- an
+      // admission-side BpStall is unclassified evidence and must never
+      // trigger P3 or sneak into P2 (CORE_REVIEW F2).
       case StallReason::SquashStall:
       case StallReason::InstMisPred:
       case StallReason::InstSquashed:
       case StallReason::CommitSquash:
-      case StallReason::BpStall:
         return SlotClass::Recovery;
+      case StallReason::BpStall:
+        return upstreamRole ? SlotClass::Recovery : SlotClass::Unknown;
 
       // Unknown (never-used values and any out-of-table future value)
       case StallReason::FetchBufferInvalid:
@@ -323,9 +486,32 @@ classifyDispatchCycle(const DispatchCycleInputs &in)
             split.upstreamRule = TermRule::P3AdmissionBS;
             split.counts[static_cast<size_t>(SlotClass::Recovery)] +=
                 split.upstreamShortSlots;
+        } else if (admissionUnclassifiedBlocked(in)) {
+            // Admission block present but its reason is neither Backend
+            // nor BS family (admission-role BpStall, out-of-table value,
+            // or unsampled NoStall): the consumer provably refused, so
+            // P5's silent-ready premise does NOT hold and upstream
+            // attribution has no causally unique chain evidence either
+            // -- honest destination Unknown (no reclassification to FE).
+            split.upstreamRule = TermRule::AdmissionUnclassified;
+            split.counts[static_cast<size_t>(SlotClass::Unknown)] +=
+                split.upstreamShortSlots;
         } else {
             const unsigned hops = chainNonSilentHops(in);
-            if (hops == 1) {
+            const bool anyHopMixed =
+                in.renameUp == kChainMixedStall ||
+                in.decodeUp == kChainMixedStall ||
+                in.fetchUp == kChainMixedStall;
+            if (anyHopMixed) {
+                // Same-hop heterogeneous vector folded to the mixed
+                // sentinel (foldChainHop): ambiguous evidence even when
+                // only one hop is non-silent -- the frozen ambiguity
+                // policy (P6 family) applies, Unknown.  Never the first
+                // non-NoStall entry (slot order must not pick FE/BE).
+                split.upstreamRule = TermRule::P4MixedHop;
+                split.counts[static_cast<size_t>(SlotClass::Unknown)] +=
+                    split.upstreamShortSlots;
+            } else if (hops == 1) {
                 // P4: causally unique lagged-chain cause.
                 split.upstreamRule = TermRule::P4UniqueChain;
                 const SlotClass cls =
@@ -376,6 +562,8 @@ patternBin(const DispatchCycleInputs &inputs, const SlotSplit &split)
     } else if (split.upstreamRule == TermRule::P5SilentFE) {
         bin.x = 5;
     } else if (split.upstreamRule == TermRule::P6Ambiguous ||
+               split.upstreamRule == TermRule::P4MixedHop ||
+               split.upstreamRule == TermRule::AdmissionUnclassified ||
                split.poppedRule == TermRule::PoppedUnknown ||
                split.breakRule == TermRule::BreakUnsignaled) {
         bin.x = 6;
@@ -529,7 +717,9 @@ TopdownLedger::TopdownLedger(statistics::Group *parent, const Config &cfg,
                "(tail-anomaly visibility)"),
       ADD_STAT(replayCompleteStat, statistics::units::Count::get(),
                "1 while every classified cycle is present in the lossless "
-               "tuple table; 0 after a resource-cap drop"),
+               "tuple table AND the ledger is collecting (statEnabled=1); "
+               "0 for a disabled ledger (no table exists) and 0 after a "
+               "resource-cap drop"),
       ADD_STAT(replayDistinctTuples, statistics::units::Count::get(),
                "Distinct full evidence tuples retained in the lossless "
                "table"),
@@ -586,15 +776,27 @@ TopdownLedger::TopdownLedger(statistics::Group *parent, const Config &cfg,
 
     statEnabled = enabled_ ? 1 : 0;
     slotWidth = cfg_.slotWidth;
-    replayCompleteStat = 1;
+    // FAIL-1 fix (acceptance card): the off arm must print 0/NaN for the
+    // whole topdownV2 group.  replayComplete is a collection-completeness
+    // self-report: 1 only for a LEDGER THAT IS COLLECTING with every
+    // classified cycle retained (an empty enabled table is complete).
+    // A disabled ledger has no table, so it reports 0 ("not
+    // replay-complete"), never 1; the enabled state is carried by
+    // statEnabled.  resetStats()/beginEpoch() re-stamp identically.
+    replayComplete_ = enabled_;
+    replayCompleteStat = enabled_ ? 1 : 0;
     setLedgerStateStat();
     refreshRatios();
 
     // Dump-time advisory checks (contract section 1.5f): sumCheck drift
     // is a construction-break alarm; the Unknown ratio is advisory and
     // NEVER a gate.  One-shot warnings only; the disabled ledger stays
-    // silent (A/B off-arm stderr must not move).
-    statistics::registerDumpCallback([this]() { checkAdvisories(); });
+    // silent (A/B off-arm stderr must not move).  The same callback
+    // drives the persistent audit export (fail-fast on I/O errors).
+    statistics::registerDumpCallback([this]() {
+        checkAdvisories();
+        exportAudit();
+    });
 }
 
 LedgerRunState
@@ -849,7 +1051,6 @@ TopdownLedger::accountCycle(const DispatchCycleInputs &inputs)
 {
     if (!enabled_ || frozen_)
         return;
-
     // Crossing cross-check: the caller's per-cycle crossing count must
     // equal the number of registrations since the last accountCycle.
     if (inputs.crossings != registrationsSinceAccount_) {
@@ -881,12 +1082,152 @@ TopdownLedger::accountCycle(const DispatchCycleInputs &inputs)
     }
 
     // INV-4 partition assertion (bookkeeping identity, not causality).
-    if (!split.partitions(inputs.budget))
+    // Dormant-contract gap closed (CORE_REVIEW F5): a partition violation
+    // is an invalidating guard exactly like the others (contract section
+    // 1.6 names INV-4).  classifyDispatchCycle currently cannot produce
+    // a partitions-violating split without also flagging budgetViolation,
+    // so this branch is not independently reachable through production
+    // inputs today -- it is still executed (and unit-tested via a real
+    // compound-violation cycle) because future classification changes
+    // must flip ledgerState, not just bump a counter.
+    if (!split.partitions(inputs.budget)) {
         identityViolations++;
+        invalidate();
+    }
 
     recordCycle(inputs, split);
 
     refreshRatios();
+}
+
+void
+TopdownLedger::setAuditExportPath(const std::string &path)
+{
+    auditExportPath_ = path;
+}
+
+bool
+TopdownLedger::exportAudit() const
+{
+    if (auditExportPath_.empty() || !enabled_ || exportFailed_)
+        return true;   // nothing configured / disabled / already fatal
+
+    // -- freeze the current epoch's table at this dump point -------------
+    // (const method: mutates only the mutable export cache below)
+    std::ostringstream pat;
+    bool first_pat = true;
+    for (const auto &kv : patternTable_) {
+        const DispatchCycleInputs &in = kv.first;
+        const PatternRecord &rec = kv.second;
+        if (!first_pat)
+            pat << ",\n";
+        first_pat = false;
+        pat << "    {\"inputs\": {\"budget\": " << in.budget
+            << ", \"residueAtStart\": " << in.residueAtStart
+            << ", \"arrivals\": " << in.arrivals
+            << ", \"crossings\": " << in.crossings
+            << ", \"poppedSquashed\": " << in.poppedSquashed
+            << ", \"drainMode\": " << (in.drainMode ? "true" : "false")
+            << ", \"breakReason\": \"" << stallReasonName(in.breakReason) << "\""
+            << ", \"blockIEW\": " << (in.blockIEW ? "true" : "false")
+            << ", \"iewBlockReason\": \""
+            << stallReasonName(in.iewBlockReason) << "\""
+            << ", \"blockRename\": " << (in.blockRename ? "true" : "false")
+            << ", \"renameBlockReason\": \""
+            << stallReasonName(in.renameBlockReason) << "\""
+            << ", \"renameUp\": \"" << stallReasonName(in.renameUp) << "\""
+            << ", \"decodeUp\": \"" << stallReasonName(in.decodeUp) << "\""
+            << ", \"fetchUp\": \"" << stallReasonName(in.fetchUp) << "\""
+            << ", \"renameUpReasons\": "
+            << reasonsMaskJson(in.renameUpReasons)
+            << ", \"decodeUpReasons\": "
+            << reasonsMaskJson(in.decodeUpReasons)
+            << ", \"fetchUpReasons\": "
+            << reasonsMaskJson(in.fetchUpReasons)
+            << ", \"commitSquashWire\": "
+            << (in.commitSquashWire ? "true" : "false")
+            << ", \"robSquashingWire\": "
+            << (in.robSquashingWire ? "true" : "false")
+            << "}, \"count\": " << rec.cycles
+            << ", \"slots\": {\"Frontend\": "
+            << rec.classSlots[static_cast<size_t>(SlotClass::Frontend)]
+            << ", \"Backend\": "
+            << rec.classSlots[static_cast<size_t>(SlotClass::Backend)]
+            << ", \"Recovery\": "
+            << rec.classSlots[static_cast<size_t>(SlotClass::Recovery)]
+            << ", \"Drain\": "
+            << rec.classSlots[static_cast<size_t>(SlotClass::Drain)]
+            << ", \"Unknown\": "
+            << rec.classSlots[static_cast<size_t>(SlotClass::Unknown)]
+            << "}, \"crossings\": " << rec.crossings << "}";
+    }
+    exportedEpochs_[currentEpoch_] = pat.str();
+    exportedEpochDropped_[currentEpoch_] =
+        replayTableOverflowTuples.value();
+
+    // -- assemble header + all frozen epochs, write atomically -----------
+    // Header completeness aggregates EVERY exported epoch (AND of the
+    // per-epoch completeness), and dropped_patterns is the total across
+    // epochs -- a stale per-epoch drop must never be reported as a
+    // complete table at the top level.
+    bool allComplete = replayComplete_;
+    uint64_t totalDropped = 0;
+    for (const auto &kv : exportedEpochDropped_) {
+        totalDropped += kv.second;
+        if (kv.second != 0)
+            allComplete = false;
+    }
+    std::ostringstream out;
+    out << "{\n"
+        << "  \"schema_version\": \"" << kAuditSchemaVersion << "\",\n"
+        << "  \"impl_schema_version\": \""
+        << kAuditImplSchemaVersion << "\",\n"
+        << "  \"policy_version\": \"" << kAuditPolicyVersion << "\",\n"
+        << "  \"replay_complete\": "
+        << (allComplete ? "true" : "false") << ",\n"
+        << "  \"dropped_patterns\": " << totalDropped << ",\n"
+        << "  \"resource_cap\": {\"max_patterns\": "
+        << kPatternTableCap << "},\n"
+        << "  \"current_epoch\": " << currentEpoch_ << ",\n"
+        << "  \"epochs\": [\n";
+    bool first_epoch = true;
+    for (const auto &kv : exportedEpochs_) {
+        if (!first_epoch)
+            out << ",\n";
+        first_epoch = false;
+        const uint64_t dropped =
+            exportedEpochDropped_.count(kv.first) ?
+                exportedEpochDropped_.at(kv.first) : 0;
+        const bool complete = dropped == 0;
+        out << "    {\"epoch\": " << kv.first
+            << ", \"replay_complete\": "
+            << (complete ? "true" : "false")
+            << ", \"dropped_patterns\": " << dropped
+            << ", \"patterns\": [\n" << kv.second << "]}";
+    }
+    out << "]\n}\n";
+
+    const std::string tmp = auditExportPath_ + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f) {
+            exportFailed_ = true;
+            fatal("topdownV2 audit export: cannot open %s\n", tmp);
+        }
+        f << out.str();
+        f.flush();
+        if (!f) {
+            exportFailed_ = true;
+            fatal("topdownV2 audit export: write/stream error on %s\n",
+                  tmp);
+        }
+    }
+    if (std::rename(tmp.c_str(), auditExportPath_.c_str()) != 0) {
+        exportFailed_ = true;
+        fatal("topdownV2 audit export: atomic rename %s -> %s failed\n",
+              tmp, auditExportPath_);
+    }
+    return true;
 }
 
 void
@@ -895,9 +1236,12 @@ TopdownLedger::beginEpoch()
     currentEpoch_++;
     frozen_ = false;
     registrationsSinceAccount_ = 0;
-    // Segment-scoped audit table restarts with the segment.
+    // Segment-scoped audit table restarts with the segment.  A collecting
+    // (enabled) ledger re-arms the completeness self-report; a disabled
+    // ledger keeps replayComplete=0 (FAIL-1: off arm stays 0/NaN).
     patternTable_.clear();
-    replayComplete_ = true;
+    replayComplete_ = enabled_;
+    replayCompleteStat = enabled_ ? 1 : 0;
 }
 
 void
@@ -953,12 +1297,13 @@ TopdownLedger::resetStats()
     beginEpoch();
 
     // Re-stamp configuration stats that the storage wipe cleared.
+    // (beginEpoch(), which ran above, re-stamps replayCompleteStat:
+    // 1 only for a collecting enabled ledger, 0 for a disabled one.)
     statEnabled = enabled_ ? 1 : 0;
     slotWidth = cfg_.slotWidth;
     configUnsupportedSMT = cfg_.numThreads > 1 ? 1 : 0;
     configUnsupportedDispatchStage = cfg_.enableDispatchStage ? 1 : 0;
     configUnsupportedWidth = cfg_.upstreamWidthMatches ? 0 : 1;
-    replayCompleteStat = 1;
     replayDistinctTuples = 0;
     setLedgerStateStat();
     refreshRatios();
