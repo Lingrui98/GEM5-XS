@@ -49,6 +49,8 @@ def setKmhV3Params(args, system):
             getattr(args, 'enable_d4b_topdown_ledger', False))
         cpu.enable_d4b_diag = bool(
             getattr(args, 'enable_d4b_diag', False))
+        cpu.d4b_topdown_audit_export_path = str(
+            getattr(args, 'd4b_topdown_audit_export', ''))
 
         # fetch (idealfetch not care)
         cpu.mmu.itb.size = 96

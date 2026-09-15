@@ -152,6 +152,11 @@ class BaseO3CPU(BaseCPU):
         "statistical group). Statistics-only: no output feeds any pipeline "
         "decision. The unsupported domain (SMT / enableDispatchStage / "
         "decodeWidth != renameWidth) reports ledgerState=1 with NaN ratios.")
+    d4b_topdown_audit_export_path = Param.String("",
+        "File path for the D4-B lossless-tuple audit export "
+        "(d4b-audit-export-v1; written atomically at every statistics "
+        "dump when the ledger is enabled). Empty (default) disables the "
+        "export; audit I/O failure aborts the simulation (fail-fast).")
     enable_d4b_diag = Param.Bool(False,
         "Enable the D4-B d4bDiag overlap-diagnostics group (H1/H3/H4 "
         "per-cycle overlap counters plus the E1/E2/B1/B2/B3 machine-checked "
