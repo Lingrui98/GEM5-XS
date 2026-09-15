@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <vector>
 
 #include "base/statistics.hh"
 #include "cpu/o3/comm.hh"
@@ -160,10 +161,27 @@ struct DispatchCycleInputs
     bool blockRename = false;
     StallReason renameBlockReason = StallReason::NoStall;
 
-    /** Lagged upstream chain hop reasons (NoStall = silent hop). */
+    /**
+     * Lagged upstream chain hop reasons (NoStall = silent hop;
+     * kChainMixedStall = same-hop heterogeneous vector, see
+     * foldChainHop).  Admission-side fields (above) must never carry
+     * kChainMixedStall: it is a chain-role-only sentinel.
+     */
     StallReason renameUp = StallReason::NoStall;
     StallReason decodeUp = StallReason::NoStall;
     StallReason fetchUp = StallReason::NoStall;
+
+    /**
+     * Per-hop distinct non-NoStall reason bit sets (bit r set iff
+     * StallReason value r is present in that hop's per-slot vector).
+     * Lossless audit encoding of the chain evidence: the frozen policy
+     * consumes only the distinct-reason set, never multiplicity or
+     * order.  Kept in the replay key alongside the representative
+     * single values above.
+     */
+    uint64_t renameUpReasons = 0;
+    uint64_t decodeUpReasons = 0;
+    uint64_t fetchUpReasons = 0;
 
     /** Lagged commit-side squash wires (informational only). */
     bool commitSquashWire = false;
@@ -186,6 +204,13 @@ enum class TermRule : uint8_t
     P2AdmissionBE,       // upstream term: admission Backend family
     P3AdmissionBS,       // upstream term: admission BS family
     P4UniqueChain,       // upstream term: unique lagged-chain cause
+    P4MixedHop,          // upstream term: single non-silent hop but that
+                         // hop is same-hop heterogeneous (mixed) -> Unknown
+    AdmissionUnclassified,// upstream term: admission block present but the
+                         // reason is neither Backend- nor BS-family
+                         // (unclassified evidence) -> Unknown; the consumer
+                         // provably refused, so the silent-chain-ready
+                         // premise of P5 does NOT hold
     P5SilentFE,          // upstream term: silent chain + ready admission
     P6Ambiguous          // upstream term: ambiguous/contradictory chain
 };
@@ -217,6 +242,42 @@ struct SlotSplit
 };
 
 /**
+ * Chain-hop mixed sentinel (F4 contract pin).  A same-hop vector whose
+ * non-NoStall entries carry two or more distinct reasons is folded to
+ * this out-of-table value, NOT to its first non-NoStall entry: the
+ * frozen ambiguity policy (P6) applies to same-hop heterogeneity too,
+ * and slot-order must never select FE/BE.  The value deliberately sits
+ * outside the legal StallReason range (comm.hh 0..NumStallReasons-1)
+ * and is never injected into admission-side fields (iewBlockReason /
+ * renameBlockReason / breakReason producers must never emit it; the
+ * only producer is foldChainHop on the three chain-hop fields).
+ */
+constexpr StallReason kChainMixedStall = static_cast<StallReason>(200);
+static_assert(static_cast<unsigned>(kChainMixedStall) >=
+              static_cast<unsigned>(StallReason::NumStallReasons),
+              "mixed sentinel must stay outside the legal enum range");
+
+/**
+ * Fold one chain hop's per-slot reason vector (rename.cc:433-440
+ * per-slot propagation keeps delivered NoStall slots and passes the
+ * downstream per-slot reasons up) into the cycle-level evidence the
+ * policy layer consumes.  Pure production helper (directly tested):
+ *   - 0 distinct non-NoStall reasons  -> representative NoStall (silent hop)
+ *   - exactly 1 distinct reason        -> that reason (repeats collapse)
+ *   - >= 2 distinct reasons (mixed)    -> kChainMixedStall sentinel
+ * `reasonsMask` keeps the distinct-reason bit set (bit r set iff reason
+ * value r was present) as the lossless per-hop audit encoding: the
+ * frozen policy depends only on the distinct-reason set, never on
+ * multiplicity or slot order.
+ */
+struct ChainHopEvidence
+{
+    StallReason representative = StallReason::NoStall;
+    uint64_t reasonsMask = 0;
+};
+ChainHopEvidence foldChainHop(const std::vector<StallReason> &hop);
+
+/**
  * Section 1.5d policy table (owner-frozen D-4).  Maps a StallReason to
  * its slot class.  The same value can map differently by role:
  *   - upstreamRole=false: admission/break-side role.
@@ -229,8 +290,10 @@ struct SlotSplit
  * Deliberate deviations registered in the contract:
  *   - SerializeStall maps to Backend (barrier occupies dispatch/backend
  *     resources; the comm.hh "F" comment anchor is overridden).
- *   - BpStall participates only as chain evidence (P4 maps it to
- *     Recovery when causally unique); it is NOT unconditionally Recovery.
+ *   - BpStall maps to Recovery ONLY as chain-role evidence (R-16: it was
+ *     removed from the unconditional Recovery row).  In the admission
+ *     role it maps to Unknown: an admission-side BpStall is unclassified
+ *     evidence, never a P3 trigger (CORE_REVIEW F2).
  *   - OtherFragStall maps to Backend (SMT freeze is out of the supported
  *     domain; DispBW residue is backend backpressure).
  */
@@ -367,6 +430,29 @@ class TopdownLedger : public statistics::Group
     /** Statistics-reset hook: drives beginEpoch. */
     void resetStats() override;
 
+    /**
+     * Persistent lossless-tuple audit export (contract section 1.5c,
+     * validation INTERFACE.md section 4, format d4b-audit-export-v1).
+     * When a non-empty path is configured on a COLLECTING (enabled)
+     * ledger, every statistics dump rewrites the file atomically
+     * (tmp + rename, no per-cycle I/O) with: header (schema_version /
+     * impl_schema_version / policy_version / replay_complete /
+     * dropped_patterns / resource cap), one entry per exported epoch,
+     * and per epoch the full distinct-tuple table with 17-signal inputs
+     * + per-class slot weights + crossings.  I/O failure is fatal
+     * (fail-fast: a run whose audit cannot be produced must not exit
+     * looking successful).  An empty path (default) exports nothing.
+     */
+    void setAuditExportPath(const std::string &path);
+    bool exportAudit() const;
+
+    /** Exported schema/policy identity (F6: version metadata). */
+    static constexpr const char *kAuditSchemaVersion =
+        "d4b-audit-export-v1";
+    static constexpr const char *kAuditImplSchemaVersion =
+        "d4b-audit-export-v1.1-hopmultiset";
+    static constexpr const char *kAuditPolicyVersion = "d4b-policy-v4";
+
     /** Read-only access for replay validation (contract section 1.5c). */
     const std::map<DispatchCycleInputs, PatternRecord> &
     patternTable() const { return patternTable_; }
@@ -440,6 +526,20 @@ class TopdownLedger : public statistics::Group
     // -- lossless audit table --------------------------------------------
     std::map<DispatchCycleInputs, PatternRecord> patternTable_;
     bool replayComplete_ = true;
+
+    // -- persistent audit export (d4b-audit-export-v1) --------------------
+    /** Configured output path ("" = no export; default). */
+    std::string auditExportPath_;
+    /** Serialized per-epoch pattern arrays, frozen at each dump so the
+     *  begin-epoch reset cannot lose already-dumped segments.  Mutable
+     *  export cache: exportAudit() runs from the (const) dump callback. */
+    mutable std::map<uint32_t, std::string> exportedEpochs_;
+    /** Patterns dropped after the resource cap, per epoch (replay
+     *  completeness must survive the segment reset too). */
+    mutable std::map<uint32_t, uint64_t> exportedEpochDropped_;
+    /** One-shot fatal guard: the first export failure aborts the run
+     *  (fail-fast), so no repeat-warning noise is needed. */
+    mutable bool exportFailed_ = false;
 
   protected:
     // (stat storages are public: the CPU-side d4bDiag bridge formulas in
