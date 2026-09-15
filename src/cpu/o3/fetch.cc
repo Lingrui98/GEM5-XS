@@ -61,6 +61,7 @@
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/limits.hh"
+#include "cpu/o3/topdown_stats_helpers.hh"
 #include "cpu/o3/trace/TraceFetch.hh"
 #include "cpu/o3/trace/TraceL1iIdentity.hh"
 #include "cpu/pred/btb/decoupled_bpred.hh"
@@ -779,59 +780,54 @@ Fetch::setIEWStage(IEW *iew_stage) {
     iewStage = iew_stage;
 }
 
+// Window machines: the interval/overlap/discard rules live in the
+// production helper (tdstats::RedirectWindow) that the unit tests link
+// directly; these adapters bind them to the stats storages.
+
 void
 Fetch::FetchStatGroup::closeBtbMissWindow(ThreadID tid)
 {
-    if (!btbMissWindow[tid].active) {
-        return;
-    }
     // Half-open interval [start, curCycle): the opening cycle itself is
     // an empty-delivery cycle for this tid (the squash cleared the fetch
     // queue before sendInstructionsToDecode in the same tick), the
     // closing cycle delivered >= 1 instruction and is not charged.
-    const uint64_t elapsed =
-        cpu->curCycle() - btbMissWindow[tid].start;
+    const uint64_t elapsed = btbMissWindow[tid].close(cpu->curCycle());
     if (elapsed > 0) {
         btbMissResteerCycles += elapsed;
     }
-    btbMissWindow[tid].active = false;
 }
 
 void
 Fetch::FetchStatGroup::openBtbMissWindow(ThreadID tid)
 {
-    // Overlap rule: a new redirect closes any still-open window by its
-    // elapsed cycles first, then opens a fresh one — windows never double
-    // charge the same cycle.
-    closeBtbMissWindow(tid);
-    btbMissWindow[tid].active = true;
-    btbMissWindow[tid].start = cpu->curCycle();
+    // Overlap rule (in the helper: close-then-open): a new redirect
+    // closes any still-open window by its elapsed cycles first (the
+    // charge is returned and bound here exactly like the old explicit
+    // closeBtbMissWindow call), then opens a fresh one — windows never
+    // double charge the same cycle.
+    btbMissResteerCycles += btbMissWindow[tid].open(cpu->curCycle());
 }
 
 void
 Fetch::FetchStatGroup::closeRecoveryWindow(ThreadID tid)
 {
-    if (!recoveryWindow[tid].active) {
-        return;
-    }
     // Same half-open interval semantics as the R3 window.
-    const uint64_t elapsed =
-        cpu->curCycle() - recoveryWindow[tid].start;
+    const uint64_t elapsed = recoveryWindow[tid].close(cpu->curCycle());
     if (elapsed > 0) {
         frontendRecoveryCycles += elapsed;
         frontendRecoverySlots += elapsed * fetch->decodeWidth;
     }
-    recoveryWindow[tid].active = false;
 }
 
 void
 Fetch::FetchStatGroup::openRecoveryWindow(ThreadID tid)
 {
-    // Overlap rule (same as R3): a newer commit squash closes any open
-    // recovery window by its elapsed cycles first, then opens a fresh one.
-    closeRecoveryWindow(tid);
-    recoveryWindow[tid].active = true;
-    recoveryWindow[tid].start = cpu->curCycle();
+    // Overlap rule (same as R3, in the helper): the embedded close's
+    // charge is returned and bound here exactly like the old explicit
+    // closeRecoveryWindow call.
+    const uint64_t elapsed = recoveryWindow[tid].open(cpu->curCycle());
+    frontendRecoveryCycles += elapsed;
+    frontendRecoverySlots += elapsed * fetch->decodeWidth;
 }
 
 void
@@ -852,10 +848,10 @@ Fetch::FetchStatGroup::resetStats()
     // delivery/redirect/squash event are attributed to no window by
     // design (the contract forbids billing any window across segments).
     for (auto &w : btbMissWindow) {
-        w.active = false;
+        w.discard();
     }
     for (auto &w : recoveryWindow) {
-        w.active = false;
+        w.discard();
     }
 }
 
@@ -3109,13 +3105,8 @@ Fetch::lookupAndUpdateNextPC(const DynInstPtr &inst, PCStateBase &next_pc,
     // only readers are Decode's selfSquash BTB-miss classification and
     // Fetch::handleDecodeSquash's redirect-window decision; no timing,
     // arbitration, supply or prediction logic ever reads it.
-    bool pred_btb_hit = false;
-    for (const auto &entry : stream.predBTBEntries) {
-        if (entry.valid && entry.pc == curr_pc) {
-            pred_btb_hit = true;
-            break;
-        }
-    }
+    const bool pred_btb_hit =
+        tdstats::predBtbHitSnapshot(curr_pc, stream.predBTBEntries);
     inst->setPredBtbHit(pred_btb_hit);
 
     bool run_out = false;
@@ -4145,18 +4136,14 @@ Fetch::measureFrontendBubbles(unsigned insts_to_decode, ThreadID tid)
     // For N-wide machine, if frontend supplies 0 instructions:
     // - fetchBubbles += N (count total empty slots)
     // - fetchBubbles_max += 1 (count occurrence of all slots being empty)
-    if (!stallSig->blockFetch[tid] && !fromCommit->commitInfo[tid].robSquashing) {
-        // backend not stalled
-        int unused_slots = decodeWidth - insts_to_decode;
-        if (unused_slots > 0) {
-            // has empty slots
-            fetchStats.fetchBubbles += unused_slots; // add number of empty slots
-            if (unused_slots == decodeWidth) {
-                // all slots empty, insts_to_decode == 0
-                fetchStats.fetchBubbles_max++; // count max bubble occurrence
-            }
-        }
-    }
+    const tdstats::FrontendThreadCycleState t{
+        stallSig->blockFetch[tid],
+        fromCommit->commitInfo[tid].robSquashing};
+    const tdstats::FrontendBubbleDelta d =
+        tdstats::accountFrontendBubblesPerThread(t, insts_to_decode,
+                                                 decodeWidth);
+    fetchStats.fetchBubbles += d.fetchBubbles;
+    fetchStats.fetchBubbles_max += d.fetchBubblesMax;
 
     if (stallSig->blockFetch[tid]) {
         fetchStats.decodeStalls++;
@@ -4183,14 +4170,17 @@ Fetch::measureFrontendBubblesEmptyQueueCycle()
     // SMT note: the bubble is charged once at full decode width regardless of
     // how many threads have an empty queue (single-thread configs are
     // unaffected); see the commit message for this SMT policy decision.
+    tdstats::FrontendThreadCycleState states[MaxThreads];
     for (ThreadID i = 0; i < numThreads; ++i) {
-        if (!stallSig->blockFetch[i] &&
-            !fromCommit->commitInfo[i].robSquashing) {
-            fetchStats.fetchBubbles += decodeWidth;
-            fetchStats.fetchBubbles_max++;
-            return;
-        }
+        states[i] = tdstats::FrontendThreadCycleState{
+            stallSig->blockFetch[i],
+            fromCommit->commitInfo[i].robSquashing};
     }
+    const tdstats::FrontendBubbleDelta d =
+        tdstats::accountFrontendBubblesEmptyQueueCycle(
+            states, numThreads, decodeWidth);
+    fetchStats.fetchBubbles += d.fetchBubbles;
+    fetchStats.fetchBubbles_max += d.fetchBubblesMax;
 }
 
 bool

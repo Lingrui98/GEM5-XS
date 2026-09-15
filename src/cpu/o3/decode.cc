@@ -50,7 +50,9 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/limits.hh"
+#include "cpu/o3/topdown_stats_helpers.hh"
 #include "cpu/o3/trace/TraceRecoveryRules.hh"
+#include "cpu/pred/btb/common.hh"
 #include "debug/Activity.hh"
 #include "debug/Counters.hh"
 #include "debug/Decode.hh"
@@ -1033,7 +1035,9 @@ Decode::decodeInsts(ThreadID tid, unsigned max_insts)
                 // the branch was not recognized by the BTB at prediction
                 // time.  A hit with a wrong target (alias/stale entry) is
                 // NOT a BTB miss and is not counted here.
-                if (!inst->readPredBtbHit()) {
+                if (tdstats::countsAsBtbMissResteer(
+                        tdstats::SelfSquashTrigger::DirectTargetMismatch,
+                        inst->readPredBtbHit())) {
                     fetch_ptr->countBtbMissResteer();
                 }
 
@@ -1092,7 +1096,9 @@ Decode::decodeInsts(ThreadID tid, unsigned max_insts)
             // fixup redirect counts as a BTB-miss resteer only when the
             // return's fetch-time snapshot (predBtbHit) says its PC hit no
             // predBTBEntry (not recognized by the BTB at prediction time).
-            if (!inst->readPredBtbHit()) {
+            if (tdstats::countsAsBtbMissResteer(
+                    tdstats::SelfSquashTrigger::ReturnRasFixup,
+                    inst->readPredBtbHit())) {
                 fetch_ptr->countBtbMissResteer();
             }
             decode_stalls.push(StallReason::InstMisPred);

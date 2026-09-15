@@ -61,6 +61,7 @@
 #include "cpu/o3/iew.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/smt_sched.hh"
+#include "cpu/o3/topdown_stats_helpers.hh"
 #include "cpu/pc_event.hh"
 #include "cpu/pred/bpred_unit.hh"
 #include "cpu/pred/btb/decoupled_bpred.hh"
@@ -1741,11 +1742,10 @@ class Fetch
         // that consumes the redirect/squash signal and closes in the first
         // tick that delivers >= 1 instruction to decode for that tid; the
         // charge is (close cycle - open cycle).
-        struct FrontendWindow
-        {
-            bool active = false;
-            Cycles start = Cycles(0);
-        };
+        // The interval/overlap/ROI-discard rules live in the shared
+        // production helper so the unit tests link them directly
+        // (contract section 5a: no inline copy models).
+        using FrontendWindow = tdstats::RedirectWindow;
 
         /** R3: per-tid BTB-miss decode-redirect windows. */
         FrontendWindow btbMissWindow[MaxThreads];
