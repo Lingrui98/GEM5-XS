@@ -746,6 +746,12 @@ class CPU : public BaseCPU
     void ledgerSettleRetired(const DynInstPtr &inst);
     /** Observation points 2-8 settlement (squash terminations). */
     void ledgerSettleSquashed(const DynInstPtr &inst, SettleOrigin origin);
+    /** Lifecycle observation (statistics-only): CPU tick boundary reset
+     *  for the S22b per-tick boundary sample. */
+    void ledgerObserveTick();
+    /** Lifecycle observation (statistics-only): S7 nested-squash marker
+     *  from the commit-side squash arbitration. */
+    void ledgerNoteNestedSquash();
     /** ROI-end Option-B end-of-tick snapshot (cpu.cc ROI-end anchor). */
     void ledgerSnapshot();
 

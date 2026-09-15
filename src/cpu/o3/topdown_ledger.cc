@@ -224,6 +224,22 @@ soleChainCause(const DispatchCycleInputs &in)
 const char *const kSlotClassNames[] = {
     "frontend", "backend", "recovery", "drain", "unknown"};
 
+} // anonymous namespace
+
+const char *
+settleOriginName(SettleOrigin origin)
+{
+    static const char *const names[] = {
+        "Retire", "CommitBelt", "PreCutBelt", "RobWalk", "IQ", "LSQ",
+        "ExecSkip", "DispQue", "BufferSquash"};
+    const unsigned idx = static_cast<unsigned>(origin);
+    assert(idx < static_cast<unsigned>(SettleOrigin::NumSettleOrigins));
+    return names[idx];
+}
+
+namespace
+{
+
 const char *const kPatternXNames[] = {
     "fullwidth",   // 0: budget fully allocated, no unused slots
     "drain",       // 1: P1 drain fired
@@ -726,6 +742,72 @@ TopdownLedger::TopdownLedger(statistics::Group *parent, const Config &cfg,
       ADD_STAT(replayTableOverflowTuples, statistics::units::Count::get(),
                "Cycle records dropped after the tuple-table resource cap "
                "was reached (no silent truncation: replayComplete goes 0)"),
+    ADD_STAT(registerHookCalls, statistics::units::Count::get(),
+               "Lifecycle observation: registerAlloc hook entries while "
+               "collecting (frozen live-group semantics: stops growing "
+               "after the snapshot; post-snapshot attempts are counted in "
+               "postSnapshotRegistrations only)"),
+    ADD_STAT(settleRetiredHookCalls, statistics::units::Count::get(),
+               "Lifecycle observation: settleRetired hook entries while "
+               "collecting"),
+    ADD_STAT(settleSquashedHookCalls, statistics::units::Count::get(),
+               "Lifecycle observation: settleSquashed hook entries while "
+               "collecting"),
+    ADD_STAT(settleRetiredEffective, statistics::units::Count::get(),
+               "Lifecycle observation: settleRetired hooks that transitioned "
+               "a Live member (== retiredCohort + settledOutOfEpochRetired "
+               "+ settledAfterCloseRetired)"),
+    ADD_STAT(settleSquashedEffective, statistics::units::Count::get(),
+               "Lifecycle observation: settleSquashed hooks that transitioned "
+               "a Live member (== squashedCohort + settledOutOfEpochSquashed "
+               "+ settledAfterCloseSquashed)"),
+    ADD_STAT(settleRetiredAbsorbed, statistics::units::Count::get(),
+               "Lifecycle observation: settleRetired hooks absorbed by the "
+               "idempotence rule (tag not Live at the hook)"),
+    ADD_STAT(settleSquashedAbsorbed, statistics::units::Count::get(),
+               "Lifecycle observation: settleSquashed hooks absorbed by the "
+               "idempotence rule (tag not Live at the hook); natural "
+               "duplicate squash notifications (S16) land here"),
+    ADD_STAT(settleAbsorbedUnallocated, statistics::units::Count::get(),
+               "Lifecycle observation: absorbed settles whose tag was never "
+               "registered (pre-C4 population drift-protection no-ops, e.g. "
+               "the pre-cut belt hooks)"),
+    ADD_STAT(settleAbsorbedRetired, statistics::units::Count::get(),
+               "Lifecycle observation: absorbed settles whose tag was "
+               "already Retired (duplicate retire notifications)"),
+    ADD_STAT(settleAbsorbedSquashed, statistics::units::Count::get(),
+               "Lifecycle observation: absorbed settles whose tag was "
+               "already Squashed (duplicate squash notifications, S16)"),
+    ADD_STAT(settleOriginEffective, statistics::units::Count::get(),
+               "Lifecycle observation (S18 class x origin matrix): effective "
+               "in-segment squashed settles per observation point; total == "
+               "squashedCohort"),
+    ADD_STAT(settleOriginOutOfEpoch, statistics::units::Count::get(),
+               "Lifecycle observation: effective squashed settles per "
+               "observation point routed out-of-epoch or after-close; "
+               "total == settledOutOfEpochSquashed + "
+               "settledAfterCloseSquashed"),
+    ADD_STAT(settleOriginAbsorbed, statistics::units::Count::get(),
+               "Lifecycle observation: absorbed settleSquashed hooks per "
+               "observation point; total == settleSquashedAbsorbed"),
+    ADD_STAT(nestedSquashObservations, statistics::units::Count::get(),
+               "Lifecycle observation (S7): squash requests accepted by "
+               "commit while a previous ROB squash walk was still in "
+               "progress (commitStatus==ROBSquashing at arbitration)"),
+    ADD_STAT(snapshotBoundaryTick, statistics::units::Tick::get(),
+               "S22b boundary sample: tick of the Option-B end-of-tick "
+               "snapshot (0 = no snapshot this segment)"),
+    ADD_STAT(snapshotTickRegistrations, statistics::units::Count::get(),
+               "S22b boundary sample: C4 registrations during the snapshot "
+               "tick (all land inside the frozen segment)"),
+    ADD_STAT(snapshotTickSettlesPre, statistics::units::Count::get(),
+               "S22b boundary sample: effective settles during the snapshot "
+               "tick before the snapshot call (all land inside the frozen "
+               "segment)"),
+    ADD_STAT(snapshotTickSettlesPost, statistics::units::Count::get(),
+               "S22b boundary sample: effective settles after the snapshot "
+               "call within the same tick (structurally 0: the snapshot "
+               "block runs after every stage of that tick)"),
       ADD_STAT(retiring, statistics::units::Ratio::get(),
                "topdownV2 L1: retiredCohort / slotBudget (allocation-cohort "
                "semantics, TMA-aligned naming only)"),
@@ -752,6 +834,18 @@ TopdownLedger::TopdownLedger(statistics::Group *parent, const Config &cfg,
 
     for (unsigned x = 0; x < 8; x++)
         slotPatternDist.subname(x, kPatternXNames[x]);
+
+    const unsigned kNumOrigins =
+        static_cast<unsigned>(SettleOrigin::NumSettleOrigins);
+    settleOriginEffective.init(kNumOrigins);
+    settleOriginOutOfEpoch.init(kNumOrigins);
+    settleOriginAbsorbed.init(kNumOrigins);
+    for (unsigned o = 0; o < kNumOrigins; o++) {
+        const char *nm = settleOriginName(static_cast<SettleOrigin>(o));
+        settleOriginEffective.subname(o, nm);
+        settleOriginOutOfEpoch.subname(o, nm);
+        settleOriginAbsorbed.subname(o, nm);
+    }
     for (unsigned y = 0; y < 5; y++)
         slotPatternDist.ysubname(y, kSlotClassNames[y]);
     slotPatternDist.ysubname(5, "reserved0");
@@ -888,11 +982,41 @@ TopdownLedger::invalidate()
 }
 
 void
+TopdownLedger::observeTick(uint64_t whenTick)
+{
+    if (!enabled_)
+        return;
+    // S22b scratch: the per-tick window starts at the CPU tick boundary
+    // (before the commit phase); the snapshot call at the end of the
+    // same tick reads it.  Pure observation: no accounting state changes.
+    if (!haveObservedTick_ || whenTick != observedTick_) {
+        observedTick_ = whenTick;
+        haveObservedTick_ = true;
+        tickRegistrations_ = 0;
+        tickSettlesPre_ = 0;
+    }
+}
+
+void
+TopdownLedger::noteNestedSquash()
+{
+    if (!enabled_ || frozen_)
+        return;
+    nestedSquashObservations++;
+}
+
+void
 TopdownLedger::registerAlloc(LedgerTag &tag, bool inROB, const void *instId,
                              uint64_t whenTick)
 {
     if (!enabled_)
         return;
+
+    if (!frozen_) {
+        registerHookCalls++;
+        if (observedTick_ == whenTick && haveObservedTick_)
+            tickRegistrations_++;
+    }
 
     if (frozen_) {
         // Contract section 1.2b(d): post-snapshot registrations never
@@ -930,14 +1054,55 @@ TopdownLedger::registerAlloc(LedgerTag &tag, bool inROB, const void *instId,
 
 bool
 TopdownLedger::settle(LedgerTag &tag, const void *instId, bool retired,
-                      SettleOrigin origin)
+                      SettleOrigin origin, uint64_t whenTick)
 {
     if (!enabled_)
         return false;
 
+    // Lifecycle observation (statistics-only; never a decision input).
+    // Hook-entry counts and the S22b per-tick scratch run BEFORE the
+    // idempotence gate so the production evidence can distinguish
+    // effective settles from absorbed duplicates (S16) and from pre-C4
+    // drift-protection no-ops.  The per-origin/absorbed vectors and the
+    // hook/effective/absorbed scalars respect the frozen live-group
+    // discipline: after the snapshot only the registered may-grow
+    // diagnostics (settledAfterClose*/settledOutOfEpoch*/
+    // postSnapshotRegistrations) keep growing.
+    const unsigned oidx = static_cast<unsigned>(origin);
+    if (!frozen_) {
+        if (retired)
+            settleRetiredHookCalls++;
+        else
+            settleSquashedHookCalls++;
+        if (observedTick_ == whenTick && haveObservedTick_)
+            tickSettlesPre_++;
+    }
+
     // Idempotence (INV-2): only a Live instruction settles, exactly once.
-    if (tag.state != LedgerState::Live)
+    if (tag.state != LedgerState::Live) {
+        if (!frozen_) {
+            if (retired)
+                settleRetiredAbsorbed++;
+            else
+                settleSquashedAbsorbed++;
+            switch (tag.state) {
+            case LedgerState::Unallocated:
+                settleAbsorbedUnallocated++;
+                break;
+            case LedgerState::Retired:
+                settleAbsorbedRetired++;
+                break;
+            case LedgerState::Squashed:
+                settleAbsorbedSquashed++;
+                break;
+            default:
+                break;
+            }
+            if (!retired)
+                settleOriginAbsorbed[oidx]++;
+        }
         return false;
+    }
 
     const bool currentEpochInst = (tag.epoch == currentEpoch_);
 
@@ -959,8 +1124,10 @@ TopdownLedger::settle(LedgerTag &tag, const void *instId, bool retired,
         // In-segment cohort settlement: the live group updates.
         if (retired) {
             retiredCohort++;
+            settleRetiredEffective++;
         } else {
             squashedCohort++;
+            settleOriginEffective[oidx]++;
             const bool iqSide = (origin == SettleOrigin::IQ ||
                                 origin == SettleOrigin::LSQ ||
                                 origin == SettleOrigin::ExecSkip ||
@@ -969,6 +1136,7 @@ TopdownLedger::settle(LedgerTag &tag, const void *instId, bool retired,
                 squashedInIQ++;
             else
                 squashedAtCommit++;
+            settleSquashedEffective++;
         }
         liveAtClose--;
     } else {
@@ -977,6 +1145,17 @@ TopdownLedger::settle(LedgerTag &tag, const void *instId, bool retired,
             settledOutOfEpochRetired++;
         else
             settledOutOfEpochSquashed++;
+        if (retired)
+            settleRetiredEffective++;
+    }
+    if (!retired && !currentEpochInst) {
+        // Effective squashed settle routed out-of-epoch/after-close
+        // (frozen or pre-segment): per-origin observation, frozen
+        // live-group discipline.
+        if (!frozen_)
+            settleOriginOutOfEpoch[oidx]++;
+        if (!frozen_)
+            settleSquashedEffective++;
     }
 
     tag.state = retired ? LedgerState::Retired : LedgerState::Squashed;
@@ -985,16 +1164,17 @@ TopdownLedger::settle(LedgerTag &tag, const void *instId, bool retired,
 }
 
 void
-TopdownLedger::settleRetired(LedgerTag &tag, const void *instId)
+TopdownLedger::settleRetired(LedgerTag &tag, const void *instId,
+                             uint64_t whenTick)
 {
-    settle(tag, instId, true, SettleOrigin::Retire);
+    settle(tag, instId, true, SettleOrigin::Retire, whenTick);
 }
 
 void
 TopdownLedger::settleSquashed(LedgerTag &tag, const void *instId,
-                              SettleOrigin origin)
+                              SettleOrigin origin, uint64_t whenTick)
 {
-    settle(tag, instId, false, origin);
+    settle(tag, instId, false, origin, whenTick);
 }
 
 void
@@ -1265,6 +1445,22 @@ TopdownLedger::snapshot(uint64_t whenTick)
     snapshotStats.recoverySlots = recoverySlots.value();
     snapshotStats.drainSlots = drainSlots.value();
     snapshotStats.unknownSlots = unknownSlots.value();
+
+    // S22b boundary disambiguation sample (statistics-only, written once
+    // here): the per-tick scratch was reset by observeTick() at the start
+    // of this CPU tick and accumulated the commit-phase settles and
+    // IEW-phase registrations of THIS tick, proving they land inside the
+    // frozen segment.  No stage runs after this block within the same
+    // tick, so the same-tick post-snapshot settle count is structurally 0;
+    // post-snapshot settles appear in later ticks as settledAfterClose*.
+    snapshotBoundaryTick = whenTick;
+    snapshotTickRegistrations =
+        (haveObservedTick_ && observedTick_ == whenTick) ?
+        tickRegistrations_ : 0;
+    snapshotTickSettlesPre =
+        (haveObservedTick_ && observedTick_ == whenTick) ?
+        tickSettlesPre_ : 0;
+    snapshotTickSettlesPost = 0;
 
     // liveAgeMax: oldest live member of the snapshot cohort (in ticks).
     uint64_t oldestReg = whenTick;
