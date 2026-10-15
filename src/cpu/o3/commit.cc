@@ -974,7 +974,9 @@ Commit::tick()
     ledgerCommittedThisCycle_ = 0;
     ledgerOldChargeWindowCyclesThisCycle_ = 0;
     ledgerOldChargeCountThisCycle_ = 0;
-    ledgerOldWindowActive_ = ismispred;
+    ledgerOldWindowActive_ = std::any_of(
+        std::begin(ismispred), std::end(ismispred),
+        [](bool v) { return v; });
 
     if (activeThreads->empty())
         return;

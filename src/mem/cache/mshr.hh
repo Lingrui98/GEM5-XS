@@ -440,11 +440,6 @@ class MSHR : public QueueEntry, public Printable
 
     PrefetchSourceType getInstPrefetchSource() const;
 
-
-    uint64_t getInstPrefetchDecisionId() const;
-
-    PrefetchSourceType getInstPrefetchSource() const;
-
     int getPFDepth() const {
         return targets.pfDepth;
     }

@@ -1044,35 +1044,30 @@ MBTB::commitBranch(const PredictionUpdateContext &context,
         }
     }
 
-    if (inst->isDirectCtrl() && !inst->isIndirectCtrl() &&
-        !inst->isReturn()) {
+    // BTBP branch-demand observation adapted to the
+    // PredictionUpdateContext/BranchOutcome update pipeline: the commit
+    // path here no longer carries the DynInst, so the direct-branch
+    // filter and the target/taken evidence come from the outcome, and
+    // the DynInst-only identity fields (ftqId/instBytes/lineSize) stay
+    // unset (valid flags false).
+    if (!outcome.isIndirect && !outcome.isReturn) {
         BtbpTraceEvent demand_event;
         demand_event.tick = curTick();
         demand_event.eventType = BtbpTraceEvent::BranchDemand;
-        demand_event.threadId = stream.tid;
+        demand_event.threadId = context.tid;
         demand_event.branchPc = pc;
         demand_event.branchPcValid = true;
         demand_event.hit = this_branch_hit;
         demand_event.hitValid = true;
-        std::unique_ptr<PCStateBase> target =
-            inst->staticInst->branchTarget(inst->pcState());
-        demand_event.target = target->instAddr();
+        demand_event.target = this_branch_target;
         demand_event.targetValid = true;
-        demand_event.takenHint = inst->hasTraceBranchInfo() ?
-            inst->traceBranchTaken() :
-            (inst->branching() || inst->isUncondCtrl());
+        demand_event.takenHint = this_branch_taken;
         demand_event.takenHintValid = true;
-        demand_event.lineSize = stream.lineSize;
-        demand_event.lineSizeValid = true;
-        demand_event.asidHash = stream.asidHash;
+        demand_event.asidHash = context.asidHash;
         demand_event.asidHashValid = true;
-        demand_event.ftqId = inst->getFtqId();
-        demand_event.ftqIdValid = true;
         demand_event.lookupTick = meta->lookupTick;
         demand_event.lookupTickValid = true;
-        demand_event.instBytes = inst->getInstBytes();
-        demand_event.instBytesValid = true;
-        demand_event.streamStartPc = stream.startPC;
+        demand_event.streamStartPc = context.startPC;
         demand_event.streamStartPcValid = true;
         demand_event.structuralMiss = false;
         demand_event.structuralMissValid = true;

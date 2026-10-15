@@ -3105,8 +3105,11 @@ Fetch::lookupAndUpdateNextPC(const DynInstPtr &inst, PCStateBase &next_pc,
     // only readers are Decode's selfSquash BTB-miss classification and
     // Fetch::handleDecodeSquash's redirect-window decision; no timing,
     // arbitration, supply or prediction logic ever reads it.
-    const bool pred_btb_hit =
-        tdstats::predBtbHitSnapshot(curr_pc, stream.predBTBEntries);
+    const auto &supplying_target = dbpbtb->ftqFetchingTarget(tid);
+    const bool pred_btb_hit = std::find(
+        supplying_target.predictedBranchPCs.begin(),
+        supplying_target.predictedBranchPCs.end(),
+        curr_pc) != supplying_target.predictedBranchPCs.end();
     inst->setPredBtbHit(pred_btb_hit);
 
     bool run_out = false;
@@ -4068,6 +4071,19 @@ Fetch::sendInstructionsToDecode()
 
         total_insts_to_decode += thread_insts;
         measureFrontendBubbles(thread_insts, tid);
+
+        // D4-A R3/R4: delivering >= 1 instruction to decode for this tid
+        // is the end condition of any open frontend window (BTB-miss
+        // redirect window / commit-squash recovery window) — the frontend
+        // is supplying the currently-known correct path again.  Cycles in
+        // which decode is backend-blocked (blockFetch) while the queue is
+        // non-empty can extend an open window past the queue refill; that
+        // is a documented approximation of this diagnostic proxy
+        // (delivery, not refill, is the defined end point).
+        if (thread_insts >= 1) {
+            fetchStats.closeBtbMissWindow(tid);
+            fetchStats.closeRecoveryWindow(tid);
+        }
     }
 
     // Legacy stall-reason vectors describe one logical decode lane. Keep
@@ -4080,19 +4096,6 @@ Fetch::sendInstructionsToDecode()
     // D4-B d4bDiag evidence: instructions delivered to decode this tick
     // (the H1/H3/H2 overlap diagnostics' delivery signal).
     ledgerDeliveredToDecode_ = static_cast<unsigned>(total_insts_to_decode);
-
-    // D4-A R3/R4: delivering >= 1 instruction to decode for this tid is
-    // the end condition of any open frontend window (BTB-miss redirect
-    // window / commit-squash recovery window) — the frontend is supplying
-    // the currently-known correct path again.  Cycles in which decode is
-    // backend-blocked (blockFetch) while the queue is non-empty can
-    // extend an open window past the queue refill; that is a documented
-    // approximation of this diagnostic proxy (delivery, not refill, is
-    // the defined end point).
-    if (insts_to_decode >= 1) {
-        fetchStats.closeBtbMissWindow(tid);
-        fetchStats.closeRecoveryWindow(tid);
-    }
 
     // If there was activity this cycle, inform the CPU of it
     if (wroteToTimeBuffer) {

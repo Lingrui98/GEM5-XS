@@ -1166,6 +1166,11 @@ class BaseCache : public ClockedObject, public CacheAccessor
 
     BtbpL1iLifecycleLedger btbpLifecycleLedger;
 
+    /** Incoming packet of the in-progress cache replacement (BTBP
+     *  eviction-attribution measurement context; null outside
+     *  allocateBlock's eviction phase). */
+    PacketPtr btbpReplacementPacket = nullptr;
+
     /**
      * when a data expansion of a compressed block happens it will not be
      * able to co-allocate where it is at anymore. If true, the replacement

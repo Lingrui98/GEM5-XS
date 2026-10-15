@@ -1324,6 +1324,8 @@ IEW::recordThreadSquash(ThreadID tid)
 {
     cycleThreadSquash[tid] = true;
     recordThreadWork(tid);
+}
+
 /**
  * D4-B evidence assembly for one dispatch cycle (contract section 1.5a).
  * Every input is read at the same classification point (IEW phase, right

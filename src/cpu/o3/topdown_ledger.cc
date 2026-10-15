@@ -100,6 +100,10 @@ stallReasonName(StallReason r)
         return "ScalarReadyButNotIssued";
       case StallReason::ResumeUnblock:      return "ResumeUnblock";
       case StallReason::CommitSquash:       return "CommitSquash";
+      case StallReason::ControlRecovery:    return "ControlRecovery";
+      case StallReason::MemVioRecovery:     return "MemVioRecovery";
+      case StallReason::VPRecovery:         return "VPRecovery";
+      case StallReason::TrapRecovery:       return "TrapRecovery";
       case StallReason::ROBFull:            return "ROBFull";
       case StallReason::RegFull:            return "RegFull";
       case StallReason::OtherStall:         return "OtherStall";

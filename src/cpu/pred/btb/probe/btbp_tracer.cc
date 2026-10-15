@@ -31,22 +31,24 @@ BtbpTracer::~BtbpTracer()
 void
 BtbpTracer::regProbeListeners()
 {
+    // Upstream probe.hh now owns listeners as ProbeListenerPtr
+    // (unique_ptr with ProbeListenerCleanup); attach through
+    // ProbeManager::connect, which registers the listener with the
+    // manager supplied by Parent.any (the CPU's probe manager in the
+    // kmhv3 wiring).
     using Listener = ProbeListenerArg<BtbpTracer, BtbpTraceEvent>;
+    auto attach = [this](const char *name) {
+        listeners.push_back(
+            manager->connect<Listener>(this, name, &BtbpTracer::trace));
+    };
 
-    listeners.push_back(new Listener(this, "BtbpTraceMbtbLookup",
-                                     &BtbpTracer::trace));
-    listeners.push_back(new Listener(this, "BtbpTraceMbtbFill",
-                                     &BtbpTracer::trace));
-    listeners.push_back(new Listener(this, "BtbpTraceIPrefetchIssue",
-                                     &BtbpTracer::trace));
-    listeners.push_back(new Listener(this, "BtbpTraceLineLifecycle",
-                                     &BtbpTracer::trace));
-    listeners.push_back(new Listener(this, "BtbpTraceL1IDemandAccess",
-                                     &BtbpTracer::trace));
-    listeners.push_back(new Listener(this, "BtbpTraceDecodeBranch",
-                                     &BtbpTracer::trace));
-    listeners.push_back(new Listener(this, "BtbpTraceBranchDemand",
-                                     &BtbpTracer::trace));
+    attach("BtbpTraceMbtbLookup");
+    attach("BtbpTraceMbtbFill");
+    attach("BtbpTraceIPrefetchIssue");
+    attach("BtbpTraceLineLifecycle");
+    attach("BtbpTraceL1IDemandAccess");
+    attach("BtbpTraceDecodeBranch");
+    attach("BtbpTraceBranchDemand");
 }
 
 void

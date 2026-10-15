@@ -3227,7 +3227,13 @@ BaseCache::allocateBlock(
     }
 
     // Try to evict blocks; if it fails, give up on allocation
-    if (!handleEvictions(evict_blks, writebacks, evicted_dirty)) {
+    panic_if(btbpReplacementPacket,
+             "nested cache replacement measurement context");
+    btbpReplacementPacket = pkt;
+    const bool evictions_handled =
+        handleEvictions(evict_blks, writebacks, evicted_dirty);
+    btbpReplacementPacket = nullptr;
+    if (!evictions_handled) {
         return nullptr;
     }
 
