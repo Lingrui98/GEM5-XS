@@ -489,7 +489,9 @@ class MBTB : public TimedBaseBTBPredictor
     void squashNativeWay(int sramId, unsigned way);
     BTBSet &swayExtraSet(int sramId, Addr idx);
     std::vector<std::vector<uint32_t>> &swayExtraVisit(int sramId);
-    void updateBTBEntrySway(const BTBEntry& entry, const FetchTarget &stream);
+    void updateBTBEntrySway(const BTBEntry &entry, bool actual_taken,
+                             Addr actual_target,
+                             const PredictionUpdateContext &stream);
 
     enum Mode {
         READ, WRITE, EVICT
