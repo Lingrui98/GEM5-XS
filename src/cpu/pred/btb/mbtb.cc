@@ -1009,16 +1009,18 @@ MBTB::collectAndResetWayVisitCounts()
 }
 
 void
-MBTB::updateBTBEntrySway(const BTBEntry& entry, const FetchTarget &stream)
+MBTB::updateBTBEntrySway(const BTBEntry &entry, bool actual_taken,
+                          Addr actual_target,
+                          const PredictionUpdateContext &stream)
 {
     btbStats.updateTotal++;
     Addr alignedPC = entry.pc & ~(blockSize - 1);
     int sram_id = getSRAMId(alignedPC);
     auto& target_sram = (sram_id == 0) ? sram0 : sram1;
     auto& target_mru = (sram_id == 0) ? mru0 : mru1;
-    auto& extra_set = swayExtraSet(sram_id, getIndex(entry.pc, stream.asidHash));
+    auto& extra_set = swayExtraSet(sram_id, getIndex(entry.pc, stream.asidHash, stream.tid));
 
-    Addr btb_idx = getIndex(entry.pc, stream.asidHash);
+    Addr btb_idx = getIndex(entry.pc, stream.asidHash, stream.tid);
 
     bool found = false;
     bool found_extra = false;
@@ -1060,7 +1062,8 @@ MBTB::updateBTBEntrySway(const BTBEntry& entry, const FetchTarget &stream)
         existing_ptr = static_cast<const BTBEntry*>(&victimCache[vc_idx]);
     }
 
-    auto entry_to_write = buildUpdatedEntry(entry, existing_ptr, stream);
+    auto entry_to_write = buildUpdatedEntry(
+        entry, actual_taken, actual_target, existing_ptr, stream);
     auto ticked_entry = TickedBTBEntry(entry_to_write, curTick());
 
     if (found) {
@@ -1301,7 +1304,7 @@ MBTB::updateBTBEntry(
     // active; with 0 donated ways the normal path is bit-identical and the
     // borrowed-slot path must stay inert (no pre-fire pre-arming).
     if (enableSwayRealloc && hasActiveBorrows()) {
-        updateBTBEntrySway(entry, stream);
+        updateBTBEntrySway(entry, actual_taken, actual_target, stream);
         return;
     }
 

@@ -314,10 +314,14 @@ class BTBTAGE : public TimedBaseBTBPredictor
      *  The top-level BPU calls collectAndResetWayVisitCounts() at every
      *  phase boundary to derive per-table stranded ratio. See SWAY plan
      *  PENDING-9 / Figure 1.
+     *
+     *  mutable: the counters are pure telemetry, bumped from the const
+     *  prediction path (upstream made generateSinglePrediction const);
+     *  prediction behavior itself is unchanged.
      */
-    std::vector<std::vector<std::vector<uint32_t>>> wayVisitCnt;
+    mutable std::vector<std::vector<std::vector<uint32_t>>> wayVisitCnt;
     std::vector<std::vector<std::vector<TageEntry>>> swayExtraTable;
-    std::vector<std::vector<std::vector<uint32_t>>> swayExtraVisitCnt;
+    mutable std::vector<std::vector<std::vector<uint32_t>>> swayExtraVisitCnt;
     std::vector<uint64_t> swayPhaseUpdates;
     std::vector<uint64_t> swayPhaseAllocSuccess;
     std::vector<uint64_t> swayPhaseEvicts;
@@ -431,7 +435,8 @@ class BTBTAGE : public TimedBaseBTBPredictor
         uint8_t doneeTable = sway::InvalidIndex;
         sway::BorrowedBankGeometry geometry;
         std::vector<std::vector<TageEntry>> entries;
-        std::vector<std::vector<uint32_t>> visits;
+        // mutable: visit telemetry bumped from the const prediction path.
+        mutable std::vector<std::vector<uint32_t>> visits;
     };
     std::array<SwayMbtbBorrowedSlot, sway::NumMbtbTightSlots>
         swayMbtbBorrowedSlots;
@@ -576,7 +581,9 @@ class BTBTAGE : public TimedBaseBTBPredictor
         void updateStatsWithTagePrediction(const TagePrediction &pred, bool when_pred);
     } ;
 
-    TageStats tageStats;
+    // mutable: SWAY borrowed-hit telemetry is bumped from the const
+    // prediction path (swayBorrowedHitsByDonee).
+    mutable TageStats tageStats;
 
 #ifndef UNIT_TEST
     TraceManager *tageMissTrace;
