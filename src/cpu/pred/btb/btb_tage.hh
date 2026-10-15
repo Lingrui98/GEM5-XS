@@ -297,9 +297,12 @@ class BTBTAGE : public TimedBaseBTBPredictor
      *  phase boundary to derive per-table stranded ratio. See SWAY plan
      *  PENDING-9 / Figure 1.
      */
-    std::vector<std::vector<std::vector<uint32_t>>> wayVisitCnt;
+    mutable std::vector<std::vector<std::vector<uint32_t>>> wayVisitCnt;
     std::vector<std::vector<std::vector<TageEntry>>> swayExtraTable;
-    std::vector<std::vector<std::vector<uint32_t>>> swayExtraVisitCnt;
+    mutable std::vector<std::vector<std::vector<uint32_t>>> swayExtraVisitCnt;
+    // mutable: the visit counters above are pure telemetry bumped from
+    // the const prediction path (upstream made generateSinglePrediction
+    // const); prediction behavior is unchanged.
 
     struct WayPhaseSnapshot
     {
