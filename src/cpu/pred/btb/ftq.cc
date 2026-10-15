@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <utility>
 
 #include "ftq.hh"
 
@@ -14,9 +15,24 @@ namespace btb_pred
 int
 FetchTargetQueue::getTargetTid()
 {
+    std::array<bool, MaxThreads> eligible{};
+    eligible.fill(true);
+    return getTargetTid(eligible, nullptr);
+}
+
+int
+FetchTargetQueue::getTargetTid(const std::array<bool, MaxThreads> &eligible,
+                               unsigned *ineligibleSkips)
+{
     for (int i = roundRobinPtr; i < numThreads + roundRobinPtr; ++i) {
         ThreadID tid = i % numThreads;
         if (!queue[tid].cap.empty() && hasTarget(fetchId(tid), tid)) {
+            if (!eligible[tid]) {
+                if (ineligibleSkips) {
+                    ++(*ineligibleSkips);
+                }
+                continue;
+            }
             roundRobinPtr = (tid + 1) % numThreads;
             FetchTarget& target = get(queue[tid].fetchptr, tid);
             return target.tid;
@@ -25,8 +41,44 @@ FetchTargetQueue::getTargetTid()
     return -1;
 }
 
+int
+FetchTargetQueue::getTargetTidByFetchQueueSize(const std::array<bool, MaxThreads> &eligible,
+                                               unsigned *ineligibleSkips,
+                                               const std::array<unsigned, MaxThreads> &fetchQueueSizes)
+{
+    int selectedTid = -1;
+    unsigned minFetchQueueSize = UINT_MAX;
+    
+    // Find eligible thread with minimum fetch queue entries
+    // Use round-robin order to break ties when queue sizes are equal
+    for (int i = roundRobinPtr; i < numThreads + roundRobinPtr; ++i) {
+        ThreadID tid = i % numThreads;
+        if (!eligible[tid]) {
+            if (ineligibleSkips) {
+                ++(*ineligibleSkips);
+            }
+            continue;
+        }
+        
+        if (!queue[tid].cap.empty() && hasTarget(fetchId(tid), tid)) {
+            unsigned fqSize = fetchQueueSizes[tid];
+            if (fqSize < minFetchQueueSize) {
+                minFetchQueueSize = fqSize;
+                selectedTid = tid;
+            }
+        }
+    }
+    
+    // Update round-robin pointer for next call
+    if (selectedTid != -1) {
+        roundRobinPtr = (selectedTid + 1) % numThreads;
+    }
+    
+    return selectedTid;
+}
+
 void
-FetchTargetQueue::insert(FetchTarget& target)
+FetchTargetQueue::insert(FetchTarget&& target)
 {
     ThreadID tid = target.tid;
     assert(queue[tid].cap.size() < ftqSize[tid]);
@@ -39,6 +91,12 @@ void
 FetchTargetQueue::finishTarget(ThreadID tid)
 {
     queue[tid].fetchptr++;
+}
+
+void
+FetchTargetQueue::finishPrefetchTarget(ThreadID tid)
+{
+    queue[tid].prefetchptr++;
 }
 
 void
@@ -55,6 +113,7 @@ FetchTargetQueue::squashAfter(FetchTargetId squashId, ThreadID tid)
         queue[tid].cap.pop_back();
     }
     queue[tid].fetchptr = squashId + 1;
+    queue[tid].prefetchptr = queue[tid].fetchptr;
 }
 
 void
@@ -68,6 +127,7 @@ FetchTargetQueue::clear(ThreadID tid)
     queue[tid].cap.clear();
     queue[tid].baseTargetId = nextTargetId;
     queue[tid].fetchptr = nextTargetId;
+    queue[tid].prefetchptr = nextTargetId;
 }
 
 

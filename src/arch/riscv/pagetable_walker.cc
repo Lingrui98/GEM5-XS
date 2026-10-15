@@ -50,6 +50,7 @@
 
 #include "arch/riscv/pagetable_walker.hh"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <numeric>
@@ -90,6 +91,229 @@ Walker::WalkerStats::WalkerStats(statistics::Group *parent)
                "Average PTW memory latency",
                ptwMemCycle / ptwMemCount)
 {
+}
+
+bool
+Walker::ptwLevelAvailable(WalkerState *state, int level) const
+{
+    if (!enablePtwLevelLimit || !state->usePtwLevelLimit())
+        return true;
+
+    panic_if(level < 0 || level >= static_cast<int>(ptwLevelLimit.size()),
+             "Invalid PTW level %d\n", level);
+    panic_if(ptwLevelLimit[level] == 0,
+             "PTW level %d limit must be positive when enabled\n", level);
+    return state->reservedPtwLevel == level ||
+           ptwLevelActive[level] < ptwLevelLimit[level];
+}
+
+bool
+Walker::reservePtwLevel(WalkerState *state, int level)
+{
+    if (!enablePtwLevelLimit || !state->usePtwLevelLimit())
+        return true;
+
+    panic_if(level < 0 || level >= static_cast<int>(ptwLevelLimit.size()),
+             "Invalid PTW level %d\n", level);
+    panic_if(ptwLevelLimit[level] == 0,
+             "PTW level %d limit must be positive when enabled\n", level);
+
+    if (state->reservedPtwLevel == level)
+        return true;
+
+    releasePtwLevel(state);
+    if (ptwLevelActive[level] >= ptwLevelLimit[level])
+        return false;
+
+    ptwLevelActive[level]++;
+    state->reservedPtwLevel = level;
+    return true;
+}
+
+void
+Walker::releasePtwLevel(WalkerState *state)
+{
+    if (!enablePtwLevelLimit || state->reservedPtwLevel < 0)
+        return;
+
+    const int level = state->reservedPtwLevel;
+    panic_if(level >= static_cast<int>(ptwLevelActive.size()),
+             "Invalid reserved PTW level %d\n", level);
+    panic_if(ptwLevelActive[level] == 0,
+             "PTW level %d active counter underflow\n", level);
+    ptwLevelActive[level]--;
+    state->reservedPtwLevel = -1;
+}
+
+void
+Walker::retryPtwLevelBlockedStates()
+{
+    if (!enablePtwLevelLimit)
+        return;
+
+    for (auto *walker_state : currStates) {
+        if (walker_state->retryBlockedPtwLevel())
+            break;
+    }
+}
+
+bool
+Walker::usePtwLevelLimitForStart(bool from_forward_pre_req,
+                                 bool from_back_pre_req,
+                                 bool is_prefetch) const
+{
+    return enablePtwLevelLimit && !from_forward_pre_req &&
+           !from_back_pre_req && !is_prefetch;
+}
+
+bool
+Walker::canStartPtwLevel(int level, bool from_forward_pre_req,
+                         bool from_back_pre_req, bool is_prefetch)
+{
+    if (!usePtwLevelLimitForStart(from_forward_pre_req, from_back_pre_req,
+                                  is_prefetch))
+        return true;
+
+    panic_if(level < 0 || level >= static_cast<int>(ptwLevelLimit.size()),
+             "Invalid PTW level %d\n", level);
+    panic_if(ptwLevelLimit[level] == 0,
+             "PTW level %d limit must be positive when enabled\n", level);
+    if (ptwLevelActive[level] < ptwLevelLimit[level])
+        return true;
+
+    return false;
+}
+
+bool
+Walker::ptwMissQueueHintMatch(const MissQueueEntry &entry,
+                              const TlbEntry &refill_entry,
+                              uint8_t translateMode) const
+{
+    if (!entry.tc || !entry.req)
+        return false;
+    return tlb->refillHintMaySatisfy(entry.req, entry.tc, entry.mode,
+                                     refill_entry, translateMode);
+}
+
+void
+Walker::notifyTlbRefillHint(const TlbEntry &entry, uint8_t translateMode)
+{
+    if (translateMode != direct && translateMode != allstage)
+        return;
+    if (translateMode == allstage && !entry.pte.r && !entry.pte.x)
+        return;
+
+    if (!enablePtwLevelLimit || retryingPtwMissQueue ||
+        processingPtwMissQueueHint || ptwMissQueue.empty())
+        return;
+
+    if (translateMode == allstage) {
+        MissQueueEntry mq_entry = ptwMissQueue.front();
+        if (!ptwMissQueueHintMatch(mq_entry, entry, translateMode))
+            return;
+
+        ptwMissQueue.pop_front();
+
+        processingPtwMissQueueHint = true;
+        tlb->retryTimingPtwMiss(mq_entry.tc, mq_entry.translation,
+                                mq_entry.req, mq_entry.mode, true);
+        processingPtwMissQueueHint = false;
+        return;
+    }
+
+    std::deque<MissQueueEntry> remaining;
+    std::deque<MissQueueEntry> matched;
+    processingPtwMissQueueHint = true;
+
+    while (!ptwMissQueue.empty()) {
+        MissQueueEntry mq_entry = ptwMissQueue.front();
+        ptwMissQueue.pop_front();
+        if (ptwMissQueueHintMatch(mq_entry, entry, translateMode)) {
+            matched.push_back(mq_entry);
+        } else {
+            remaining.push_back(mq_entry);
+        }
+    }
+
+    ptwMissQueue.swap(remaining);
+
+    while (!matched.empty()) {
+        MissQueueEntry mq_entry = matched.front();
+        matched.pop_front();
+        tlb->retryTimingPtwMiss(mq_entry.tc, mq_entry.translation,
+                                mq_entry.req, mq_entry.mode, true);
+    }
+
+    processingPtwMissQueueHint = false;
+}
+
+bool
+Walker::enqueuePtwMiss(ThreadContext *tc, BaseMMU::Translation *translation,
+                       const RequestPtr &req, BaseMMU::Mode mode, bool front)
+{
+    if (!enablePtwLevelLimit)
+        return false;
+
+    MissQueueEntry entry;
+    entry.tc = tc;
+    entry.translation = translation;
+    entry.req = req;
+    entry.mode = mode;
+
+    if (!front && ptwMissQueue.size() >= ptwMissQueueSize) {
+        ptwMissQueueWaiters.push_back(entry);
+        DPRINTF(PageTableWalker,
+                "PTW MissQueue full, hold vaddr %#lx waiter size %u\n",
+                req->getVaddr(), ptwMissQueueWaiters.size());
+        return true;
+    }
+
+    if (front) {
+        ptwMissQueue.push_front(entry);
+        ptwMissQueueHeadRequeued = true;
+    } else {
+        ptwMissQueue.push_back(entry);
+    }
+    DPRINTF(PageTableWalker,
+            "Enqueue PTW miss vaddr %#lx queue size %u\n",
+            req->getVaddr(), ptwMissQueue.size());
+    return true;
+}
+
+void
+Walker::retryPtwMissQueue()
+{
+    if (!enablePtwLevelLimit || retryingPtwMissQueue)
+        return;
+
+    while (!ptwMissQueueWaiters.empty() &&
+           ptwMissQueue.size() < ptwMissQueueSize) {
+        ptwMissQueue.push_back(ptwMissQueueWaiters.front());
+        ptwMissQueueWaiters.pop_front();
+    }
+    if (ptwMissQueue.empty())
+        return;
+
+    retryingPtwMissQueue = true;
+    while (!ptwMissQueue.empty()) {
+        const size_t size_before = ptwMissQueue.size();
+        ptwMissQueueHeadRequeued = false;
+        MissQueueEntry entry = ptwMissQueue.front();
+        ptwMissQueue.pop_front();
+        DPRINTF(PageTableWalker,
+                "Dequeue PTW miss vaddr %#lx queue size %u\n",
+                entry.req->getVaddr(), ptwMissQueue.size());
+        tlb->retryTimingPtwMiss(entry.tc, entry.translation, entry.req, entry.mode);
+        if (ptwMissQueueHeadRequeued ||
+            ptwMissQueue.size() >= size_before)
+            break;
+        while (!ptwMissQueueWaiters.empty() &&
+               ptwMissQueue.size() < ptwMissQueueSize) {
+            ptwMissQueue.push_back(ptwMissQueueWaiters.front());
+            ptwMissQueueWaiters.pop_front();
+        }
+    }
+    retryingPtwMissQueue = false;
 }
 
 void
@@ -258,11 +482,11 @@ Walker::recvTimingResp(PacketPtr pkt)
                 break;
             }
         }
+        releasePtwLevel(senderWalk);
         delete senderWalk;
-        // Since we block requests when another is outstanding, we
-        // need to check if there is a waiting request to be serviced
-
     }
+    retryPtwLevelBlockedStates();
+    retryPtwMissQueue();
     return true;
 }
 
@@ -354,7 +578,7 @@ Walker::WalkerState::initState(ThreadContext *_tc, const RequestPtr &_req, BaseM
                  vsatp, vsatp >> 60, (vsatp >> 44) & 0xffff, vsatp & 0xfffffffffff);
         DPRINTFR(PageTableWalker, "\thgatp %#x(mode: %d, vmid: %#x, ppn:%#x)\n",
                  hgatp, hgatp >> 60, (hgatp >> 44) & 0xffff, hgatp & 0xfffffffffff);
-    } else {
+    } else {    // 1-stage state
         assert(state == Ready);
         started = false;
         assert(functional || requestors.back().tc == nullptr);
@@ -492,12 +716,21 @@ Walker::dol2TLBHit()
         pma->check(dol2TLBHitrequestors.req);
         l2tlbFault =
             pmp->pmpCheck(dol2TLBHitrequestors.req, dol2TLBHitrequestors.mode,
-                          pmodel2, dol2TLBHitrequestors.tc);
+                          pmodel2, dol2TLBHitrequestors.tc);//pmpcheck
         //assert(l2tlbFault == NoFault);
         if (l2tlbFault == NoFault) {
-            if (enableL1L2replace){
-                if (dol2TLBHitrequestors.entry != nullptr)
-                    tlb->insert(dol2TLBHitrequestors.entry->vaddr, *dol2TLBHitrequestors.entry, false, direct);
+            if (enableL1L2replace){ //write back entry from L2 to L1
+                if (dol2TLBHitrequestors.entry != nullptr) {
+                    TlbEntry l1_entry;
+                    if (tlb->isL1DirectCompressionEnabled() &&
+                        tlb->buildSingleL1CompressedEntry(dol2TLBHitrequestors.req->getVaddr(),
+                                                          *dol2TLBHitrequestors.entry, direct, l1_entry)) {
+                        tlb->insert(l1_entry.vaddr, l1_entry, false, direct);
+                        tlb->recordL1CompressedEntry(l1_entry);
+                    } else if (!tlb->isL1DirectCompressionEnabled()) {
+                        tlb->insert(dol2TLBHitrequestors.entry->vaddr, *dol2TLBHitrequestors.entry, false, direct);
+                    }
+                }
                 if (dol2TLBHitrequestors.entryVsstage != nullptr)
                     tlb->insert(dol2TLBHitrequestors.entryVsstage->vaddr, *dol2TLBHitrequestors.entryVsstage, false,
                             vsstage);
@@ -580,6 +813,15 @@ Walker::WalkerState::startWalk(Addr ppn, int f_level, bool from_l2tlb,
         nextState = state;
         state = Waiting;
         mainFault = NoFault;
+        const int resource_level = currentPtwResourceLevel();
+        if (!walker->reservePtwLevel(this, resource_level)) {
+            waitingForPtwLevel = true;
+            blockedPtwLevel = resource_level;
+            DPRINTF(PageTableWalker,
+                    "PTW level%d busy, defer initial read for %#lx\n",
+                    resource_level, mainReq->getVaddr());
+            return fault;
+        }
         sendPackets();
     } else {
         if (translateMode == twoStageMode)
@@ -882,6 +1124,11 @@ Walker::WalkerState::twoStageStepWalk(PacketPtr &write)
             if (walker->l2tlb == nullptr)
                 panic("walker->l2tlb is none\n");
             
+            if (deferPtwLevelRead(twoStageLevel, nextRead, oldSize, flags, oldRead)) {
+                read = nullptr;
+                walker->retryPtwLevelBlockedStates();
+                return fault;
+            }
             delete oldRead;
             oldRead = nullptr;
             RequestPtr request = std::make_shared<Request>(nextRead, oldSize, flags, walker->requestorId);
@@ -1050,6 +1297,7 @@ Walker::WalkerState::twoStageWalk(PacketPtr &write)
                         if (!tlbHit) {
                             delete oldRead;
                             oldRead = nullptr;
+                            read = nullptr;
                             fault = startTwoStageWalk(gPaddr, entry.vaddr);
                             if (fault != NoFault) {
                                 endWalk();
@@ -1137,6 +1385,7 @@ Walker::WalkerState::twoStageWalk(PacketPtr &write)
                     if (!tlbHit) {
                         delete oldRead;
                         oldRead = nullptr;
+                        read = nullptr;
                         fault = startTwoStageWalk(gPaddr, entry.vaddr);
                         if (fault != NoFault) {
                             endWalk();
@@ -1207,9 +1456,9 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
     if (fault != NoFault) {
         DPRINTF(PageTableWalker3, " may pmp fault vaddr %#x\n", entry.vaddr);
     }
-
+    //
     if ((fault == NoFault) && (!nextline)) {
-        // step 3:
+        // step 3
         if (!pte.v || (!pte.r && pte.w)) {
             doEndWalk = true;
             DPRINTF(PageTableWalker3, "PTE invalid, raising PF\n");
@@ -1386,10 +1635,32 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
             write = NULL;
         }
 
-        if (doTLBInsert) {
+        if (doTLBInsert) {  //write back L1
             if (!functional) {
                 if (((!entry.fromForwardPreReq) && (!entry.fromBackPreReq)) || (preHitInPtw)) {
-                    walker->tlb->insert(entry.vaddr, entry, false, direct);
+                    if (walker->tlb->isL1DirectCompressionEnabled()) {
+                        std::array<PTE, l2tlbLineSize> l1_compress_ptes;
+                        for (int compress_i = 0; compress_i < l2tlbLineSize; compress_i++) {
+                            l1_compress_ptes[compress_i] = read->getLE_l2tlb<uint64_t>(compress_i);
+                        }
+                        walker->tlb->recordL1CompressionPotential(entry.vaddr, entry.pte, l1_compress_ptes, direct,
+                                                                    level);
+                        TlbEntry compressed_entry;
+                        if (walker->tlb->buildL1CompressedEntry(entry.vaddr, entry, l1_compress_ptes, direct, level,
+                                                                 compressed_entry)) {
+                            walker->tlb->insert(compressed_entry.vaddr, compressed_entry, false, direct);
+                            TlbEntry *l1_entry = walker->tlb->lookup(entry.vaddr, entry.asid, BaseMMU::Read, true,
+                                                                     false, direct);
+                            if (l1_entry && l1_entry->isCompressed)
+                                walker->tlb->recordL1CompressedEntry(compressed_entry);
+                        } else if (walker->tlb->buildSingleL1CompressedEntry(entry.vaddr, entry, direct,
+                                                                              compressed_entry)) {
+                            walker->tlb->insert(compressed_entry.vaddr, compressed_entry, false, direct);
+                            walker->tlb->recordL1CompressedEntry(compressed_entry);
+                        }
+                    } else {
+                        walker->tlb->insert(entry.vaddr, entry, false, direct);
+                    }
                 }
                 finishDefaultTranslate = true;
 
@@ -1524,6 +1795,17 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
         endWalk();
     } else {
         //If we didn't return, we're setting up another read.
+        if (!walker->reservePtwLevel(this, level)) {
+            if (waitForPtwLevel(level, nextRead, oldRead->getSize(), flags)) {
+                delete oldRead;
+                oldRead = nullptr;
+                read = nullptr;
+                walker->retryPtwLevelBlockedStates();
+                return fault;
+            }
+        }
+        walker->retryPtwLevelBlockedStates();
+        walker->retryPtwMissQueue();
         RequestPtr request = std::make_shared<Request>(
             nextRead, oldRead->getSize(), flags, walker->requestorId);
         if (nextRead == 0)
@@ -1549,6 +1831,104 @@ Walker::WalkerState::endWalk()
     nextState = Ready;
     delete read;
     read = NULL;
+    walker->releasePtwLevel(this);
+}
+
+bool
+Walker::WalkerState::usePtwLevelLimit() const
+{
+    return timing && (translateMode == defaultmode ||
+                      translateMode == twoStageMode) &&
+           !fromPre && !fromBackPre &&
+           mainReq && !mainReq->isPrefetch();
+}
+
+int
+Walker::WalkerState::currentPtwResourceLevel() const
+{
+    if (translateMode == twoStageMode && inGstage)
+        return twoStageLevel;
+    return level;
+}
+
+bool
+Walker::WalkerState::waitForPtwLevel(int target_level, Addr next_read,
+                                     unsigned read_size,
+                                     Request::Flags flags)
+{
+    if (!usePtwLevelLimit())
+        return false;
+
+    waitingForPtwLevel = true;
+    blockedPtwLevel = target_level;
+    blockedPtwRead = next_read;
+    blockedPtwReadSize = read_size;
+    blockedPtwFlags = flags;
+    state = Waiting;
+    nextState = Translate;
+    DPRINTF(PageTableWalker,
+            "PTW level%d busy, defer read %#lx for vaddr %#lx\n",
+            target_level, next_read, mainReq->getVaddr());
+    return true;
+}
+
+bool
+Walker::WalkerState::deferPtwLevelRead(int target_level, Addr next_read,
+                                       unsigned read_size,
+                                       Request::Flags flags,
+                                       PacketPtr old_read)
+{
+    if (walker->reservePtwLevel(this, target_level))
+        return false;
+
+    if (!waitForPtwLevel(target_level, next_read, read_size, flags))
+        return false;
+
+    PacketPtr pending_read = old_read;
+    if (!pending_read && read && read->isResponse())
+        pending_read = read;
+    if (pending_read) {
+        if (read == pending_read)
+            read = nullptr;
+        delete pending_read;
+    }
+    return true;
+}
+
+bool
+Walker::WalkerState::retryBlockedPtwLevel()
+{
+    if (!waitingForPtwLevel)
+        return false;
+
+    if (!walker->ptwLevelAvailable(this, blockedPtwLevel))
+        return false;
+    if (!walker->reservePtwLevel(this, blockedPtwLevel))
+        return false;
+
+    panic_if(inflight != 0,
+             "Blocked PTW state has in-flight packet when retried\n");
+    if (!read) {
+        panic_if(blockedPtwRead == 0,
+                 "Blocked PTW read address should not be zero\n");
+        RequestPtr request = std::make_shared<Request>(
+            blockedPtwRead, blockedPtwReadSize, blockedPtwFlags,
+            walker->requestorId);
+        read = new Packet(request, MemCmd::ReadReq);
+        read->allocate();
+    }
+
+    DPRINTF(PageTableWalker,
+            "Resume blocked PTW level%d read %#lx for vaddr %#lx\n",
+            blockedPtwLevel, read->getAddr(), mainReq->getVaddr());
+
+    waitingForPtwLevel = false;
+    blockedPtwLevel = -1;
+    blockedPtwRead = 0;
+    blockedPtwReadSize = 0;
+    blockedPtwFlags = Request::PHYSICAL;
+    sendPackets();
+    return true;
 }
 Fault
 Walker::WalkerState::endGstageWalk()
@@ -1593,6 +1973,9 @@ Walker::WalkerState::startTwoStageWalkFromTLBNotInG(Addr ppn, Addr vaddr)
     if (nextRead == 0)
         panic("nextread can't be 0\n");
     Request::Flags flags = Request::PHYSICAL;
+    if (deferPtwLevelRead(level, nextRead, 64, flags, nullptr))
+        return NoFault;
+
     RequestPtr request = std::make_shared<Request>(nextRead, 64, flags, walker->requestorId);
     DPRINTF(PageTableWalkerTwoStage, "twoStageStepWalk nextRead %lx vaddr %lx gpaddr %lx level %d twolevel %d\n",
             nextRead, entry.vaddr, gPaddr, level, twoStageLevel);
@@ -1610,6 +1993,9 @@ Walker::WalkerState::startTwoStageWalkFromTLBInG(Addr ppn, Addr vaddr)
     nextRead = (nextRead >> 6) << 6;
     if (nextRead == 0)
         panic("nextread can't be 0\n");
+    if (deferPtwLevelRead(twoStageLevel, nextRead, 64, flags, nullptr))
+        return NoFault;
+
     RequestPtr request = std::make_shared<Request>(nextRead, 64, flags, walker->requestorId);
     read = new Packet(request, MemCmd::ReadReq);
     read->allocate();
@@ -1641,6 +2027,9 @@ Walker::WalkerState::startTwoStageWalk(Addr ppn, Addr vaddr)
         if (TwoLevelTopAddr == 0)
             panic("topAddr can't be 0\n");
         // DPRINTF(PageTableWalker, " sv39 size is %d\n", sizeof(PTE));
+
+        if (deferPtwLevelRead(twoStageLevel, TwoLevelTopAddr, 64, flags, nullptr))
+            return NoFault;
 
         read = new Packet(request, MemCmd::ReadReq);
         read->allocate();
@@ -1889,6 +2278,9 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
 
         sendPackets();
     }
+    if (waitingForPtwLevel)
+        return false;
+
     if ((inflight == 0 && read == NULL && writes.size() == 0) && (translateMode == twoStageMode)) {
         state = Ready;
         nextState = Waiting;
@@ -2060,6 +2452,9 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
 void
 Walker::WalkerState::sendPackets()
 {
+    if (waitingForPtwLevel)
+        return;
+
     //If we're already waiting for the port to become available, just return.
     if (retrying)
         return;

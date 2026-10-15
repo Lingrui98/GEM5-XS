@@ -74,6 +74,16 @@ struct BtbpTraceEvent
         DemandUse = 3,
         Evict = 4,
         RoiDrainClose = 5,
+        SameLineRefill = 6,
+    };
+
+    enum class GateOutcome : uint32_t
+    {
+        Unknown = 0,
+        Accepted = 1,
+        BandwidthRejected = 2,
+        OutstandingRejected = 3,
+        DrainRejected = 4,
     };
 
     enum FillSource : uint32_t

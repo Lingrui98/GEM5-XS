@@ -55,6 +55,9 @@ struct CacheAccessor
 {
     /** Determine if address is in cache */
     virtual bool inCache(Addr addr, bool is_secure) const = 0;
+    /** Return hit way for an address already known to be in cache. */
+    virtual bool lookupHitWay(Addr addr, bool is_secure,
+                              uint8_t &way) const = 0;
 
     // cache level, l1 is 1, l2 is 2, etc.
     virtual unsigned level() const = 0;

@@ -61,6 +61,7 @@
 #include "mem/se_translating_port_proxy.hh"
 #include "mem/translating_port_proxy.hh"
 #include "params/RiscvISA.hh"
+#include "sim/core.hh"
 #include "sim/faults.hh"
 #include "sim/full_system.hh"
 #include "sim/pseudo_inst.hh"
@@ -112,7 +113,7 @@ matrixWriteBlob(ThreadContext *tc, Addr addr, const void *src, size_t size)
 
 } // namespace
 
-[[maybe_unused]] const std::array<const char *, NUM_MISCREGS> MiscRegNames = {{
+[[maybe_unused]] const std::array<const char *, NUM_MISC_AND_HELPER_REGS> MiscRegNames = {{
     [MISCREG_PRV]           = "PRV",
     [MISCREG_VIRMODE]         = "VIRTUALIZATIONMODE",
     [MISCREG_ISA]           = "ISA",
@@ -229,10 +230,6 @@ matrixWriteBlob(ThreadContext *tc, Addr addr, const void *src, size_t size)
     [MISCREG_MTVEC]         = "MTVEC",
     [MISCREG_MCOUNTEREN]    = "MCOUNTEREN",
     [MISCREG_MENVCFG]       = "MENVCFG",
-    [MISCREG_MSTATEEN0]     = "MSTATEEN0",
-    [MISCREG_MSTATEEN1]     = "MSTATEEN1",
-    [MISCREG_MSTATEEN2]     = "MSTATEEN2",
-    [MISCREG_MSTATEEN3]     = "MSTATEEN3",
     [MISCREG_MSCRATCH]      = "MSCRATCH",
     [MISCREG_MEPC]          = "MEPC",
     [MISCREG_MCAUSE]        = "MCAUSE",
@@ -262,11 +259,6 @@ matrixWriteBlob(ThreadContext *tc, Addr addr, const void *src, size_t size)
     [MISCREG_RESERVED02]    = "",
     [MISCREG_STVEC]         = "STVEC",
     [MISCREG_SCOUNTEREN]    = "SCOUNTEREN",
-    [MISCREG_SENVCFG]       = "SENVCFG",
-    [MISCREG_SSTATEEN0]     = "SSTATEEN0",
-    [MISCREG_SSTATEEN1]     = "SSTATEEN1",
-    [MISCREG_SSTATEEN2]     = "SSTATEEN2",
-    [MISCREG_SSTATEEN3]     = "SSTATEEN3",
     [MISCREG_SSCRATCH]      = "SSCRATCH",
     [MISCREG_SEPC]          = "SEPC",
     [MISCREG_SCAUSE]        = "SCAUSE",
@@ -301,10 +293,6 @@ matrixWriteBlob(ThreadContext *tc, Addr addr, const void *src, size_t size)
     [MISCREG_HTINST]        = "HTINST",
     [MISCREG_HGEIP]         = "HGEIP",
     [MISCREG_HENVCFG]       = "HENVCFG",
-    [MISCREG_HSTATEEN0]     = "HSTATEEN0",
-    [MISCREG_HSTATEEN1]     = "HSTATEEN1",
-    [MISCREG_HSTATEEN2]     = "HSTATEEN2",
-    [MISCREG_HSTATEEN3]     = "HSTATEEN3",
     [MISCREG_HGATP]         = "HGATP",
     [MISCREG_HTIMEDELTA]    = "HTIMEDELTA",
     [MISCREG_VSSTATUS]      = "VSSTATUS",
@@ -323,6 +311,22 @@ matrixWriteBlob(ThreadContext *tc, Addr addr, const void *src, size_t size)
     [MISCREG_NMIVEC]        = "NMIVEC",
     [MISCREG_NMIE]          = "NMIE",
     [MISCREG_NMIP]          = "NMIP",
+    [MISCREG_MSTATEEN0]     = "MSTATEEN0",
+    [MISCREG_MSTATEEN1]     = "MSTATEEN1",
+    [MISCREG_MSTATEEN2]     = "MSTATEEN2",
+    [MISCREG_MSTATEEN3]     = "MSTATEEN3",
+
+    [MISCREG_SENVCFG]       = "SENVCFG",
+    [MISCREG_SSTATEEN0]     = "SSTATEEN0",
+    [MISCREG_SSTATEEN1]     = "SSTATEEN1",
+    [MISCREG_SSTATEEN2]     = "SSTATEEN2",
+    [MISCREG_SSTATEEN3]     = "SSTATEEN3",
+
+    [MISCREG_HSTATEEN0]     = "HSTATEEN0",
+    [MISCREG_HSTATEEN1]     = "HSTATEEN1",
+    [MISCREG_HSTATEEN2]     = "HSTATEEN2",
+    [MISCREG_HSTATEEN3]     = "HSTATEEN3",
+    [MISCREG_FFLAGS_EXE]    = "FFLAGS_EXE",
 }};
 
 
@@ -389,8 +393,14 @@ void ISA::clear()
         miscRegFile[MISCREG_STATUS] = (2ULL << UXL_OFFSET) | (2ULL << SXL_OFFSET) |
                                     (1ULL << FS_OFFSET);
     }
-    miscRegFile[MISCREG_MCOUNTEREN] = 0;
-    miscRegFile[MISCREG_SCOUNTEREN] = 0;
+    if (FullSystem) {
+        miscRegFile[MISCREG_MCOUNTEREN] = 0;
+        miscRegFile[MISCREG_SCOUNTEREN] = 0;
+    } else {
+        // SE runs user-mode code without firmware or an OS to enable counters.
+        miscRegFile[MISCREG_MCOUNTEREN] = 0x7;
+        miscRegFile[MISCREG_SCOUNTEREN] = 0x7;
+    }
     // don't set it to zero; software may try to determine the supported
     // triggers, starting at zero. simply set a different value here.
     miscRegFile[MISCREG_TSELECT] = 1;
@@ -575,7 +585,7 @@ ISA::readMiscRegNoEffect(int misc_reg) const
             return miscRegFile[misc_reg] & (mmu->getPMP()->pmpTorMask());
         }
         return 0;
-    } else if (misc_reg > NUM_MISCREGS || misc_reg < 0) {
+    } else if (misc_reg >= NUM_MISCREGS || misc_reg < 0) {
         // Illegal CSR
         panic("Illegal CSR index %#x\n", misc_reg);
         return -1;
@@ -621,6 +631,26 @@ ISA::readMiscReg(int misc_reg)
         auto ic = dynamic_cast<RiscvISA::Interrupts *>(tc->getCpuPtr()->getInterruptController(tc->threadId()));
         return (ic->readIP() & NEMU_HVIP_MASK);
     }
+    if (misc_reg == MISCREG_HIDELEG) {
+        return readMiscRegNoEffect(MISCREG_HIDELEG) & NEMU_HIDELEG_MASK &
+               readMiscRegNoEffect(MISCREG_MIDELEG);
+    }
+    if (misc_reg == MISCREG_VSIE) {
+        auto ic = dynamic_cast<RiscvISA::Interrupts *>(
+                tc->getCpuPtr()->getInterruptController(tc->threadId()));
+        RegVal mask = readMiscReg(MISCREG_HIDELEG) &
+                      (readMiscRegNoEffect(MISCREG_MIDELEG) |
+                       NEMU_MIDELEG_FORCED_MASK);
+        return (ic->readIE() & mask & NEMU_VS_MASK) >> 1;
+    }
+    if (misc_reg == MISCREG_VSIP) {
+        auto ic = dynamic_cast<RiscvISA::Interrupts *>(
+                tc->getCpuPtr()->getInterruptController(tc->threadId()));
+        RegVal mask = readMiscReg(MISCREG_HIDELEG) &
+                      (readMiscRegNoEffect(MISCREG_MIDELEG) |
+                       NEMU_MIDELEG_FORCED_MASK);
+        return (ic->readIP() & mask & NEMU_VS_MASK) >> 1;
+    }
     switch (misc_reg) {
       case MISCREG_HARTID:
         return tc->contextId();
@@ -634,9 +664,16 @@ ISA::readMiscReg(int misc_reg)
         }
       case MISCREG_TIME:
         if (hpmCounterEnabled(MISCREG_TIME)) {
-            DPRINTF(RiscvMisc, "Wall-clock counter at: %llu.\n",
-                    std::time(nullptr));
-            return readMiscRegNoEffect(MISCREG_TIME);
+            if (!FullSystem) {
+                const uint64_t seTimebaseHz = 1000000;
+                RegVal time = curTick() / (sim_clock::Frequency / seTimebaseHz);
+                DPRINTF(RiscvMisc, "SE time counter at: %llu.\n", time);
+                return time;
+            } else {
+                DPRINTF(RiscvMisc, "Wall-clock counter at: %llu.\n",
+                        std::time(nullptr));
+                return readMiscRegNoEffect(MISCREG_TIME);
+            }
         } else {
             return 0;
         }
@@ -684,6 +721,11 @@ ISA::readMiscReg(int misc_reg)
                   (readMiscRegNoEffect(MISCREG_VXRM) << 1);
         }
         break;
+      case MISCREG_FFLAGS_EXE:
+        {
+            return readMiscRegNoEffect(MISCREG_FFLAGS) & FFLAGS_MASK;
+        }
+        break;
         case MISCREG_PMPADDR00 ... MISCREG_PMPADDR15:
         {
             return readMiscRegNoEffect(misc_reg);
@@ -709,7 +751,7 @@ ISA::readMiscReg(int misc_reg)
 void
 ISA::setMiscRegNoEffect(int misc_reg, RegVal val)
 {
-    if (misc_reg > NUM_MISCREGS || misc_reg < 0) {
+    if (misc_reg >= NUM_MISCREGS || misc_reg < 0) {
         // Illegal CSR
         panic("Illegal CSR index %#x\n", misc_reg);
     }
@@ -859,6 +901,16 @@ ISA::setMiscReg(int misc_reg, RegVal val)
                 RegVal writeVal = ((old & ~(NEMU_HVIP_MASK)) | (val & NEMU_HVIP_MASK));
                 ic->setIP(writeVal);
             } break;
+            case MISCREG_VSIP: {
+                auto ic = dynamic_cast<RiscvISA::Interrupts *>(
+                    tc->getCpuPtr()->getInterruptController(tc->threadId()));
+                RegVal old = readMiscReg(MISCREG_IP);
+                RegVal mask = NEMU_VSIP_WMASK & readMiscReg(MISCREG_HIDELEG) &
+                              (readMiscReg(MISCREG_MIDELEG) |
+                               NEMU_MIDELEG_FORCED_MASK);
+                RegVal writeVal = (old & ~mask) | ((val << 1) & mask);
+                ic->setIP(writeVal);
+            } break;
 
           case MISCREG_IP:
             {
@@ -879,6 +931,18 @@ ISA::setMiscReg(int misc_reg, RegVal val)
                 RegVal hip_Mask = NEMU_HIE_WMASK & (readMiscReg(MISCREG_MIDELEG) | NEMU_MIDELEG_FORCED_MASK);
                 write_val = ((old & ~(hip_Mask)) |(val & hip_Mask));
                 ic->setIE(write_val);
+            }
+            break;
+          case MISCREG_VSIE:
+            {
+                auto ic = dynamic_cast<RiscvISA::Interrupts *>(
+                    tc->getCpuPtr()->getInterruptController(tc->threadId()));
+                RegVal old = readMiscReg(MISCREG_IE);
+                RegVal mask = NEMU_VS_MASK & readMiscReg(MISCREG_HIDELEG) &
+                              (readMiscReg(MISCREG_MIDELEG) |
+                               NEMU_MIDELEG_FORCED_MASK);
+                RegVal writeVal = (old & ~mask) | ((val << 1) & mask);
+                ic->setIE(writeVal);
             }
             break;
           case MISCREG_IE:
@@ -930,6 +994,19 @@ ISA::setMiscReg(int misc_reg, RegVal val)
                     ((cur & ~(NEMU_MSTATUS_WMASK)) | (val & NEMU_MSTATUS_WMASK));
                 mstatus.sd = mstatus.fs == 0x3 || mstatus.vs == 0x3;
                 setMiscRegNoEffect(misc_reg, mstatus);
+            }
+            break;
+          case MISCREG_FFLAGS_EXE:
+            {
+                DPRINTF(RiscvMisc, "Will set fs\n");
+                STATUS mstatus = readMiscRegNoEffect(MISCREG_STATUS);
+                mstatus.fs = 3;
+                mstatus.sd = 1;
+                setMiscRegNoEffect(MISCREG_STATUS, mstatus);
+
+                RegVal fflags = readMiscRegNoEffect(MISCREG_FFLAGS);
+                fflags |= (val & FFLAGS_MASK);
+                setMiscRegNoEffect(MISCREG_FFLAGS, fflags);
             }
             break;
             case MISCREG_FFLAGS:
@@ -993,6 +1070,15 @@ ISA::setMiscReg(int misc_reg, RegVal val)
                setMiscRegNoEffect(misc_reg, writeVal);
             }
             break;
+          case MISCREG_HIDELEG:
+            {
+                RegVal writeVal = val & NEMU_HIDELEG_MASK;
+                setMiscRegNoEffect(misc_reg, writeVal);
+            }
+            break;
+          case MISCREG_SENVCFG:
+            setMiscRegNoEffect(misc_reg, val & NEMU_SENVCFG_WMASK);
+            break;
           case MISCREG_HSTATUS:
             {
                 RegVal oldVal = readMiscRegNoEffect(MISCREG_HSTATUS);
@@ -1025,6 +1111,8 @@ ISA::unserialize(CheckpointIn &cp)
 {
     DPRINTF(Checkpoint, "Unserializing Riscv Misc Registers\n");
     UNSERIALIZE_CONTAINER(miscRegFile);
+    if (miscRegFile.size() < NUM_MISCREGS)
+        miscRegFile.resize(NUM_MISCREGS, 0);
     UNSERIALIZE_SCALAR(matrixTileM);
     UNSERIALIZE_SCALAR(matrixTileK);
     UNSERIALIZE_SCALAR(matrixTileN);

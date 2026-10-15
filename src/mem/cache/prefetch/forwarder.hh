@@ -29,7 +29,14 @@ class PrefetcherForwarder : public Base
   public:
     PrefetcherForwarder(const PrefetcherForwarderParams &p);
 
-    void setRealPrefetcher(Base* real_pf_ptr) { real_pf = real_pf_ptr; }
+    void
+    setRealPrefetcher(Base* real_pf_ptr)
+    {
+        real_pf = real_pf_ptr;
+        if (real_pf) {
+            real_pf->setIssueStatsAtForwarder();
+        }
+    }
 
     bool observeAccess(const PacketPtr &pkt, bool miss) const override;
 
@@ -40,6 +47,11 @@ class PrefetcherForwarder : public Base
     bool hasPendingPacket() override;
     Tick nextPrefetchReadyTime() const override;
 
+    lldp::Hint loadTrain(const PacketPtr &pkt, bool miss) override
+    { return real_pf ? real_pf->loadTrain(pkt, miss) : lldp::Hint(); }
+    void hintData(const lldp::Hint &hint, const PacketPtr &demand,
+                  const uint8_t *data, unsigned size) override
+    { if (real_pf) real_pf->hintData(hint, demand, data, size); }
     void notifyFill(const PacketPtr &pkt) override;
     void coreDirectAddrNotify(const PacketPtr &pkt) override;
     bool hasHintDownStream() const override;
@@ -56,7 +68,16 @@ class PrefetcherForwarder : public Base
 
     // stats
     void incrDemandMhsrMisses() override;
+    void notifyDemandAccess(Addr paddr, bool is_secure, bool miss) override;
+    void notifyCacheMissRequest(Addr paddr, bool is_secure) override;
+    void notifyDemandMshrMiss(Addr paddr, bool is_secure) override;
+    void notifyPrefetchUseful(PrefetchSourceType source) override;
+    void notifyPrefetchEvictsDemand(
+        Addr victim_paddr, bool is_secure,
+        PrefetchSourceType evictor_source) override;
+    void notifyCachelineRefill(Addr paddr, bool is_secure) override;
     void prefetchUnused(PrefetchSourceType pf_type) override;
+    void prefetchUnused(Addr paddr, PrefetchSourceType pf_type) override;
     void pfHitInMSHR(PrefetchSourceType pf_type) override;
     void pfHitInCache(PrefetchSourceType pf_type) override;
     void pfHitInWB(PrefetchSourceType pf_type) override;

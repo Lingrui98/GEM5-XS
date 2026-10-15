@@ -204,6 +204,10 @@ class BaseCPU : public ClockedObject
 
         statistics::Formula hostInstRate;
         statistics::Formula hostOpRate;
+
+      private:
+        Counter instsAtLastReset = 0;
+        Counter opsAtLastReset = 0;
     };
 
     /**
@@ -758,7 +762,7 @@ class BaseCPU : public ClockedObject
         gem5::Addr physEffAddr;
         gem5::Addr effSize;
         uint8_t *goldenValue;
-        uint64_t amoOldGoldenValue;
+        uint8_t amoOldGoldenValue[16];
         // Register address causing difftest error
         bool errorRegsValue[diffAllNum];
         bool errorCsrsValue[diffCsrNum];  // CsrRegIndex

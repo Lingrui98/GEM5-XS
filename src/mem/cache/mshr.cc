@@ -46,6 +46,7 @@
 
 #include "mem/cache/mshr.hh"
 
+#include <algorithm>
 #include <cassert>
 #include <string>
 
@@ -65,6 +66,8 @@ MSHR::MSHR(const std::string &name)
         pendingModified(false),
         postInvalidate(false), postDowngrade(false),
         allocationOwner(AllocationOwner::Unallocated),
+        allocationInstPrefetchDecisionId(0),
+        allocationInstPrefetchSource(PF_NONE),
         wasWholeLineWrite(false), isForward(false),
         targets(name + ".targets"),
         deferredTargets(name + ".deferredTargets")
@@ -76,6 +79,7 @@ MSHR::TargetList::TargetList(const std::string &name)
         needsWritable(false), hasUpgrade(false),
         allocOnFill(false), hasFromCache(false),
         hasFromPref(false), hasFromCPU(false),
+        hasFromDemand(false), hasFromFDIP(false),
         pfSource(PF_NONE), pfDepth(0),
         blkAddr(0), blkSize(0),
         canMergeWrites(true), writesBitmap(0)
@@ -128,6 +132,8 @@ MSHR::TargetList::updateFlags(PacketPtr pkt, Target::Source source,
 
         if (source == Target::FromCPU) {
             hasFromCPU = true;
+            hasFromDemand = hasFromDemand || !pkt->cmd.isSWPrefetch();
+            hasFromFDIP = hasFromFDIP || is_fdip;
         }
     }
 }
@@ -346,6 +352,7 @@ MSHR::allocate(Addr blk_addr, unsigned blk_size, PacketPtr target,
     assert(target);
     isForward = false;
     wasWholeLineWrite = false;
+    sbufferStoreOrigin = target->isDcacheMainPipeSbufferReq();
     _isUncacheable = target->req->isUncacheable();
     inService = false;
     downstreamPending = false;
@@ -354,6 +361,16 @@ MSHR::allocate(Addr blk_addr, unsigned blk_size, PacketPtr target,
                                   target->req->getXsMetadata().isInstPrefetch();
     allocationOwner = is_inst_prefetch ? AllocationOwner::InstPrefetch :
                                          AllocationOwner::Demand;
+    allocationInstPrefetchDecisionId = 0;
+    allocationInstPrefetchSource = PF_NONE;
+    if (is_inst_prefetch) {
+        const auto metadata = target->req->getXsMetadata();
+        panic_if(metadata.instPrefetchDecisionId == 0,
+                 "instruction-prefetch MSHR owner lacks decision identity");
+        allocationInstPrefetchDecisionId =
+            metadata.instPrefetchDecisionId;
+        allocationInstPrefetchSource = metadata.prefetchSource;
+    }
 
     targets.init(blkAddr, blkSize);
     deferredTargets.init(blkAddr, blkSize);
@@ -410,6 +427,24 @@ MSHR::deallocate()
     inService = false;
     fdipLateSeen = false;
     allocationOwner = AllocationOwner::Unallocated;
+    allocationInstPrefetchDecisionId = 0;
+    allocationInstPrefetchSource = PF_NONE;
+}
+
+bool
+MSHR::canMergeSbufferStore(const Packet *predecessor) const
+{
+    if (!sbufferStoreOrigin || !deferredTargets.empty() ||
+        (inService && (hasPostInvalidate() || hasPostDowngrade() ||
+                       !isPendingModified() || isForward))) {
+        return false;
+    }
+    // Once refill has consumed the store target, a late CPU response does
+    // not keep the merge window open (nor does a reused MSHR for this line).
+    return std::any_of(targets.begin(), targets.end(),
+        [predecessor](const Target &target) {
+            return target.pkt == predecessor;
+        });
 }
 
 /*
@@ -468,6 +503,18 @@ MSHR::allocateTarget(PacketPtr pkt, Tick whenReady, Counter _order,
     }
 
     DPRINTF(MSHR, "After target allocation: %s", print());
+}
+
+uint64_t
+MSHR::getInstPrefetchDecisionId() const
+{
+    return allocationInstPrefetchDecisionId;
+}
+
+PrefetchSourceType
+MSHR::getInstPrefetchSource() const
+{
+    return allocationInstPrefetchSource;
 }
 
 bool
@@ -610,7 +657,14 @@ MSHR::pushReadyTargets(TargetList &ready_targets, Target &tgt)
     // in the case when sbuffer store and load missed at the same block
     // make sure write packet is processed before read packet
     // so that load can get the right data after sbuffer store has updated the cache
-    if (tgt.pkt->isWrite()) {
+    if (tgt.pkt->isDcacheMainPipeSbufferReq()) {
+        // Preserve the existing store-before-load policy, but never reverse
+        // successive SBuffer writes: older bytes must not overwrite newer
+        // bytes when several stores share a miss.
+        auto pos = std::find_if(ready_targets.begin(), ready_targets.end(),
+            [](const Target &target) { return !target.pkt->isWrite(); });
+        ready_targets.insert(pos, tgt);
+    } else if (tgt.pkt->isWrite()) {
         ready_targets.push_front(tgt);
     } else {
         ready_targets.push_back(tgt);

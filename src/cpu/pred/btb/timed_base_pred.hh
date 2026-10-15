@@ -4,6 +4,9 @@
 
 #include <boost/dynamic_bitset.hpp>
 
+#include <functional>
+#include <utility>
+
 // Conditional includes based on build mode
 #ifdef UNIT_TEST
     #include "base/types.hh"
@@ -12,8 +15,9 @@
     #include "base/statistics.hh"
     #include "base/types.hh"
     #include "cpu/inst_seq.hh"
-    #include "cpu/o3/dyn_inst_ptr.hh"
     #include "cpu/pred/btb/common.hh"
+    #include "cpu/pred/btb/probe/btbp_trace_event.hh"
+    #include "enums/TrainingStage.hh"
     #include "sim/sim_object.hh"
     #include "params/TimedBaseBTBPredictor.hh"
 #endif
@@ -32,9 +36,11 @@ namespace btb_pred
 namespace test {
 #endif
 
-#ifndef UNIT_TEST
-using DynInstPtr = o3::DynInstPtr;
-#endif
+enum class PredictorTrainingStage
+{
+    Commit,
+    Resolve,
+};
 
 #ifdef UNIT_TEST
 class TimedBaseBTBPredictor
@@ -47,6 +53,14 @@ class TimedBaseBTBPredictor: public SimObject
 #ifdef UNIT_TEST
     TimedBaseBTBPredictor();
     void setNumDelay(unsigned delay) { numDelay = delay; }
+    void setTrainingStage(PredictorTrainingStage stage)
+    {
+        trainingStage = stage;
+    }
+    void setSmtTidPartitioned(bool partitioned)
+    {
+        smtTidPartitioned = partitioned;
+    }
 #else
     typedef TimedBaseBTBPredictorParams Params;
 
@@ -65,6 +79,9 @@ class TimedBaseBTBPredictor: public SimObject
     {
         return nullptr;
     }
+    virtual void refreshPredictionMeta(Addr startAddr,
+                                       const boost::dynamic_bitset<> &history,
+                                       FullBTBPrediction &pred) {}
 
     virtual void specUpdateGHist(const boost::dynamic_bitset<> &history,
                                 FullBTBPrediction &pred,
@@ -73,21 +90,45 @@ class TimedBaseBTBPredictor: public SimObject
                                  FullBTBPrediction &pred,
                                  const PathHistoryUpdate &update) {}
     virtual void recoverHist(const boost::dynamic_bitset<> &history,
-                             const FetchTarget &entry, int shamt,
-                             bool cond_taken) {}
+                             const HistoryRecoveryContext &context,
+                             const DirectionHistoryUpdate &update) {}
     virtual void recoverPHist(const boost::dynamic_bitset<> &history,
-                              const FetchTarget &entry,
+                              const HistoryRecoveryContext &context,
                               const PathHistoryUpdate &update) {}
-    virtual void update(const FetchTarget &entry) {}
+    virtual void update(const PredictionUpdateContext &context,
+                        const PreparedUpdate &update) {}
     virtual unsigned getDelay() {return numDelay;}
-    virtual bool getResolvedUpdate() {return resolvedUpdate;}
-    // Two-phase resolved update: probe first, then apply
-    virtual bool canResolveUpdate(const FetchTarget &entry) { return true; }
-    virtual void doResolveUpdate(const FetchTarget &entry) { update(entry); }
+    bool trainsAtResolve() const
+    {
+        return trainingStage == PredictorTrainingStage::Resolve;
+    }
+    bool trainsAtCommit() const
+    {
+        return trainingStage == PredictorTrainingStage::Commit;
+    }
 #ifndef UNIT_TEST
-    // do some statistics on a per-branch and per-predictor basis
-    virtual void commitBranch(const FetchTarget &entry, const DynInstPtr &inst) {}
+    // BTBP trace plumbing: the top-level BPU installs a callback that
+    // forwards component events to the CPU's probe points.
+    using BtbpTraceNotify = std::function<void(const BtbpTraceEvent &)>;
+    void setBtbpTraceNotify(BtbpTraceNotify notify)
+    {
+        btbpTraceNotify = std::move(notify);
+    }
 #endif
+    // Two-phase resolved update: probe first, then apply
+    virtual bool canResolveUpdate(const PredictionUpdateContext &context,
+                                  const PreparedUpdate &update)
+    {
+        return true;
+    }
+    virtual void doResolveUpdate(const PredictionUpdateContext &context,
+                                 const PreparedUpdate &update)
+    {
+        this->update(context, update);
+    }
+    // do some statistics on a per-branch and per-predictor basis
+    virtual void commitBranch(const PredictionUpdateContext &context,
+                              const BranchOutcome &outcome) {}
 
     int componentIdx{0};
     unsigned aheadPipelinedStages{0};
@@ -111,10 +152,66 @@ class TimedBaseBTBPredictor: public SimObject
     // Check if this component is enabled
     bool isEnabled() const { return enabled; }
 
+    /**
+     * Map an index into one of two equal per-thread storage partitions.
+     * The underlying vector keeps its original total size; only ownership and
+     * replacement domains change when partitioning is enabled.
+     */
+    unsigned partitionIndex(unsigned index, unsigned totalEntries,
+                            ThreadID tid) const
+    {
+        if (!smtTidPartitioned) {
+            return index % totalEntries;
+        }
+        assert(totalEntries >= 2 && totalEntries % 2 == 0);
+        assert(tid < 2);
+        const unsigned entriesPerThread = totalEntries / 2;
+        return tid * entriesPerThread + index % entriesPerThread;
+    }
+
+    unsigned partitionIndexBits(unsigned fullIndexBits) const
+    {
+        assert(!smtTidPartitioned || fullIndexBits > 0);
+        return fullIndexBits - (smtTidPartitioned ? 1 : 0);
+    }
+
+    unsigned partitionBegin(unsigned totalEntries, ThreadID tid) const
+    {
+        if (!smtTidPartitioned) {
+            return 0;
+        }
+        assert(totalEntries >= 2 && totalEntries % 2 == 0);
+        assert(tid < 2);
+        return tid * (totalEntries / 2);
+    }
+
+    unsigned partitionEnd(unsigned totalEntries, ThreadID tid) const
+    {
+        return smtTidPartitioned ?
+            partitionBegin(totalEntries, tid) + totalEntries / 2 :
+            totalEntries;
+    }
+
+    bool usesTidPartitionedStorage() const { return smtTidPartitioned; }
+
+protected:
+#ifndef UNIT_TEST
+    void notifyBtbpTrace(const BtbpTraceEvent &event) const
+    {
+        if (btbpTraceNotify) {
+            btbpTraceNotify(event);
+        }
+    }
+#endif
+
 private:
     unsigned numDelay;
-    bool resolvedUpdate;
+    PredictorTrainingStage trainingStage;
     bool enabled;
+    bool smtTidPartitioned;
+#ifndef UNIT_TEST
+    BtbpTraceNotify btbpTraceNotify;
+#endif
 };
 
 // Close conditional namespace wrapper for testing

@@ -32,6 +32,7 @@
 #ifndef __ARCH_RISCV_TLB_HH__
 #define __ARCH_RISCV_TLB_HH__
 
+#include <array>
 #include <cstdint>
 #include <list>
 #include <vector>
@@ -43,7 +44,6 @@
 #include "arch/riscv/regs/misc.hh"
 #include "arch/riscv/utility.hh"
 #include "base/statistics.hh"
-#include "base/types.hh"
 #include "mem/request.hh"
 #include "params/RiscvTLB.hh"
 #include "sim/sim_object.hh"
@@ -68,6 +68,7 @@ class TLB : public BaseTLB
     bool is_L1tlb;
     bool isStage2;
     bool isTheSharedL2;
+    bool enableL1DirectCompression;
     size_t size;
     size_t sizeBack;
     size_t l2TlbL3Size;
@@ -159,6 +160,22 @@ class TLB : public BaseTLB
         statistics::Scalar l1tlbRemove;
         statistics::Scalar l1tlbUsedRemove;
         statistics::Scalar l1tlbUnusedRemove;
+        statistics::Scalar l1CompressPotentialAttempts;
+        statistics::Scalar l1CompressPotentialBlocks;
+        statistics::Scalar l1CompressPotentialPages;
+        statistics::Scalar l1CompressPotentialSavedEntries;
+        statistics::Vector l1CompressPotentialPagesPerBlock;
+        statistics::Scalar l1CompressedBlocks;
+        statistics::Scalar l1CompressedPages;
+        statistics::Scalar l1CompressedSavedEntries;
+        statistics::Scalar l1CompressedLookupHits;
+        statistics::Scalar l1CompressedLookupMisses;
+        statistics::Scalar l1CompressedLookupFallbackHits;
+        statistics::Scalar l1CompressedLookupFallbackMisses;
+        statistics::Scalar l1CompressedNarrowInserts;
+        statistics::Scalar l1InitialLookupHits;
+        statistics::Scalar l1InitialLookupMisses;
+        statistics::Scalar l1InitialCompressedHits;
 
         statistics::Vector l2tlbRemove;
         statistics::Vector l2tlbUsedRemove;
@@ -213,6 +230,7 @@ class TLB : public BaseTLB
     Fault createPagefault(Addr vaddr, Addr gPaddr,BaseMMU::Mode mode,bool G);
 
     PrivilegeMode getMemPriv(ThreadContext *tc, BaseMMU::Mode mode);
+    PrivilegeMode currentMemPriv(ThreadContext *tc, BaseMMU::Mode mode);
 
     // Checkpointing
     void serialize(CheckpointOut &cp) const override;
@@ -230,7 +248,28 @@ class TLB : public BaseTLB
      */
     Port *getTableWalkerPort() override;
 
+    Addr getEntryPaddr(const TlbEntry *entry, Addr vaddr) const;
+    bool refillHintMaySatisfy(const RequestPtr &req, ThreadContext *tc,
+                              BaseMMU::Mode mode, const TlbEntry &entry,
+                              uint8_t translateMode) const;
+    TlbEntry *lookupL1CompressedFallback(Addr vaddr, uint16_t asid,
+                                         uint8_t translateMode,
+                                         const TlbEntry *missed_entry);
+    TlbEntry *prepareL1CompressedInsert(const TlbEntry &entry,
+                                        uint8_t translateMode);
+    bool buildL1CompressedEntry(Addr vaddr, const TlbEntry &base_entry,
+                                const std::array<PTE, l2tlbLineSize> &ptes,
+                                uint8_t translateMode, int level,
+                                TlbEntry &compressed_entry) const;
+    bool buildSingleL1CompressedEntry(Addr vaddr, const TlbEntry &base_entry,
+                                      uint8_t translateMode,
+                                      TlbEntry &compressed_entry) const;
+    bool isL1DirectCompressionEnabled() const { return enableL1DirectCompression; }
     Addr translateWithTLB(Addr vaddr, uint16_t asid, BaseMMU::Mode mode, uint8_t translateMode);
+    void recordL1CompressionPotential(Addr vaddr, PTE base_pte,
+                                      const std::array<PTE, l2tlbLineSize> &ptes,
+                                      uint8_t translateMode, int level);
+    void recordL1CompressedEntry(const TlbEntry &entry);
 
     Fault L2TLBPagefault(Addr vaddr, BaseMMU::Mode mode, const RequestPtr &req, bool is_pre, bool is_back_pre);
 
@@ -240,9 +279,13 @@ class TLB : public BaseTLB
     void sendPreHitOnHitRequest(TlbEntry *e_pre_1, TlbEntry *e_pre_2, const RequestPtr &req, Addr pre_block,
                                 uint16_t asid, bool forward, int check_level, STATUS status, PrivilegeMode pmode,
                                 BaseMMU::Mode mode, ThreadContext *tc, BaseMMU::Translation *translation);
-    std::pair<bool, Fault> L2TLBSendRequest(Fault fault, TlbEntry *e_l2tlb, const RequestPtr &req, ThreadContext *tc,
-                                            BaseMMU::Translation *translation, BaseMMU::Mode mode, Addr vaddr,
-                                            bool &delayed, int level);
+    std::pair<bool, Fault> L2TLBSendRequest(Fault fault, TlbEntry *e_l2tlb, const RequestPtr &req,
+                                            ThreadContext *tc, BaseMMU::Translation *translation,
+                                            BaseMMU::Mode mode, Addr vaddr, bool &delayed, int level,
+                                            bool from_miss_queue = false);
+    bool retryTimingPtwMiss(ThreadContext *tc, BaseMMU::Translation *translation,
+                            const RequestPtr &req, BaseMMU::Mode mode,
+                            bool from_miss_queue = true);
 
     Fault translateAtomic(const RequestPtr &req,
                           ThreadContext *tc, BaseMMU::Mode mode) override;
@@ -259,7 +302,6 @@ class TLB : public BaseTLB
                               BaseMMU::Translation *translation, BaseMMU::Mode mode) override;
     Fault finalizePhysical(const RequestPtr &req, ThreadContext *tc,
                            BaseMMU::Mode mode) const override;
-    PrivilegeMode currentMemPriv(ThreadContext *tc, BaseMMU::Mode mode);
     TlbEntry *lookup(Addr vpn, uint16_t asid, BaseMMU::Mode mode, bool hidden,
                      bool sign_used, uint8_t translateMode,
                      bool is_prefetch = false);
@@ -309,7 +351,9 @@ class TLB : public BaseTLB
 
   private:
     uint64_t nextSeq() { return ++lruSeq; }
-    void updateL2TLBSeq(TlbEntryTrie *Trie_l2,Addr vpn,Addr step, uint16_t asid,uint8_t translateMode);
+    void updateL2TLBSeq(TlbEntryTrie *Trie_l2, Addr vpn, Addr step,
+                        uint16_t asid, uint8_t translateMode,
+                        unsigned prefix_width);
 
 
     void evictLRU();
@@ -328,17 +372,17 @@ class TLB : public BaseTLB
 
     Fault translate(const RequestPtr &req, ThreadContext *tc,
                     BaseMMU::Translation *translation, BaseMMU::Mode mode,
-                    bool &delayed);
+                    bool &delayed, bool from_miss_queue = false);
     Fault doTwoStageTranslate(const RequestPtr &req, ThreadContext *tc,
                       BaseMMU::Translation *translation, BaseMMU::Mode mode,
-                      bool &delayed);
+                      bool &delayed, bool from_miss_queue = false);
     std::pair<int, Fault> checkHL1Tlb(const RequestPtr &req, ThreadContext *tc, BaseMMU::Translation *translation,
                                       BaseMMU::Mode mode);
     std::pair<int, Fault> checkHL2Tlb(const RequestPtr &req, ThreadContext *tc, BaseMMU::Translation *translation,
                                       BaseMMU::Mode mode, int l1tlbtype);
     Fault doTranslate(const RequestPtr &req, ThreadContext *tc,
                       BaseMMU::Translation *translation, BaseMMU::Mode mode,
-                      bool &delayed);
+                      bool &delayed, bool from_miss_queue = false);
 
 };
 

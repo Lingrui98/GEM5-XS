@@ -446,16 +446,6 @@ Cache::handleTimingReqMiss(PacketPtr pkt, CacheBlk *blk, Tick forward_time,
                     __func__, pkt->getAddr(),
                     pkt->req->getXsMetadata().prefetchSource);
         }
-
-        pkt->makeTimingResponse();
-
-        // request_time is used here, taking into account lat and the delay
-        // charged if the packet comes from the xbar.
-        cpuSidePort.schedTimingResp(pkt, request_time);
-
-        // If an outstanding request is in progress (we found an
-        // MSHR) this is set to null
-        pkt = pf;
     }
 
     WriteQueueEntry *wb_entry = writeBuffer.findMatch(pkt->getAddr(),
@@ -826,6 +816,20 @@ Cache::serviceMSHRTargets(MSHR *mshr, const PacketPtr pkt, CacheBlk *blk)
         switch (target.source) {
           case MSHR::Target::FromCPU:
             from_core = true;
+            if (prefetcher && target.lldpHint.valid && !is_error) {
+                const uint8_t *line = nullptr;
+                unsigned bytes = 0;
+                if (blk && blk->isValid() && (!mshr->isForward || !pkt->hasData())) {
+                    line = blk->data;
+                    bytes = blkSize;
+                } else if (pkt->hasData() && pkt->getSize() == blkSize) {
+                    line = pkt->getConstPtr<uint8_t>();
+                    bytes = pkt->getSize();
+                }
+                prefetcher->hintData(target.lldpHint, tgt_pkt, line, bytes);
+                target.lldpHint.valid = false;
+            }
+
 
             Tick completion_time;
             // Here we charge on completion_time the delay of the xbar if the

@@ -52,6 +52,7 @@
 #include <cstdint>
 #include <queue>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "base/addr_range.hh"
@@ -60,6 +61,7 @@
 #include "base/trace.hh"
 #include "base/types.hh"
 #include "cpu/pred/btb/probe/btbp_trace_event.hh"
+#include "mem/cache/btbp_l1i_lifecycle.hh"
 #include "debug/Cache.hh"
 #include "debug/CachePort.hh"
 #include "debug/CacheTrace.hh"
@@ -182,10 +184,10 @@ class BaseCache : public ClockedObject, public CacheAccessor
 
       protected:
 
-        CacheRequestPort(const std::string &_name, BaseCache *_cache,
+        CacheRequestPort(const std::string &_name,
                         ReqPacketQueue &_reqQueue,
                         SnoopRespPacketQueue &_snoopRespQueue) :
-            QueuedRequestPort(_name, _cache, _reqQueue, _snoopRespQueue)
+            QueuedRequestPort(_name, _reqQueue, _snoopRespQueue)
         { }
 
         /**
@@ -311,8 +313,10 @@ class BaseCache : public ClockedObject, public CacheAccessor
 
       protected:
 
-        CacheResponsePort(const std::string &_name, BaseCache *_cache,
+        CacheResponsePort(const std::string &_name, BaseCache& _cache,
                        const std::string &_label);
+
+        BaseCache& cache;
 
         /** A normal packet queue used to store responses. */
         RespPacketQueue queue;
@@ -333,11 +337,6 @@ class BaseCache : public ClockedObject, public CacheAccessor
      */
     class CpuSidePort : public CacheResponsePort
     {
-      private:
-
-        // a pointer to our specific cache implementation
-        BaseCache *cache;
-
       protected:
         virtual bool recvTimingSnoopResp(PacketPtr pkt) override;
 
@@ -353,7 +352,7 @@ class BaseCache : public ClockedObject, public CacheAccessor
 
       public:
 
-        CpuSidePort(const std::string &_name, BaseCache *_cache,
+        CpuSidePort(const std::string &_name, BaseCache& _cache,
                     const std::string &_label);
 
     };
@@ -391,6 +390,9 @@ class BaseCache : public ClockedObject, public CacheAccessor
     /** Miss status registers */
     MSHRQueue mshrQueue;
 
+    /** MSHR slots held by fake DCache MainPipe refill timing. */
+    int dcacheMainPipeHeldMSHRCredits = 0;
+
     /** Write/writeback buffer */
     WriteQueue writeBuffer;
 
@@ -414,6 +416,65 @@ class BaseCache : public ClockedObject, public CacheAccessor
      */
     uint64_t lastMSHRAllocCycle;
     int accessCounter = 0;
+
+    enum class FdipMissAllocPriorClass
+    {
+        ColdOrUnknown,
+        AfterUseful,
+        AfterUnused
+    };
+
+    struct FdipPendingMissAlloc
+    {
+        FdipMissAllocPriorClass priorClass;
+    };
+
+    struct FdipLineKey
+    {
+        Addr blkAddr = 0;
+        bool isSecure = false;
+
+        bool operator==(const FdipLineKey &other) const
+        {
+            return blkAddr == other.blkAddr && isSecure == other.isSecure;
+        }
+    };
+
+    struct FdipLineKeyHash
+    {
+        size_t operator()(const FdipLineKey &key) const
+        {
+            return (std::hash<Addr>{}(key.blkAddr) << 1) ^
+                   std::hash<bool>{}(key.isSecure);
+        }
+    };
+
+    struct FdipMissAllocTracker
+    {
+        uint64_t allocCount = 0;
+        uint64_t lastAllocCycle = 0;
+    };
+
+    enum class FdipLastOutcome
+    {
+        ColdOrUnknown,
+        UsefulDemandHit,
+        UnusedEvict,
+        DroppedRefill
+    };
+
+    struct FdipLastOutcomeRecord
+    {
+        FdipLastOutcome outcome = FdipLastOutcome::UnusedEvict;
+        uint64_t cycle = 0;
+    };
+
+    std::unordered_map<FdipLineKey, FdipMissAllocTracker, FdipLineKeyHash>
+        fdipMissAllocTrackers;
+    std::unordered_map<FdipLineKey, FdipLastOutcomeRecord, FdipLineKeyHash>
+        fdipLastOutcomes;
+    std::unordered_map<FdipLineKey, FdipPendingMissAlloc, FdipLineKeyHash>
+        fdipPendingMissAllocs;
 
     /** Max number of MSHR allocations/merges allowed per cycle.
      * -1 means unlimited (no arbitration limit). Configured per cache via
@@ -482,10 +543,10 @@ class BaseCache : public ClockedObject, public CacheAccessor
      */
     void markInService(MSHR *mshr, bool pending_modified_resp)
     {
-        bool wasFull = mshrQueue.isFull();
+        bool wasFull = dcacheMainPipeEffectiveMSHRFull();
         mshrQueue.markInService(mshr, pending_modified_resp);
 
-        if (wasFull && !mshrQueue.isFull()) {
+        if (wasFull && !dcacheMainPipeEffectiveMSHRFull()) {
             clearBlocked(Blocked_NoMSHRs);
         }
     }
@@ -665,6 +726,13 @@ class BaseCache : public ClockedObject, public CacheAccessor
                                     CacheBlk *blk) = 0;
 
     virtual void sendHintViaMSHRTargets(MSHR *mshr, const PacketPtr pkt) = 0;
+
+    bool dcacheMainPipeEffectiveMSHRFull() const;
+    bool dcacheMainPipeCanPrefetch() const;
+    void registerDcacheMainPipeLSQ(o3::LSQ *lsq);
+    void holdDcacheMainPipeMSHRCredit();
+    void scheduleDcacheMainPipeMSHRCreditRelease(Tick tick);
+    void releaseDcacheMainPipeMSHRCredit();
 
     /**
      * Handles a response (cache line fill/write ack) from the bus.
@@ -882,7 +950,7 @@ class BaseCache : public ClockedObject, public CacheAccessor
      * @return False if any of the evicted blocks is in transient state.
      */
     bool handleEvictions(std::vector<CacheBlk*> &evict_blks,
-        PacketList &writebacks);
+        PacketList &writebacks, bool *evicted_dirty = nullptr);
 
     /**
      * Handle a fill operation caused by a received packet.
@@ -902,8 +970,10 @@ class BaseCache : public ClockedObject, public CacheAccessor
      * @param allocate Whether to allocate a block or use the temp block
      * @return Pointer to the new cache block.
      */
-    CacheBlk *handleFill(PacketPtr pkt, CacheBlk *blk,
-                         PacketList &writebacks, bool allocate);
+    CacheBlk *handleFill(
+        PacketPtr pkt, CacheBlk *blk, PacketList &writebacks, bool allocate,
+        PrefetchSourceType prefetch_fill_source = PrefetchSourceType::PF_NONE,
+        bool *refill_need_data_read = nullptr);
 
     /**
      * Allocate a new block and perform any necessary writebacks
@@ -917,7 +987,10 @@ class BaseCache : public ClockedObject, public CacheAccessor
      * @param writebacks A list of writeback packets for the evicted blocks
      * @return the allocated block
      */
-    CacheBlk *allocateBlock(const PacketPtr pkt, PacketList &writebacks);
+    CacheBlk *allocateBlock(
+        const PacketPtr pkt, PacketList &writebacks,
+        PrefetchSourceType prefetch_fill_source = PrefetchSourceType::PF_NONE,
+        bool *evicted_dirty = nullptr);
     /**
      * Evict a cache block.
      *
@@ -936,7 +1009,8 @@ class BaseCache : public ClockedObject, public CacheAccessor
      * @param blk Block to invalidate
      * @param writebacks Return a list of packets with writebacks
      */
-    void evictBlock(CacheBlk *blk, PacketList &writebacks);
+    void evictBlock(CacheBlk *blk, PacketList &writebacks,
+                    bool *evicted_dirty = nullptr);
 
     /**
      * Invalidate a cache block.
@@ -1088,6 +1162,8 @@ class BaseCache : public ClockedObject, public CacheAccessor
 
     /** Trace records for every active physical L1I residency. */
     std::unordered_map<uint64_t, BtbpRoiResidency> btbpRoiResidencies;
+
+    BtbpL1iLifecycleLedger btbpLifecycleLedger;
 
     /**
      * when a data expansion of a compressed block happens it will not be
@@ -1300,6 +1376,8 @@ class BaseCache : public ClockedObject, public CacheAccessor
         statistics::Value mshrFullTicks;
         /** Cycles for which the cache stayed blocked due to no free MSHR. */
         statistics::Scalar noMshrBlockedCycles;
+        /** Clean read hits served while the cache was blocked (hit-under-blocked). */
+        statistics::Scalar hitUnderBlockServed;
 
         /** The average bandwidth receiving data from lower cache. */
         statistics::Formula bytesRecvPerCycle;
@@ -1366,6 +1444,9 @@ class BaseCache : public ClockedObject, public CacheAccessor
         statistics::Scalar MSHRArbFails;
 
         statistics::Scalar DcacheRefillTimes;
+        statistics::Scalar DcacheRefillNotifyFromPacketLSQ;
+        statistics::Scalar DcacheRefillNotifyFromOwnerLSQ;
+        statistics::Scalar DcacheRefillNotifyWithoutLSQ;
 
         /** Number of MSHR Alias fails (VA diff) . */
         statistics::Scalar MSHRAliasFails;
@@ -1383,6 +1464,33 @@ class BaseCache : public ClockedObject, public CacheAccessor
          * factor improved).
          */
         statistics::Scalar dataContractions;
+
+        /** Number of L1I fills installed by FDIP-triggered misses. */
+        statistics::Scalar fdipInstalled;
+
+        /** Number of L1I late FDIP observations. */
+        statistics::Scalar fdipLate;
+
+        /** Number of FDIP probes merged into an existing miss. */
+        statistics::Scalar fdipProbeMerged;
+
+        /** Number of FDIP refills dropped for epoch mismatch. */
+        statistics::Scalar fdipEpochMismatch;
+
+        /** Number of FDIP refills dropped at install time. */
+        statistics::Scalar fdipDroppedRefill;
+
+        /** Number of FDIP allocations rejected (no prefetch MSHR credit). */
+        statistics::Scalar fdipRejectedNoPrefetchMSHR;
+
+        /** Late FDIP observations after a cold/unknown prior. */
+        statistics::Scalar fdipMissAllocColdOrUnknownThenLate;
+
+        /** Late FDIP observations after a useful prior. */
+        statistics::Scalar fdipMissAllocAfterUsefulThenLate;
+
+        /** Late FDIP observations after an unused prior. */
+        statistics::Scalar fdipMissAllocAfterUnusedThenLate;
 
         /** Per-command statistics */
         std::vector<std::unique_ptr<CacheCmdStats>> cmd;
@@ -1428,7 +1536,7 @@ class BaseCache : public ClockedObject, public CacheAccessor
                                         allocOnFill(pkt->cmd));
         emitL1IMshrOccupancy(pkt);
 
-        if (mshrQueue.isFull()) {
+        if (dcacheMainPipeEffectiveMSHRFull()) {
             setBlocked((BlockedCause)MSHRQueue_MSHRs);
         }
 
@@ -1653,7 +1761,11 @@ class BaseCache : public ClockedObject, public CacheAccessor
     void rollbackDeferredMiss(PacketPtr pkt);
 
     void emitL1IMshrOccupancy(const PacketPtr pkt);
-    void emitL1ILineEvict(CacheBlk *blk);
+    void emitL1ILineEvict(
+        CacheBlk *blk,
+        branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind kind =
+            branch_prediction::btb_pred::BtbpTraceEvent::LifecycleKind::Evict,
+        const PacketPtr incoming = nullptr);
 
     bool shouldDropFdipRefill(MSHR *mshr, const PacketPtr pkt) const;
     FdipLineKey makeFdipLineKey(Addr blkAddr, bool is_secure) const
@@ -1751,6 +1863,9 @@ class BaseCache : public ClockedObject, public CacheAccessor
 
   private:
 
+    /** Packets forwarded as uncacheable writes and awaiting a response. */
+    std::unordered_set<PacketPtr> outstandingUncacheableWrites;
+
     const unsigned cacheLevel{0};
 
     //const unsigned maxCacheLevel;
@@ -1764,6 +1879,7 @@ class BaseCache : public ClockedObject, public CacheAccessor
 
     const bool forceHit;
     const bool simulateDcacheRefill;
+    o3::LSQ *dcacheMainPipeLSQ = nullptr;
 
 public:
     /**
@@ -1771,9 +1887,27 @@ public:
      */
     const bool doFastWriteline = false;
 
+    /** When true, serve clean read hits even while the cache is blocked
+     * (MSHR-exhausted / downstream backpressure). Misses still NAK+retry. */
+    bool hitUnderBlock = false;
+
+    /** Read-only hit probe (no LRU/writeback side effects) for hit-under-blocked. */
+    bool probeHit(const PacketPtr pkt) const;
+    void incHitUnderBlockServed() { stats.hitUnderBlockServed++; }
+
     // CacheAccessor overrided function
 
     bool inCache(Addr addr, bool is_secure) const override { return tags->findBlock(addr, is_secure); }
+    bool lookupHitWay(Addr addr, bool is_secure, uint8_t &way) const override
+    {
+        CacheBlk *block = tags->findBlock(addr, is_secure);
+        if (!block) {
+            return false;
+        }
+
+        way = block->getWay();
+        return true;
+    }
 
     unsigned level() const override { return cacheLevel; }
 

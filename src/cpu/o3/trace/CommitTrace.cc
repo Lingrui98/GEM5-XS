@@ -62,6 +62,25 @@ bool
 Commit::traceMaybeExitOnEofDrainFromTick()
 {
     if (cpu->isTraceMode() && cpu->isTraceEOF() && cpu->isTracePipelineDrained()) {
+        // EOF reconciliation invariant (runtime self-check; the per-trace
+        // "committed count == reader instrRead" accounting from the
+        // e87d6b5db4 validation batch, made resident): with the pipeline
+        // drained and the reader at EOF, every consumed record must have
+        // been committed exactly once — the committed trace index equals
+        // the reader position. The reader is a single stream bound to
+        // thread 0 (initTraceMode), so only thread 0's committed index is
+        // comparable; other threads' indices would misfire under any
+        // SMT+trace mix.
+        const uint64_t reader_idx = cpu->getTraceReaderIndex();
+        {
+            const uint64_t committed_idx = traceCommitIndex[0];
+            panic_if(committed_idx != reader_idx,
+                     "[Commit][tid:0] EOF reconciliation failed: committed "
+                     "trace index %llu != reader index %llu: replay and "
+                     "commit have diverged",
+                     (unsigned long long)committed_idx,
+                     (unsigned long long)reader_idx);
+        }
         warn("[Commit] Trace mode reached EOF and pipeline drained; exiting cleanly.\n");
         exitSimLoop("Trace-driven CPU reached EOF and drained");
         return true;
@@ -111,6 +130,37 @@ Commit::traceMaybeInjectCtrlFlowChangeFault(ThreadID tid, const DynInstPtr &head
 }
 
 bool
+Commit::traceAccountInjectedCtrlFlowRecord(
+    ThreadID tid, const DynInstPtr &head_inst)
+{
+    if (!cpu->isTraceMode() || !traceCtrlFaultPending[tid] ||
+        traceCtrlFaultSeqNum[tid] != head_inst->seqNum ||
+        !head_inst->hasTraceCtrlFlowChange()) {
+        return false;
+    }
+
+    panic_if(!cpu->isTraceInstruction(head_inst->seqNum),
+             "Trace control-flow fault [sn:%llu] has no trace metadata",
+             head_inst->seqNum);
+    panic_if(head_inst->isMicroop() && !head_inst->isLastMicroop(),
+             "Trace control-flow fault [sn:%llu] is not an instruction boundary",
+             head_inst->seqNum);
+
+    // The fault already applied the recorded target. Account the source record
+    // exactly once while preserving the existing trap squash and ROB removal.
+    updateComInstStats(head_inst);
+    stats.committedInstType[tid][head_inst->opClass()]++;
+    traceOnCommit(tid, head_inst);
+    traceOnMacroCommit(tid);
+
+    DPRINTF(CommitTrace,
+            "[tid:%d idx:%llu sn:%llu] Logically retired trace control-flow record\n",
+            tid, (unsigned long long)cpu->getTraceIndexForSeqNum(head_inst->seqNum),
+            (unsigned long long)head_inst->seqNum);
+    return true;
+}
+
+bool
 Commit::traceMaybeExitOnLastTraceInst(const DynInstPtr &head_inst)
 {
     if (cpu->isTraceMode() && head_inst->isLastTraceInst()) {
@@ -144,6 +194,24 @@ Commit::traceOnCommit(ThreadID tid, const DynInstPtr &head_inst)
     // a sliding window based on the oldest in-flight seqNum and a guard distance.
     if (cpu->isTraceInstruction(head_inst->seqNum)) {
         cpu->cleanupTraceMetadataOnCommit(head_inst->seqNum);
+    }
+
+    static constexpr uint64_t TraceHeartbeatInterval = 5000000;
+    const uint64_t current_idx = traceCommitIndex[tid];
+    const bool first_heartbeat =
+        (current_idx != 0 && traceLastHeartbeatIndex[tid] == 0);
+    const bool periodic_heartbeat =
+        (current_idx != 0 &&
+         (current_idx / TraceHeartbeatInterval) >
+             (traceLastHeartbeatIndex[tid] / TraceHeartbeatInterval));
+    if (first_heartbeat || periodic_heartbeat) {
+        traceLastHeartbeatIndex[tid] = current_idx;
+        warn("[TraceHeartbeat][tid:%d] idx=%llu sn=%llu pc=0x%lx tick=%llu\n",
+             tid,
+             (unsigned long long)current_idx,
+             (unsigned long long)head_inst->seqNum,
+             (unsigned long)head_inst->pcState().instAddr(),
+             (unsigned long long)curTick());
     }
 }
 

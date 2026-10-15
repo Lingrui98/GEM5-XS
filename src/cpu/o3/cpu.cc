@@ -42,6 +42,7 @@
 
 #include "cpu/o3/cpu.hh"
 
+#include <algorithm>
 #include <cassert>
 #include <limits>
 
@@ -106,7 +107,7 @@ CPU::CPU(const BaseO3CPUParams &params)
               params.numPhysRMiscRegs,
               params.isa[0]->regClasses()),
 
-      freeList(name() + ".freelist", &regFile),
+      freeList(name() + ".freelist", &regFile, params),
 
       rob(this, params),
 
@@ -166,6 +167,7 @@ CPU::CPU(const BaseO3CPUParams &params)
     rename.setActiveThreads(&activeThreads);
     iew.setActiveThreads(&activeThreads);
     commit.setActiveThreads(&activeThreads);
+    freeList.setActiveThreads(&activeThreads);
 
     // Give each of the stages the time buffer they will use.
     fetch.setTimeBuffer(&timeBuffer);
@@ -186,6 +188,7 @@ CPU::CPU(const BaseO3CPUParams &params)
     commit.setIEWQueue(&iewTimebuffer);
     commit.setRenameQueue(&renameTimebuffer);
 
+    fetch.setIEWStage(&iew);
     decode.setFetchStage(&fetch);
     commit.setIEWStage(&iew);
     commit.setDecodeStage(&decode);
@@ -243,8 +246,8 @@ CPU::CPU(const BaseO3CPUParams &params)
     for (ThreadID tid = 0; tid < numThreads; tid++) {
         isa[tid] = dynamic_cast<TheISA::ISA *>(params.isa[tid]);
         warn("Setting isa ptr of cpu to %p", isa[tid]);
-        commitRenameMap[tid].init(regClasses, &regFile, &freeList);
-        renameMap[tid].init(regClasses, &regFile, &freeList);
+        commitRenameMap[tid].init(regClasses, &regFile, &freeList, tid);
+        renameMap[tid].init(regClasses, &regFile, &freeList, tid);
     }
 
     // Initialize rename map to assign physical registers to the
@@ -257,7 +260,7 @@ CPU::CPU(const BaseO3CPUParams &params)
                 // Note that we can't use the rename() method because we don't
                 // want special treatment for the zero register at this point
                 RegId rid = RegId(type, ridx);
-                PhysRegIdPtr phys_reg = freeList.getReg(type);
+                PhysRegIdPtr phys_reg = freeList.getReg(type, tid);
                 renameMap[tid].setEntry(rid, VirtRegId(phys_reg));
                 commitRenameMap[tid].setEntry(rid, VirtRegId(phys_reg));
             }
@@ -330,11 +333,34 @@ CPU::regProbePoints()
 {
     BaseCPU::regProbePoints();
 
+    ppLldpDependenceTrain = new ProbePointArg<XsDynInstMetaPtr>(
+        getProbeManager(), "dependenceTrain");
     ppInstAccessComplete = new ProbePointArg<PacketPtr>(
             getProbeManager(), "InstAccessComplete");
     ppDataAccessComplete = new ProbePointArg<
         std::pair<DynInstPtr, PacketPtr>>(
                 getProbeManager(), "DataAccessComplete");
+    ppBtbpTraceMbtbLookup =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceMbtbLookup");
+    ppBtbpTraceMbtbFill =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceMbtbFill");
+    ppBtbpTraceIPrefetchIssue =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceIPrefetchIssue");
+    ppBtbpTraceLineLifecycle =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceLineLifecycle");
+    ppBtbpTraceL1IDemandAccess =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceL1IDemandAccess");
+    ppBtbpTraceDecodeBranch =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceDecodeBranch");
+    ppBtbpTraceBranchDemand =
+        new ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>(
+            getProbeManager(), "BtbpTraceBranchDemand");
 
     fetch.regProbePoints();
     rename.regProbePoints();
@@ -397,6 +423,7 @@ CPU::notifyBtbpTrace(
 
 CPU::CPUStats::CPUStats(CPU *cpu)
     : statistics::Group(cpu),
+      owner(*cpu),
       ADD_STAT(timesIdled, statistics::units::Count::get(),
                "Number of times that the entire CPU went into an idle state "
                "and unscheduled itself"),
@@ -532,7 +559,11 @@ CPU::CPUStats::CPUStats(CPU *cpu)
         .precision(6);
     totalIpc = sum(committedInsts) / cpu->baseStats.numCycles;
 
-    baseRetiring = committedInsts / (cpu->issueWidth * cpu->baseStats.numCycles);
+    // Topdown slots count backend ops, so use committedOps to match the
+    // dispatchedOps population below. Architectural instructions which do
+    // not enter an issue queue must not make retiring exceed dispatch.
+    baseRetiring = committedOps /
+        (cpu->issueWidth * cpu->baseStats.numCycles);
 
     frontendBound = cpu->fetch.getFetchStats().fetchBubbles /
         (cpu->issueWidth * cpu->baseStats.numCycles);
@@ -549,12 +580,19 @@ CPU::CPUStats::CPUStats(CPU *cpu)
 
     frontendBandwidthBound = frontendBound - frontendLatencyBound;
 
-    // badSpecBound = (INST_SPEC - INST_RETIRED + RECOVERY_BUBBLE)/(IssueBW * CPU_CYCLES)
-    badSpecBound = (cpu->iew.getIEWStats().dispatchedInsts - committedInsts + cpu->commit.getCommitStats().recovery_bubble) /
-         (cpu->issueWidth * cpu->baseStats.numCycles);
-
-    // branchMissPrediction = Bad Speculation * BR_MIS_PRED/TOTAL_FLUSH
-    branchMissPrediction = badSpecBound * cpu->commit.getCommitStats().branchMispredicts / cpu->commit.getCommitStats().totalSquash;
+    // badSpecBound =
+    //   (OPS_SPEC - OPS_RETIRED + RECOVERY_BUBBLE) / available slots.
+    // Clamp only reset-boundary skew: ops already in flight when a stats
+    // reset occurs may retire before their dispatch is counted in the
+    // new interval.
+    badSpecBound
+        .init(cpu->numThreads)
+        .flags(statistics::total)
+        .precision(6);
+    branchMissPrediction
+        .init(cpu->numThreads)
+        .flags(statistics::total)
+        .precision(6);
 
     machineClears = badSpecBound - branchMissPrediction;
 
@@ -619,6 +657,39 @@ CPU::CPUStats::CPUStats(CPU *cpu)
 
     miscRegfileWrites
         .prereq(miscRegfileWrites);
+}
+
+void
+CPU::CPUStats::preDumpStats()
+{
+    statistics::Group::preDumpStats();
+
+    auto &iew_stats = owner.iew.getIEWStats();
+    auto &commit_stats = owner.commit.getCommitStats();
+    statistics::VResult dispatched_ops;
+    statistics::VResult committed_ops;
+    statistics::VResult recovery_bubbles;
+    statistics::VResult branch_mispredicts;
+    statistics::VResult total_squashes;
+    iew_stats.dispatchedOps.result(dispatched_ops);
+    committedOps.result(committed_ops);
+    commit_stats.recovery_bubble.result(recovery_bubbles);
+    commit_stats.branchMispredicts.result(branch_mispredicts);
+    commit_stats.totalSquash.result(total_squashes);
+
+    const auto cycles = owner.baseStats.numCycles.value();
+    const auto available_slots = owner.issueWidth * cycles;
+    for (ThreadID tid = 0; tid < owner.numThreads; ++tid) {
+        const auto bad_spec_slots = dispatched_ops[tid] -
+            committed_ops[tid] + recovery_bubbles[tid];
+        badSpecBound[tid] = available_slots == 0 ?
+            0.0 : std::max(0.0, bad_spec_slots / available_slots);
+
+        const auto squashes = total_squashes[tid];
+        branchMissPrediction[tid] = squashes == 0 ?
+            0.0 : badSpecBound[tid].value() *
+                branch_mispredicts[tid] / squashes;
+    }
 }
 
 void
@@ -778,6 +849,7 @@ CPU::startup()
     iew.startupStage();
     rename.startupStage();
     commit.startupStage();
+    freeList.resetEntries();
 
     if (roiInstCount && !warmupInstCount && !btbpRoiTrackingStarted) {
         fetch.beginBtbpRoiTracking();
@@ -959,7 +1031,7 @@ CPU::insertThread(ThreadID tid)
     for (auto type = (RegClassType)0; type <= RMiscRegClass;
             type = (RegClassType)(type + 1)) {
         for (RegIndex idx = 0; idx < regClasses.at(type).numRegs(); idx++) {
-            PhysRegIdPtr phys_reg = freeList.getReg(type);
+            PhysRegIdPtr phys_reg = freeList.getReg(type, tid);
             renameMap[tid].setEntry(RegId(type, idx), VirtRegId(phys_reg));
             scoreboard.setReg(phys_reg);
         }
@@ -977,6 +1049,7 @@ CPU::insertThread(ThreadID tid)
 
     //Reset ROB/IQ/LSQ Entries
     commit.rob->resetEntries();
+    freeList.resetEntries();
 }
 
 void
@@ -1012,6 +1085,10 @@ CPU::removeThread(ThreadID tid)
 
     assert(iew.ldstQueue.getCount(tid) == 0);
     assert(commit.rob->isEmpty(tid));
+
+    // Reset per-thread Preg occupancy accounting so a reinserted tid
+    // does not carry stale quota usage.
+    freeList.resetThreadUsed(tid);
 
     // Reset ROB/IQ/LSQ Entries
 
@@ -1352,6 +1429,18 @@ CPU::getReg(VirtRegId virt_reg)
       default:
         break;
     }
+    return regFile.getReg(virt_reg);
+}
+
+RegVal
+CPU::peekReg(PhysRegIdPtr phys_reg) const
+{
+    return regFile.getReg(phys_reg);
+}
+
+RegVal
+CPU::peekReg(VirtRegId virt_reg) const
+{
     return regFile.getReg(virt_reg);
 }
 
@@ -1945,6 +2034,9 @@ void
 CPU::readGem5Regs(ThreadID tid)
 {
     auto diffAllStates = this->diffAllStates[tid];
+    diffAllStates->gem5RegFile.fcsr =
+        (readMiscRegNoEffect(RiscvISA::MISCREG_FRM, tid) & 0x7) << 5 |
+        (readMiscRegNoEffect(RiscvISA::MISCREG_FFLAGS, tid) & 0x1f);
     for (int i = 0; i < 32; i++) {
         diffAllStates->gem5RegFile[i] = readArchIntReg(i, tid);
         diffAllStates->gem5RegFile[i + 32] = readArchFloatReg(i, tid);

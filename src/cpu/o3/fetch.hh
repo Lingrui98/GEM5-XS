@@ -41,6 +41,8 @@
 #ifndef __CPU_O3_FETCH_HH__
 #define __CPU_O3_FETCH_HH__
 
+#include <array>
+#include <cstdint>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -48,6 +50,7 @@
 
 #include "arch/generic/decoder.hh"
 #include "arch/generic/mmu.hh"
+#include "arch/riscv/pcstate.hh"
 #include "arch/riscv/types.hh"
 #include "base/statistics.hh"
 #include "config/the_isa.hh"
@@ -55,19 +58,24 @@
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/entangling_prefetcher.hh"
 #include "cpu/o3/fdip_cleanup.hh"
+#include "cpu/o3/iew.hh"
 #include "cpu/o3/limits.hh"
+#include "cpu/o3/smt_sched.hh"
 #include "cpu/pc_event.hh"
 #include "cpu/pred/bpred_unit.hh"
 #include "cpu/pred/btb/decoupled_bpred.hh"
+#include "cpu/pred/btb/probe/btbp_trace_event.hh"
 #include "cpu/timebuf.hh"
 #include "cpu/translation.hh"
 #include "cpu/valuepred/valuepred_unit.hh"
+#include "enums/SMTDecodePolicy.hh"
+#include "enums/SMTFetchBlockPolicy.hh"
 #include "enums/SMTFetchPolicy.hh"
+#include "mem/cache/cache_probe_arg.hh"
 #include "mem/packet.hh"
 #include "mem/port.hh"
 #include "sim/eventq.hh"
 #include "sim/probe/probe.hh"
-#include "cpu/o3/smt_sched.hh"
 
 namespace gem5
 {
@@ -80,6 +88,14 @@ namespace o3
 class CPU;
 class TraceFetch;
 class TraceInstruction;
+
+/** One group of resolved control-flow events for the same FTQ entry. */
+struct ResolveQueueEntry
+{
+    ThreadID tid;
+    branch_prediction::btb_pred::FetchTargetId ftqId;
+    std::vector<branch_prediction::btb_pred::BranchOutcome> events;
+};
 
 /**
  * Fetch class handles both single threaded and SMT fetch. Its
@@ -377,6 +393,36 @@ class Fetch
     /** Fetch policy. */
     SMTFetchPolicy fetchPolicy;
 
+    /** Distinct SMT threads allowed to feed Decode in one cycle. */
+    unsigned numPreDispatchThreads;
+
+    /**  Decode Policy: baseline fetch blocking policy */
+    SMTDecodePolicy smtDecodePolicy;
+    unsigned smtBorrowThrottleCycles[MaxThreads];
+    unsigned smtBorrowThrottleHoldCycles;
+    unsigned smtLdstqHighWater;
+    int delayedSchedulerDelay; // only for DelayedICcountPolicy
+
+    /**  Block Policy: long-latency load fetch blocking */
+    SMTFetchBlockPolicy smtFetchBlockPolicy;
+    void checkLongLatencyLoads();
+    bool isBlockPolicyActive() const;
+    unsigned longLatencyThreshold;
+    InstSeqNum lastLoadHeadSeqNum[MaxThreads];
+    uint64_t longLatencyStallCycles[MaxThreads];
+    bool threadFetchBlocked[MaxThreads];
+
+    /** Block Policy: per-thread state tracking for statistics */
+    uint64_t blockStateHoldCycles[MaxThreads];
+
+    // === FlushFrom Policy state ===
+    bool flushFromInitiated[MaxThreads];
+
+    // FlushFrom Policy methods
+    bool isFlushFromPolicy() const;
+    DynInstPtr findFirstUse(const DynInstPtr &loadInst, ThreadID tid);
+    void flushFromInitiateFlush(const DynInstPtr &loadInst, ThreadID tid, bool fromUse);
+
     /** List that has the threads organized by priority. */
     std::list<ThreadID> priorityList;
 
@@ -393,14 +439,6 @@ class Fetch
     InstsCounter* iqCounter;
     InstsCounter* robCounter;
 
-    unsigned smtBorrowThrottleCycles[MaxThreads];
-    unsigned smtBorrowThrottleHoldCycles;
-    unsigned smtLdstqHighWater;
-
-    // Configuration parameters
-    std::string smtDecodePolicy ="multi_priority";
-    int delayedSchedulerDelay;
-
   public:
     /** Fetch constructor. */
     Fetch(CPU *_cpu, const BaseO3CPUParams &params);
@@ -412,6 +450,9 @@ class Fetch
 
     /** Registers probes. */
     void regProbePoints();
+
+    /** Sets ptr to iew. */
+    void setIEWStage(IEW *iew_stage);
 
     /** Sets the main backwards communication time buffer pointer. */
     void setTimeBuffer(TimeBuffer<TimeStruct> *time_buffer);
@@ -429,6 +470,9 @@ class Fetch
     /** Trace-mode status (delegated to TraceFetch). */
     bool isTraceMode() const;
     bool isTraceEOF() const;
+    /** Current trace reader position (records consumed; see
+     *  TraceFetch::getTraceReaderIndex). */
+    uint64_t getTraceReaderIndex() const;
 
     /** Clear all thread-specific states*/
     void clearStates(ThreadID tid);
@@ -551,9 +595,16 @@ class Fetch
      * Looks up the branch predictor, gets a prediction, and updates the PC.
      * @param inst The dynamic instruction object.
      * @param next_pc The PC state to update with the prediction.
+     * @param allow_two_fetch Whether this buffer may cross an FTQ boundary.
+     * @param continued_to_next_target Whether the current buffer was retained
+     *        for the next FTQ target.
+     * @param prediction receives the prediction and false-BTB-hit result.
      * @return true if a branch was predicted taken.
      */
-    bool lookupAndUpdateNextPC(const DynInstPtr &inst, PCStateBase &next_pc);
+    bool lookupAndUpdateNextPC(const DynInstPtr &inst, PCStateBase &next_pc,
+                               bool allow_two_fetch,
+                               bool &continued_to_next_target,
+                               bool &false_hit);
 
     /**
      * Fetches the cache line that contains the fetch PC.  Returns any
@@ -572,8 +623,9 @@ class Fetch
      * Send a pipelined I-cache access request for the next FTQ entry.
      * @param tid Thread ID
      * @param pc_state The PC state of the current instruction.
+     * @return true if the request group was started, false if it was blocked.
      */
-    void sendNextCacheRequest(ThreadID tid, const PCStateBase &pc_state);
+    bool sendNextCacheRequest(ThreadID tid, const PCStateBase &pc_state);
 
     void finishTranslation(const Fault &fault, const RequestPtr &mem_req);
     void finishFdipTranslation(const Fault &fault, const RequestPtr &mem_req);
@@ -736,10 +788,20 @@ class Fetch
      */
     bool handleCommitSignals(ThreadID tid);
 
-    /** Handles iew signals including resolved cfi, mark their btb entries
-     *  and train predictors if they are configured to update in resolve stage.
-     */
+    /** Dispatch IEW notifications to scheduling and training consumers. */
     void handleIEWSignals();
+
+    /** Latch SMT scheduling hints until formal squash or timeout. */
+    void updateEarlyRedirectHints();
+
+    /** Filter and enqueue outcomes, then try training one queued FTQ group. */
+    void processResolveUpdates();
+
+    /** Remove wrong-path resolve events after a redirect. */
+    void squashResolveQueue(ThreadID tid, InstSeqNum squashSeqNum);
+
+    /** Remove all resolve events owned by one thread. */
+    void clearResolveQueue(ThreadID tid);
 
     /** Handles decode squash signals.
      *  @return: Returns true if squash occurred and immediate return needed.
@@ -789,6 +851,44 @@ class Fetch
             StaticInstPtr curMacroop, const PCStateBase &this_pc,
             const PCStateBase &next_pc, bool trace);
 
+    enum class PredecodeFault : uint8_t
+    {
+        None,
+        DirectNotTaken,
+        DirectTargetMismatch,
+        NonCfiTaken,
+        ReturnNotTaken
+    };
+
+    struct PredecodeEntry
+    {
+        DynInstPtr instruction;
+
+        PredecodeEntry();
+        ~PredecodeEntry();
+    };
+
+    struct PredecodeStage
+    {
+        std::array<PredecodeEntry, MaxWidth> entries;
+        unsigned size = 0;
+
+        ~PredecodeStage();
+        void clear();
+    };
+
+    bool predecodePipelineEnabled(ThreadID tid) const;
+    bool predecodeEnabled(ThreadID tid, const StaticInstPtr &staticInst,
+                          const StaticInstPtr &curMacroop) const;
+    void advancePredecodePipeline();
+    bool processPredecodeStage(ThreadID tid);
+    void clearPredecodePipeline(ThreadID tid);
+    PredecodeFault classifyPredecodeFault(
+            const DynInstPtr &instruction,
+            const StaticInstPtr &staticInst) const;
+    void handlePredecodeFault(ThreadID tid, const DynInstPtr &instruction,
+                              PredecodeFault fault);
+
     /** Pipeline the next I-cache access to the current one. */
     void pipelineIcacheAccesses(ThreadID tid);
 
@@ -803,6 +903,10 @@ class Fetch
      * @return true if frontend is ready for fetch, false otherwise
      */
     bool checkDecoupledFrontend(ThreadID tid);
+    ThreadID getEligibleFetchTargetTid(
+        const std::array<bool, MaxThreads> &excluded,
+        bool record_redirect_skips);
+    void clearRedirectPending(ThreadID tid);
 
     /** Prepare fetch address and handle status transitions.
      * @param tid Thread ID
@@ -826,11 +930,15 @@ class Fetch
      * @param tid The thread ID of the instruction.
      * @param pc The current program counter state (will be updated).
      * @param curMacroop The current macro-op being processed (if any).
+     * @param allow_two_fetch Whether this buffer may cross an FTQ boundary.
+     * @param continued_to_next_target Whether the current buffer was retained
+     *        for the next FTQ target.
      * @return true if a branch was predicted.
      */
-    bool
-    processSingleInstruction(ThreadID tid, PCStateBase &pc,
-                             StaticInstPtr &curMacroop);
+    bool processSingleInstruction(ThreadID tid, PCStateBase &pc,
+                                  StaticInstPtr &curMacroop,
+                                  bool allow_two_fetch,
+                                  bool &continued_to_next_target);
 
     /**
      * Checks if the decoder requires more memory to proceed and fetches
@@ -844,20 +952,11 @@ class Fetch
                                  const StaticInstPtr &curMacroop);
 
 
-    /**
-     * Looks up the branch predictor, gets a prediction, and updates the PC.
-     * @param inst The dynamic instruction object.
-     * @param next_pc The PC state to update with the prediction.
-     * @param predictedBranch Flag indicating if a branch was predicted.
-     * @param newMacro Flag indicating if we are moving to a new macro-op.
-     */
-    void
-    lookupAndUpdateNextPC(const DynInstPtr &inst, PCStateBase &next_pc,
-                         bool &predictedBranch, bool &newMacro);
-
   private:
     /** Pointer to the O3CPU. */
     CPU *cpu;
+
+    IEW *iewStage;
 
     /** Time buffer interface. */
     TimeBuffer<TimeStruct> *timeBuffer;
@@ -901,6 +1000,11 @@ class Fetch
     /** Can the fetch stage redirect from an interrupt on this instruction? */
     bool delayedCommit[MaxThreads];
 
+    /** Threads with a backend redirect detected before the formal squash arrives. */
+    bool redirectPending[MaxThreads];
+    unsigned redirectPendingCycles[MaxThreads];
+    unsigned redirectPendingHoldCycles;
+
     /** Variable that tracks if fetch has written to the time buffer this
      * cycle. Used to tell CPU if there is activity this cycle.
      */
@@ -933,6 +1037,12 @@ class Fetch
 
     /** The width of fetch in instructions. */
     unsigned fetchWidth;
+
+    /** Enable consuming two consecutive FTQ targets from one fetch buffer. */
+    const bool enableTwoFetch;
+
+    /** Maximum byte window covered by limited two-fetch. */
+    const unsigned twoFetchMaxBytes;
 
     /** The width of decode in instructions. */
     unsigned decodeWidth;
@@ -1170,11 +1280,17 @@ class Fetch
         /** Whether the fetch buffer data is valid */
         bool valid;
 
+        /** Whether this buffer has already crossed one FTQ boundary. */
+        bool usedForTwoFetch;
+
         /** Size of the fetch buffer in bytes. Set by Fetch class during init. */
         unsigned size;
 
         /** Constructor initializes buffer with default size */
-        FetchBuffer() : data(nullptr), startPC(0), valid(false), size(0) {
+        FetchBuffer()
+            : data(nullptr), startPC(0), valid(false),
+              usedForTwoFetch(false), size(0)
+        {
         }
 
         /** Destructor is not needed as Fetch class manages memory */
@@ -1185,6 +1301,7 @@ class Fetch
         void reset() {
             valid = false;
             startPC = 0;
+            usedForTwoFetch = false;
             // No need to clear data as it will be overwritten
         }
 
@@ -1224,6 +1341,10 @@ class Fetch
     /** Queue of fetched instructions. Per-thread to prevent HoL blocking. */
     std::deque<DynInstPtr> fetchQueue[MaxThreads];
 
+    /** Fixed two-cycle check pipeline; it neither queues nor backpressures. */
+    PredecodeStage predecodeStage0[MaxThreads];
+    PredecodeStage predecodeStage1[MaxThreads];
+
     unsigned currentLoopIter{0};  // todo: remove this
 
     /** Icache stall statistics. */
@@ -1238,6 +1359,12 @@ class Fetch
     /** Number of threads that are actively fetching. */
     ThreadID numFetchingThreads;
 
+    /** Maximum number of threads that may start an FTQ fetch each cycle. */
+    const unsigned numFetchTargetThreads;
+
+    /** Optional RISC-V predecode owner, disabled by default. */
+    bool enablePredecode;
+
     /** Thread ID being fetched. */
     ThreadID threadFetched;
 
@@ -1249,8 +1376,9 @@ class Fetch
     /** Instruction port. Note that it has to appear after the fetch stage. */
     IcachePort icachePort;
 
-    /** Event used to delay fault generation of translation faults */
-    FinishTranslationEvent finishTranslationEvent;
+    /** Per-thread events used to delay translation fault generation. */
+    std::vector<std::unique_ptr<FinishTranslationEvent>>
+        finishTranslationEvents;
 
     // NOTE: This Fetch implementation is decoupled+BTB-only; no coupled mode.
 
@@ -1362,6 +1490,8 @@ class Fetch
         statistics::Scalar branches;
         /** Stat for total number of predicted branches. */
         statistics::Scalar predictedBranches;
+        /** RISC-V predecode-owned recovery events. */
+        statistics::Scalar predecodeRedirects;
         /** Stat for total number of cycles spent fetching. */
         statistics::Scalar cycles;
         /** Stat for total number of cycles spent squashing. */
@@ -1404,6 +1534,10 @@ class Fetch
         statistics::Scalar tlbSquashes;
         /** Distribution of number of instructions fetched each cycle. */
         statistics::Distribution nisnDist;
+        /** Distinct SMT threads sent to Decode in one cycle. */
+        statistics::Distribution decodeThreadsPerCycle;
+        /** Instructions sent from per-thread fetch queues to Decode. */
+        statistics::Distribution instsSentToDecodePerCycle;
         /** Rate of how often fetch was idle. */
         statistics::Formula idleRate;
         /** Number of branch fetches per cycle. */
@@ -1435,12 +1569,35 @@ class Fetch
         /** Stat for total number of resolve enqueue fail events. */
         statistics::Scalar resolveEnqueueFailEvent;
 
+        /** Resolved events discarded because of a squash. */
+        statistics::Scalar resolveSquashedEvents;
+
         /** Stat for total number of resolve dequeue events. */
         statistics::Scalar resolveDequeueCount;
+        /** Number of individual resolved events successfully consumed. */
+        statistics::Scalar resolveDequeueEventCount;
         /** Stat for total number of resolve enqueue events. */
         statistics::Distribution resolveEnqueueCount;
         /** Stat for entry occupancy distribution of the resolve queue. */
         statistics::Distribution resolveQueueOccupancy;
+        /** Times fetch skipped an FTQ head because IEW reported a pending redirect. */
+        statistics::Scalar redirectPendingFetchSkips;
+        /** Cycles where only redirect-pending FTQ heads were available to fetch. */
+        statistics::Scalar redirectPendingOnlyFetchCycles;
+        /** Number of FTQ fetch groups started in one cycle. */
+        statistics::Distribution fetchTargetsStartedPerCycle;
+        /** Number of FTQ fetch groups started for each SMT thread. */
+        statistics::Vector fetchTargetsStartedByThread;
+        /** Number of cache-line requests created by FTQ fetches per cycle. */
+        statistics::Distribution fetchLineRequestsCreatedPerCycle;
+        /** Selected FTQ heads whose thread state could not start a fetch. */
+        statistics::Scalar fetchTargetThreadNotReady;
+        /** Prepared FTQ heads whose cache request could not be started. */
+        statistics::Scalar fetchTargetRequestBlocked;
+        /** Predicted-taken FTQ boundaries considered for limited two-fetch. */
+        statistics::Scalar twoFetchAttempts;
+        /** FTQ boundaries crossed using the current fetch buffer. */
+        statistics::Scalar twoFetchSuccesses;
 
         // Trace metadata accounting (trace mode)
         /** Number of stored trace metadata records (seqNum -> traceInst). */
@@ -1519,6 +1676,16 @@ class Fetch
         statistics::Scalar eipEvictionEvents;
         /** Number of wrong-path squash events observed by EIP. */
         statistics::Scalar eipSquashEvents;
+
+        // === Block Policy statistics ===
+        statistics::Vector fetchBlockState;
+        statistics::Vector fetchThrottleState;
+        statistics::VectorDistribution fetchBlockHoldCycle;  // [0]=Unblocked [1]=Blocked
+
+        // === FlushFrom Policy statistics ===
+        statistics::Vector flushForFlushPolicy;
+        statistics::Scalar flushFromFirstUseFound;
+        statistics::Scalar flushFromFirstUseNoConsumer;
     } fetchStats;
 
     SquashVersion localSquashVer[MaxThreads];
@@ -1527,6 +1694,11 @@ public:
     const FetchStatGroup &getFetchStats() { return fetchStats; }
 
   private:
+
+    /** Delay the first post-squash vector-config batch in the fetch queue. */
+    bool deferVsetvlDecode[MaxThreads];
+    /** Number of instructions in the first post-squash fetch batch. */
+    unsigned postSquashFetchBatchSize[MaxThreads];
 
     bool waitForVsetvl [MaxThreads];
 

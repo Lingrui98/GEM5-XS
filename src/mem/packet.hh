@@ -374,7 +374,13 @@ class Packet : public Printable
         MSHR_ALIAS_FAIL       = 0x00040000,
 
         // Signal that the packet hit in the write buffer.
-        HIT_IN_WRITE_BUFFER   = 0x00080000
+        HIT_IN_WRITE_BUFFER   = 0x00080000,
+
+        // Mark StoreBuffer packets issued from the fake DCache mainpipe.
+        DCACHE_MAINPIPE_SBUFFER_REQ = 0x00100000,
+
+        // Record whether the fake-mainpipe StoreBuffer access hit in L1D.
+        DCACHE_MAINPIPE_SBUFFER_HIT = 0x00200000
     };
 
     Flags flags;
@@ -392,6 +398,11 @@ class Packet : public Printable
     MemCmd cmd;
     /// The tick when the packet is sent
     Tick sendTick = 0;
+
+    // LSQ-to-L1D admission metadata only; never copied to downstream packets.
+    // A same-line store must join the MSHR that still owns this predecessor.
+    Packet *sbufferMergeTarget = nullptr;
+    bool sbufferMergeFailed = false;
 
     const PacketId id;
 
@@ -810,6 +821,17 @@ class Packet : public Printable
     void setHitInWriteBuffer() { flags.set(HIT_IN_WRITE_BUFFER); }
     bool isHitInWriteBuffer() const { return flags.isSet(HIT_IN_WRITE_BUFFER); }
     void clearHitInWriteBuffer() { flags.clear(HIT_IN_WRITE_BUFFER); }
+
+    void setDcacheMainPipeSbufferReq()
+    { flags.set(DCACHE_MAINPIPE_SBUFFER_REQ); }
+    bool isDcacheMainPipeSbufferReq() const
+    { return flags.isSet(DCACHE_MAINPIPE_SBUFFER_REQ); }
+    void setDcacheMainPipeSbufferHit()
+    { flags.set(DCACHE_MAINPIPE_SBUFFER_HIT); }
+    bool isDcacheMainPipeSbufferHit() const
+    { return flags.isSet(DCACHE_MAINPIPE_SBUFFER_HIT); }
+    void clearDcacheMainPipeSbufferHit()
+    { flags.clear(DCACHE_MAINPIPE_SBUFFER_HIT); }
 
     void setLSQPtr(o3::LSQ *lsq) { lsqPtr = lsq; }
     o3::LSQ *getLSQPtr() const { return lsqPtr; }
@@ -1649,6 +1671,8 @@ class Packet : public Printable
 
     bool coalescingMSHR{false};
 
+    // Per-cache hint: a newly created downstream packet gets a fresh hint.
+    lldp::Hint lldpHint;
     int pfSource{PrefetchSourceType::PF_NONE};
 
     int pfDepth = 0;

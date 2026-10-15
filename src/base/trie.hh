@@ -198,6 +198,39 @@ class Trie
         return NULL;
     }
 
+    /**
+     * Look up the Handle for an exact key prefix. Unlike lookupHandle(key),
+     * this continues past a matching value with a shorter prefix.
+     */
+    Handle
+    lookupHandle(Key key, unsigned width)
+    {
+        assert(width <= MaxBits);
+
+        Key mask = ~(Key)0;
+        if (width < MaxBits)
+            mask <<= (MaxBits - width);
+        key &= mask;
+
+        Node *node = &head;
+        while (node) {
+            if (node->mask == mask)
+                return node->key == key && node->value ? node : NULL;
+
+            Node *next = NULL;
+            for (Node *kid : node->kids) {
+                if (kid && kid->matches(key) &&
+                    (kid->mask & mask) == kid->mask) {
+                    next = kid;
+                    break;
+                }
+            }
+            node = next;
+        }
+
+        return NULL;
+    }
+
   public:
     /**
      * Method which inserts a key/value pair into the trie.
@@ -307,29 +340,14 @@ class Trie
     }
 
     /**
-     * Look up the Value stored at an exact prefix width.
-     *
-     * Unlike lookup(), this skips values on less-specific matching prefixes.
-     * @param key The key to look up.
-     * @param width How many bits of the key (from msb) must match.
-     * @return The Value at the exact key/width pair, or NULL if none exists.
+     * Look up the Value associated with exactly width most-significant bits
+     * of key. Broader or narrower matching prefixes are ignored.
      */
     Value *
-    lookupExact(Key key, unsigned width)
+    lookup(Key key, unsigned width)
     {
-        Key exact_mask = ~(Key)0;
-        if (width < MaxBits)
-            exact_mask <<= (MaxBits - width);
-        key &= exact_mask;
-
-        Node *node = &head;
-        while (goesAfter(&node, node->kids[0], key, exact_mask) ||
-               goesAfter(&node, node->kids[1], key, exact_mask))
-        {}
-
-        if (node->mask == exact_mask && node->key == key)
-            return node->value;
-        return NULL;
+        Node *node = lookupHandle(key, width);
+        return node ? node->value : NULL;
     }
 
     /**

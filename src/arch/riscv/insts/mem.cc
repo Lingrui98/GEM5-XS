@@ -35,6 +35,7 @@
 #include "arch/riscv/insts/static_inst.hh"
 #include "arch/riscv/utility.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/inst_queue.hh"
 #include "cpu/o3/lsq_unit.hh"
 #include "cpu/static_inst.hh"
 
@@ -57,6 +58,10 @@ std::string
 Store::generateDisassembly(Addr pc, const loader::SymbolTable *symtab) const
 {
     std::stringstream ss;
+    if (memAccessFlags & Request::CACHE_BLOCK_ZERO) {
+        ss << mnemonic << " (" << registerName(srcRegIdx(0)) << ')';
+        return ss.str();
+    }
     ss << mnemonic << ' ' << registerName(srcRegIdx(1)) << ", " <<
         offset << '(' << registerName(srcRegIdx(0)) << ')';
     return ss.str();
@@ -66,14 +71,35 @@ Fault
 StoreData::execute(ExecContext *xc, Trace::InstRecord *) const
 {
     auto inst = dynamic_cast<o3::DynInst *>(xc);
+
+    // STD does not enter the STA store-pipe S0. Consume the physical-SQ
+    // replay marker at the start of each retry before checking the window.
+    if (inst->needPhysicalSQFullReplay()) {
+        inst->clearReplayType();
+        inst->clearReplayFlags();
+        inst->clearNeedReplay();
+    }
+
+    // If no space left in the physical SQ,
+    // then defer the STD operation, will be replayed by IQ.
+    if (!inst->instQueue->storeQueueWriteReady(inst)) {
+        inst->setPhysicalSQFullReplay();
+        inst->instQueue->deferPhysicalSQFullReplay(inst);
+        return NoFault;
+    }
+
     auto data = inst->getRegOperand(inst->staticInst.get(), 0);
 
     if (inst->sqIt->instruction()->getFault() == NoFault) {
+        // STD does not compute the address or initiate memory access.  It only
+        // supplies the data half of the shared SQ entry; STA owns address,
+        // translation, and request state.
         // if instruction has already faulted, then skip executing std
         if (inst->sqIt->instruction()->memData)
             memcpy(inst->sqIt->instruction()->memData, &data, memsize);
         memcpy(inst->sqIt->data(), &data, memsize);
         inst->sqIt->setStatus(o3::SplitStoreStatus::DataReady);
+        inst->instQueue->recordAddrOrDataReady(inst);
         inst->sqIt->setStatus(o3::SplitStoreStatus::StdPipeFinish);
     }
 

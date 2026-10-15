@@ -19,6 +19,7 @@
 #include "mem/cache/prefetch/bop.hh"
 #include "mem/cache/prefetch/cmc.hh"
 #include "mem/cache/prefetch/ipcp.hh"
+#include "mem/cache/prefetch/lldp.hh"
 #include "mem/cache/prefetch/opt.hh"
 #include "mem/cache/prefetch/queued.hh"
 #include "mem/cache/prefetch/signature_path.hh"
@@ -64,6 +65,7 @@ class XSCompositePrefetcher : public Queued
       public:
         Addr pc;
         Addr regionAddr;
+        ContextID contextId;
         uint64_t regionBits;
         bool inBackwardMode;
         uint8_t accessCount;
@@ -75,6 +77,7 @@ class XSCompositePrefetcher : public Queued
             : TaggedEntry(),
               pc(~(0UL)),
               regionAddr(0),
+              contextId(InvalidContextID),
               regionBits(0),
               inBackwardMode(false),
               accessCount(0),
@@ -99,7 +102,11 @@ class XSCompositePrefetcher : public Queued
       public:
         Addr pc;
         Addr regionAddr;
-        ReACTEntry() : TaggedEntry(), pc(0), regionAddr(0) {}
+        ContextID contextId;
+        ReACTEntry()
+            : TaggedEntry(), pc(0), regionAddr(0),
+              contextId(InvalidContextID)
+        {}
         void _setSecure(bool is_secure) {
             if (is_secure) TaggedEntry::setSecure();
         }
@@ -120,9 +127,11 @@ class XSCompositePrefetcher : public Queued
       public:
         std::vector<SatCounter8> hist;
         Addr pc;
+        ContextID contextId;
         bool decr_mode;
         PhtEntry(const size_t sz, const SatCounter8 &conf)
-            : TaggedEntry(), hist(sz, conf), decr_mode(false)
+            : TaggedEntry(), hist(sz, conf),
+              contextId(InvalidContextID), decr_mode(false)
         {
         }
     };
@@ -170,6 +179,19 @@ class XSCompositePrefetcher : public Queued
     /** Update the RR right table after a prefetch fill */
     void notifyFill(const PacketPtr& pkt) override;
 
+    // LLDP is a side-band component of the composite.  Forwarding these
+    // callbacks keeps its hint attached to the original cache request while
+    // all ordinary candidates continue through this composite's queue.
+    lldp::Hint loadTrain(const PacketPtr &pkt, bool miss) override;
+    void hintData(const lldp::Hint &hint, const PacketPtr &demand,
+                  const uint8_t *data, unsigned size) override;
+    void addTLB(BaseTLB *tlb, bool functional) override;
+    void regProbeListeners() override;
+    void setPacketReadyCallback(std::function<void(Tick)> callback) override;
+    bool hasPendingPacket() override;
+    PacketPtr getPacket() override;
+    Tick nextPrefetchReadyTime() const override;
+
   private:
     const unsigned pfFilterSize{256};
     const unsigned pfPageFilterSize{16};
@@ -205,6 +227,7 @@ class XSCompositePrefetcher : public Queued
     XSStridePrefetcher *Sstride;
     OptPrefetcher *Opt;
     XsStreamPrefetcher *Xsstream;
+    LLDPrefetcher *lldp;
 
 
     const bool enableActivepage;
@@ -217,6 +240,8 @@ class XSCompositePrefetcher : public Queued
     const bool enableBOP;
     const bool enableOpt;
     const bool enableXsstream;
+    const bool enableLLDP;
+    bool preferLLDP{false};
     const bool phtEarlyUpdate;
     const bool neighborPhtUpdate;
 

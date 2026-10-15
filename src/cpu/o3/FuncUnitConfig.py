@@ -87,7 +87,9 @@ class IntMult(FUDesc):
     opList = [ OpDesc(opClass='IntMult', opLat=3) ]
 
 class FP_SLOW(FUDesc):
-    opList = [ OpDesc(opClass='FloatDiv', opLat=14),
+    # XiangShan's scalar divider accepts one operation at a time and keeps
+    # the FEX divider token busy until the result is bypassed.
+    opList = [ OpDesc(opClass='FloatDiv', opLat=14, pipelined=False),
                OpDesc(opClass='FloatSqrt', opLat=17)]
 
 class FP_ALU(FUDesc):
@@ -111,6 +113,30 @@ class SIMD_Unit(FUDesc):
                OpDesc(opClass='VectorFloatReduce'),
                OpDesc(opClass='VectorMisc'),
                OpDesc(opClass='VectorIntegerExtension')]
+
+class VecIALU(FUDesc):
+    opList = [ OpDesc(opClass='VectorIntegerArith'),
+               OpDesc(opClass='VectorIntegerReduce'),
+               OpDesc(opClass='VectorIntegerExtension')]
+
+class VecIMAC(FUDesc):
+    opList = [ OpDesc(opClass='VectorIntegerArith')]
+
+class VecMOVE(FUDesc):
+    opList = [ OpDesc(opClass='VectorMisc')]
+
+class VecFCVT(FUDesc):
+    opList = [ OpDesc(opClass='VectorFloatConvert')]
+
+class VecFMAC(FUDesc):
+    opList = [ OpDesc(opClass='VectorFloatArith'),
+               OpDesc(opClass='VectorFloatReduce')]
+
+class VecIDIV(FUDesc):
+    opList = [ OpDesc(opClass='VectorIntegerArith')]
+
+class VecFDIV(FUDesc):
+    opList = [ OpDesc(opClass='VectorFloatArith')]
 
 class ReadPort(FUDesc):
     opList = [ OpDesc(opClass='MemRead', opLat=4), # actually execute cycle = loadpipe's stage

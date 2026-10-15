@@ -72,6 +72,7 @@
 #include "cpu/o3/thread_state.hh"
 #include "cpu/simple_thread.hh"
 #include "cpu/timebuf.hh"
+#include "cpu/pred/btb/probe/btbp_trace_event.hh"
 #include "cpu/valuepred/valuepred_unit.hh"
 #include "mem/cache/prefetch/base.hh"
 #include "params/BaseO3CPU.hh"
@@ -208,11 +209,29 @@ class CPU : public BaseCPU
     /** Constructs a CPU with the given parameters. */
     CPU(const BaseO3CPUParams &params);
 
+    ProbePointArg<XsDynInstMetaPtr> *ppLldpDependenceTrain;
     ProbePointArg<PacketPtr> *ppInstAccessComplete;
     ProbePointArg<std::pair<DynInstPtr, PacketPtr> > *ppDataAccessComplete;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceMbtbLookup = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceMbtbFill = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceIPrefetchIssue = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceLineLifecycle = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceL1IDemandAccess = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceDecodeBranch = nullptr;
+    ProbePointArg<branch_prediction::btb_pred::BtbpTraceEvent>
+        *ppBtbpTraceBranchDemand = nullptr;
 
     /** Register probe points. */
     void regProbePoints() override;
+
+    void notifyBtbpTrace(
+        const branch_prediction::btb_pred::BtbpTraceEvent &event);
 
     void
     demapPage(Addr vaddr, uint64_t asn)
@@ -362,6 +381,9 @@ class CPU : public BaseCPU
 
     RegVal getReg(PhysRegIdPtr phys_reg);
     RegVal getReg(VirtRegId phys_reg);
+    /** Read a physical register without charging the architectural RF-read statistic. */
+    RegVal peekReg(PhysRegIdPtr phys_reg) const;
+    RegVal peekReg(VirtRegId virt_reg) const;
     void getReg(PhysRegIdPtr phys_reg, void *val);
     void getReg(VirtRegId phys_reg, void *val);
     void *getWritableReg(PhysRegIdPtr phys_reg);
@@ -408,6 +430,11 @@ class CPU : public BaseCPU
     void notifyEipFill(ContextID contextId, Addr virtualAddr,
                        Addr physicalAddr);
     void notifyEipEvict(ContextID contextId, Addr physicalAddr);
+
+    /** Current trace reader position (records consumed from the stream;
+     *  replay from history does not advance it). Used by the EOF
+     *  reconciliation invariant in Commit. */
+    uint64_t getTraceReaderIndex() const { return fetch.getTraceReaderIndex(); }
 
     /**
      * Wrapper for internal drain check used by trace-mode helpers.
@@ -465,6 +492,12 @@ class CPU : public BaseCPU
     void readArchVecReg(int reg_idx, uint64_t *val,ThreadID tid);
 
     uint32_t getIQInsts() { return iew.getIQInsts(); }
+
+    Fetch *getFetch() { return &fetch; }
+    Decode *getDecode() { return &decode; }
+    Rename *getRename() { return &rename; }
+    IEW *getIEW() { return &iew; }
+    Commit *getCommit() { return &commit; }
 
     /**
      * Return the oldest in-flight instruction sequence number.
@@ -692,6 +725,9 @@ class CPU : public BaseCPU
     struct CPUStats : public statistics::Group
     {
         CPUStats(CPU *cpu);
+        void preDumpStats() override;
+
+        CPU &owner;
 
         /** Stat for total number of times the CPU is descheduled. */
         statistics::Scalar timesIdled;
@@ -724,9 +760,9 @@ class CPU : public BaseCPU
         /** Frontend Bandwidth Bound */
         statistics::Formula frontendBandwidthBound;
         /** BadSpec Bound */
-        statistics::Formula badSpecBound;
+        statistics::Vector badSpecBound;
         /** Branch Miss Prediction Bound */
-        statistics::Formula branchMissPrediction;
+        statistics::Vector branchMissPrediction;
         /** Machine clears */
         statistics::Formula machineClears;
         /** Backend Bound */

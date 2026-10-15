@@ -188,9 +188,75 @@ class QueuedPrefetcher(BasePrefetcher):
     throttle_control_percentage = Param.Percent(0, "Percentage of requests \
         that can be throttled depending on the accuracy of the prefetcher.")
 
+    pf_control = Param.Bool(False,
+        "Enable windowed prefetch admission control")
+    pf_control_window = Param.Cycles(100000,
+        "Cycles per prefetch control window")
+    pf_control_admit_pct = Param.Percent(100,
+        "Fallback prefetch admission percentage for prefetch control")
+    pf_control_sweep = VectorParam.Unsigned([],
+        "Optional list of admission percentages to sweep, each in [0, 100]")
+    pf_control_source_admit_pcts = VectorParam.Int([],
+        "Optional per-PrefetchSourceType admission percentages; -1 means use "
+        "the global prefetch control action")
+    pf_control_sweep_windows = Param.Unsigned(1,
+        "Number of windows to hold each prefetch control action")
+    pf_control_warmup_windows = Param.Unsigned(0,
+        "Number of initial windows using the fallback admission percentage")
+    pf_adaptive = Param.Bool(False,
+        "Enable online PFBad-guided prefetch adaptive admission")
+    pf_adaptive_min_pct = Param.Percent(5,
+        "Minimum per-source admission percentage for adaptive mode")
+    pf_adaptive_pct_quantum = Param.Percent(10,
+        "Adaptive admission percentage quantization step")
+    pf_adaptive_gradient_step = Param.Int(10,
+        "Adaptive per-source gradient step in percentage points")
+    pf_adaptive_pfbad_weight_numer = Param.Unsigned(3,
+        "PFBad penalty weight numerator")
+    pf_adaptive_pfbad_weight_denom = Param.Unsigned(2,
+        "PFBad penalty weight denominator")
+    pf_adaptive_dpf_min_samples = Param.Unsigned(1,
+        "Minimum useful+bad samples before trusting adaptive gradient")
+    pf_adaptive_dpf_deadband = Param.Int(0,
+        "Deadband around zero useful-bad adaptive gradient score")
+    pf_adaptive_improve_margin_bps = Param.Unsigned(0,
+        "Required demand miss-rate improvement in basis points")
+    pf_adaptive_history_fallback = Param.Bool(True,
+        "Use historical best miss-rate samples as adaptive fallback")
+    pf_adaptive_best_topk = Param.Unsigned(1,
+        "Number of best FIFO samples averaged for adaptive fallback pct")
+    pf_adaptive_table_entries = Param.Unsigned(32,
+        "Adaptive FIFO experience table entries")
+    pf_adaptive_pfbad_entries = Param.Unsigned(0,
+        "Adaptive PFBad detection table entries")
+    pf_adaptive_warmup_windows = Param.Unsigned(1,
+        "Initial completed windows before adaptive threshold updates")
+    pf_adaptive_max_source_step = Param.Percent(10,
+        "Maximum per-source admission movement per adaptive update")
+
     max_pfahead_recv = Param.Int(1,"Maximum number of pfahead received")
     use_pf_buffer = Param.Bool(False, "use prefetch buffer to filter prefetches")
     max_pf_buffer_size = Param.Int(16, "size of prefetch buffer")
+
+
+class LLDPrefetcher(QueuedPrefetcher):
+    type = 'LLDPrefetcher'
+    cxx_class = 'gem5::prefetch::LLDPrefetcher'
+    cxx_header = "mem/cache/prefetch/lldp.hh"
+
+    use_virtual_addresses = True
+    on_read = True
+    on_write = False
+    on_data = True
+    on_inst = False
+    training_cpu = Param.BaseCPU(NULL, "L1 IQ dependenceTrain source; NULL learns L2 loads")
+    training_queue_size = Param.Unsigned(64, "Dependency training FIFO entries")
+    confidence_bits = Param.Unsigned(3, "Width of saturating LLDT confidence counters")
+    initial_confidence = Param.Unsigned(1, "Initial consumer and immediate confidence")
+    producer_initial_confidence = Param.Unsigned(2, "Initial producer confidence")
+    producer_threshold = Param.Unsigned(2, "Producer hint confidence threshold")
+    consumer_threshold = Param.Unsigned(3, "Consumer replay confidence threshold")
+    immediate_threshold = Param.Unsigned(3, "Load immediate stability threshold")
 
 
 class XSStridePrefetcher(QueuedPrefetcher):
@@ -299,9 +365,17 @@ class XsStreamPrefetcher(QueuedPrefetcher):
     on_write = False
     on_data  = True
     on_inst  = False
-    xs_stream_depth = Param.Int(32, "The depth of xs_stream_depth")
+    xs_stream_depth = Param.Int(64, "The depth of xs_stream_depth")
+    xs_stream_l2_depth = Param.Unsigned(
+        640,
+        "L2 stream lookahead in cache blocks; zero derives from depth << 2"
+    )
     enable_auto_depth = Param.Bool(False, "enable autp depth.")
     enable_l3_stream_pre = Param.Bool(False, "enable l3 stream pre.")
+    strict_active = Param.Bool(
+        True,
+        "Require neighboring active regions to exceed the active threshold"
+    )
     xs_stream_entries = Param.MemorySize(
         "16",
         "num of active generation table entries"
@@ -569,6 +643,22 @@ class CDP(QueuedPrefetcher):
         "How many blks a region can track")
     filter_entry_granularity = Param.Unsigned(4096,
         "How many bytes a blk in a region can track")
+    use_dynamic_degree = Param.Bool(
+        True,
+        "Enable accuracy-based CDP degree control"
+    )
+    accuracy_threshold = Param.Float(
+        0.05,
+        "Accuracy threshold for CDP degree extensions"
+    )
+    use_accuracy_dependent_alignment = Param.Bool(
+        True,
+        "Use the legacy accuracy-dependent pointer alignment"
+    )
+    cdp_use_sv48 = Param.Bool(
+        False,
+        "Use Sv48 virtual-address recognition for CDP"
+    )
     throttle_aggressiveness = Param.Float(2.0,
         "A parameter to control the aggressiveness of throttling")
 
@@ -1254,6 +1344,9 @@ class XSCompositePrefetcher(QueuedPrefetcher):
     enable_cplx = Param.Bool(False, "Enable CPLX component")
     enable_spp = Param.Bool(False, "Enable SPP component")
     enable_opt = Param.Bool(False,"Enable opt component")
+    lldp = Param.LLDPrefetcher(LLDPrefetcher(is_sub_prefetcher=True),
+                               "LLDP component")
+    enable_lldp = Param.Bool(False, "Enable LLDP component")
 
 class MultiPrefetcher(BasePrefetcher):
     type = 'MultiPrefetcher'
@@ -1267,7 +1360,8 @@ class MultiPrefetcher(BasePrefetcher):
     on_data  = True
     on_inst  = False
 
-    prefetchers = VectorParam.BasePrefetcher([XSCompositePrefetcher(), BOPPrefetcher()],
+    prefetchers = VectorParam.BasePrefetcher(
+        [XSCompositePrefetcher(), BOPPrefetcher()],
         "Array of prefetchers")
 
 class L2CompositeWithWorkerPrefetcher(CompositeWithWorkerPrefetcher):
@@ -1287,6 +1381,13 @@ class L2CompositeWithWorkerPrefetcher(CompositeWithWorkerPrefetcher):
     enable_cdp = Param.Bool(False, "Enable CDP")
     enable_cmc = Param.Bool(False, "Enable CMC")
     enable_despacito_stream = Param.Bool(False, "Enable despacito stream")
+    lldp = Param.LLDPrefetcher(LLDPrefetcher(is_sub_prefetcher=True),
+                               "LLDP component")
+    enable_lldp = Param.Bool(False, "Enable LLDP component")
+    offload_low_accuracy = Param.Bool(
+        False,
+        "Offload low-accuracy upstream pfahead sources to L3 when CDP dominates L2"
+    )
 
 class L3CompositeWithWorkerPrefetcher(CompositeWithWorkerPrefetcher):
     type = 'L3CompositeWithWorkerPrefetcher'

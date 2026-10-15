@@ -47,8 +47,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <list>
 #include <string>
+#include <utility>
 
 #include "arch/riscv/insts/fusion.hh"
 #include "arch/riscv/insts/vector.hh"
@@ -61,6 +63,7 @@
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/iew.hh"
+#include "cpu/o3/issue_queue.hh"
 #include "cpu/o3/limits.hh"
 #include "debug/Drain.hh"
 #include "debug/Fetch.hh"
@@ -84,7 +87,7 @@ namespace o3
 {
 
 LSQ::DcachePort::DcachePort(LSQ *_lsq, CPU *_cpu) :
-    RequestPort(_cpu->name() + ".dcache_port", _cpu), lsq(_lsq), cpu(_cpu)
+    RequestPort(_cpu->name() + ".dcache_port"), lsq(_lsq), cpu(_cpu)
 {}
 
 std::list<LSQ::SingleDataRequest*> LSQ::SingleDataRequest::singleList;
@@ -109,6 +112,8 @@ LSQ::StoreBufferEntry::reset(ThreadID tid, InstSeqNum seq_num,
     this->blockVaddr = block_vaddr;
     this->blockPaddr = block_paddr;
     this->sending = false;
+    this->inDcacheMainPipe = false;
+    this->replayQueued = false;
     this->request = nullptr;
     this->vice = nullptr;
 }
@@ -128,7 +133,7 @@ LSQ::StoreBufferEntry::merge(uint64_t offset, uint8_t *datas, uint64_t size,
 
 bool
 LSQ::StoreBufferEntry::recordForward(RequestPtr req, LSQRequest *lsqreq,
-                                     ThreadID load_tid, InstSeqNum load_seq)
+                                     ThreadID load_tid)
 {
     int offset = req->getPaddr() & (validMask.size() - 1);
     // the offset in the split request
@@ -137,12 +142,18 @@ LSQ::StoreBufferEntry::recordForward(RequestPtr req, LSQRequest *lsqreq,
         assert(offset == 0);
     }
     bool full_forward = true;
+    auto *lsq = lsqreq->_port.getLsq();
+    auto *inflight_entry = lsq->find_inflight_store_buffer_entry(
+        blockPaddr, load_tid);
+    bool miss_forward = false;
     auto byteEligible = [&](StoreBufferEntry *entry, int byte_idx) {
-        return entry && entry->tid == load_tid && entry->seqNum < load_seq &&
+        return entry && entry->tid == load_tid &&
                entry->validMask[byte_idx];
     };
     for (int i = 0; i < req->getSize(); i++) {
         assert(goffset + i < lsqreq->_size);
+        auto *inflight_byte = lsq->find_inflight_store_buffer_entry(
+            blockPaddr, load_tid, offset + i);
         const bool vice_eligible = byteEligible(vice, offset + i);
         const bool self_eligible = byteEligible(this, offset + i);
         if (vice_eligible) {
@@ -155,11 +166,21 @@ LSQ::StoreBufferEntry::recordForward(RequestPtr req, LSQRequest *lsqreq,
             lsqreq->SBforwardPackets.push_back(
                 LSQRequest::FWDPacket{
                     .idx = goffset + i, .byte = blockDatas[offset + i]});
+            miss_forward |= this == inflight_entry;
+        } else if (inflight_byte) {
+            lsqreq->SBforwardPackets.push_back(
+                LSQRequest::FWDPacket{
+                    .idx = goffset + i,
+                    .byte = inflight_byte->blockDatas[offset + i]});
+            miss_forward = true;
         } else {
             full_forward = false;
         }
     }
 
+    if (miss_forward) {
+        ++lsq->stats.sbufferMissForward;
+    }
     return full_forward;
 }
 
@@ -361,6 +382,8 @@ LSQ::StoreBuffer::release(StoreBufferEntry *entry)
     vld_cnt_vec[entry->tid]--;
     assert(vld_cnt_vec[entry->tid] >= 0);
     int index = entry->index;
+    assert(!entry->inDcacheMainPipe);
+    assert(!entry->replayQueued);
     data_vld[index] = false;
     data_map.erase(crossRef[index]);
     assert(std::find(free_list.begin(), free_list.end(), index) ==
@@ -376,7 +399,7 @@ LSQ::StoreBuffer::release(StoreBufferEntry *entry)
     }
 }
 
-LSQ::LSQStats::LSQStats(statistics::Group *parent)
+LSQ::LSQStats::LSQStats(statistics::Group *parent, unsigned num_threads)
     : statistics::Group(parent),
       ADD_STAT(lqAvgEntryNum, statistics::units::Count::get(),
                "Average number of entries in load queue"),
@@ -385,39 +408,114 @@ LSQ::LSQStats::LSQStats(statistics::Group *parent)
       ADD_STAT(sbufferAvgEntryNum, statistics::units::Count::get(),
                "Average number of valid entries in store buffer"),
       ADD_STAT(lqFullCycles, statistics::units::Cycle::get(),
-               "Cycles that LQ cannot accept a full enqueue bundle"),
+               "Per-thread cycles that LQ cannot accept a full enqueue "
+               "bundle"),
       ADD_STAT(sqFullCycles, statistics::units::Cycle::get(),
-               "Cycles that SQ cannot accept a full enqueue bundle"),
+               "Per-thread cycles that SQ cannot accept a full enqueue "
+               "bundle"),
       ADD_STAT(lsqFullCycles, statistics::units::Cycle::get(),
-               "Cycles that LSQ cannot accept a full enqueue bundle"),
+               "Per-thread cycles that LSQ cannot accept a full enqueue "
+               "bundle"),
       ADD_STAT(sbufferFullCycles, statistics::units::Cycle::get(),
-               "Number of cycles that store buffer is physically full"),
+               "Per-thread cycles that store buffer cannot accept an entry"),
       ADD_STAT(sbufferEvictDuetoFlush, statistics::units::Count::get(), ""),
       ADD_STAT(sbufferEvictDuetoFull, statistics::units::Count::get(), ""),
       ADD_STAT(sbufferEvictDuetoSQFull, statistics::units::Count::get(), ""),
       ADD_STAT(sbufferEvictDuetoTimeout, statistics::units::Count::get(), ""),
       ADD_STAT(sbufferDcacheReqFire, statistics::units::Count::get(),
                "Number of sbuffer write requests accepted by dcache"),
+      ADD_STAT(sbufferMissEntriesReleased, statistics::units::Count::get(),
+               "Store buffer entries released on L1D miss acceptance"),
+      ADD_STAT(sbufferMissPending, statistics::units::Count::get(),
+               "Outstanding store misses whose SBuffer entries are released"),
+      ADD_STAT(sbufferMissSameLineReplay, statistics::units::Count::get(),
+               "S2 store retries waiting for an outstanding same-line store"),
+      ADD_STAT(sbufferMissMerged, statistics::units::Count::get(),
+               "Store misses accepted into an outstanding store-origin MSHR"),
+      ADD_STAT(sbufferMissForward, statistics::units::Count::get(),
+               "Load forwarding queries using accepted store miss data"),
       ADD_STAT(sbufferDcacheReqBlocked, statistics::units::Count::get(),
-               "Number of sbuffer write request attempts rejected by dcache")
+               "Number of sbuffer write request attempts rejected by dcache"),
+      ADD_STAT(sbufferDcacheReqBlockedByMainPipe,
+               statistics::units::Count::get(),
+               "Number of sbuffer write requests blocked by fake dcache mainpipe"),
+      ADD_STAT(dcacheMainPipeRefillEnter, statistics::units::Count::get(),
+               "Number of refill requests accepted by fake dcache mainpipe"),
+      ADD_STAT(dcacheMainPipeStoreEnter, statistics::units::Count::get(),
+               "Number of store buffer requests accepted by fake dcache mainpipe"),
+      ADD_STAT(dcacheMainPipeStoreBlockedByRefill,
+               statistics::units::Count::get(),
+               "Number of store buffer requests blocked by pending refill priority"),
+      ADD_STAT(dcacheMainPipeStoreBlockedBySet,
+               statistics::units::Count::get(),
+               "Number of store buffer requests blocked by fake dcache mainpipe set conflict"),
+      ADD_STAT(dcacheMainPipeBlockedByS1Backpressure,
+               statistics::units::Count::get(),
+               "Number of requests blocked by fake dcache mainpipe S1 backpressure"),
+      ADD_STAT(dcacheMainPipeStoreBlockedByS1Backpressure,
+               statistics::units::Count::get(),
+               "Number of store buffer requests blocked by fake dcache mainpipe S1 backpressure"),
+      ADD_STAT(dcacheMainPipeRefillBlockedByS1Backpressure,
+               statistics::units::Count::get(),
+               "Number of refill requests blocked by fake dcache mainpipe S1 backpressure"),
+      ADD_STAT(dcacheMainPipeStoreBlockedByTagWrite,
+               statistics::units::Count::get(),
+               "Number of store buffer requests blocked by fake dcache mainpipe tag write"),
+      ADD_STAT(dcacheMainPipeRefillBlocked,
+               statistics::units::Count::get(),
+               "Number of pending refill requests blocked before fake dcache mainpipe entry"),
+      ADD_STAT(dcacheMainPipeRefillBlockedByPipeResource,
+               statistics::units::Count::get(),
+               "Number of pending refill requests blocked by fake dcache mainpipe resources"),
+      ADD_STAT(dcacheMainPipeBlockedByDataConflict,
+               statistics::units::Count::get(),
+               "Number of fake dcache mainpipe S1 data reads blocked by S4 data writes"),
+      ADD_STAT(dcacheMainPipeStoreS2IssueBlocked,
+               statistics::units::Count::get(),
+               "Number of store buffer requests blocked when issuing from fake dcache mainpipe S2"),
+      ADD_STAT(dcacheMainPipeStoreS2MissExit,
+               statistics::units::Count::get(),
+               "Number of store buffer requests that miss and exit fake dcache mainpipe at S2")
 {
+    lqFullCycles.init(num_threads);
+    sqFullCycles.init(num_threads);
+    lsqFullCycles.init(num_threads);
+    sbufferFullCycles.init(num_threads);
+    for (ThreadID tid = 0; tid < num_threads; ++tid) {
+        const std::string thread_name = csprintf("thread%d", tid);
+        lqFullCycles.subname(tid, thread_name);
+        sqFullCycles.subname(tid, thread_name);
+        lsqFullCycles.subname(tid, thread_name);
+        sbufferFullCycles.subname(tid, thread_name);
+    }
 }
 
 LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
     : cpu(cpu_ptr), iewStage(iew_ptr),
-      recentlyloadAddr(8 * (params.DcacheSetDivNum ? params.DcacheSetDivNum : 1)),
+      recentlyloadAddr(
+          (params.DcacheBankBytes &&
+                   params.DcacheBankBytes <= cpu_ptr->cacheLineSize() ?
+               cpu_ptr->cacheLineSize() / params.DcacheBankBytes : 1) *
+          (params.DcacheSetDivNum ? params.DcacheSetDivNum : 1)),
       _cacheBlocked(false),
       cacheStorePorts(params.cacheStorePorts), usedStorePorts(0),
       cacheLoadPorts(params.cacheLoadPorts), usedLoadPorts(0),
+      numBank(params.DcacheBankBytes ?
+              cpu_ptr->cacheLineSize() / params.DcacheBankBytes : 0),
       sbufferEvictThreshold(params.SbufferEvictThreshold),
       sbufferEntries(params.SbufferEntries),
+      sbufferReleaseOnMiss(params.sbufferReleaseOnMiss),
       storeBufferInactiveThreshold(params.storeBufferInactiveThreshold),
       enableBankConflictCheck(params.BankConflictCheck),
       sbufferBankWriteAccurately(params.sbufferBankWriteAccurately),
       dcacheSetBits(params.DcacheSetBits),
       dcacheSetDivNum(params.DcacheSetDivNum),
       dcacheLineBits(floorLog2(cpu_ptr->cacheLineSize())),
-      dcacheSetBankBits(params.DcacheSetBits + 3),
+      dcacheBankBytes(params.DcacheBankBytes),
+      dcacheBankOffsetBits(params.DcacheBankBytes ?
+                           floorLog2(params.DcacheBankBytes) : 0),
+      dcacheBankIndexBits(numBank ? floorLog2(numBank) : 0),
+      dcacheSetBankBits(params.DcacheSetBits + dcacheBankIndexBits),
       _enableLdMissReplay(params.EnableLdMissReplay),
       _enablePipeNukeCheck(params.EnablePipeNukeCheck),
       _enableReplayBasedMDP(params.EnableReplayBasedMDP),
@@ -426,9 +524,19 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
       staleTranslationWaitTxnId(0),
       lsqMode(params.smtLSQMode),
       lsqPolicy(params.smtLSQPolicy),
-      smtLSQThreshold(params.smtLSQThreshold),
-      stats(nullptr),
+      rarqPolicy(params.smtRARQPolicy),
+      rawqPolicy(params.smtRAWQPolicy),
+      smtLQThreshold(params.smtLQThreshold),
+      smtSQThreshold(params.smtSQThreshold),
+      lqBorrowBaseReserveEntries(params.smtLQBorrowBaseReserveEntries),
+      lqBorrowDonorReserveEntries(params.smtLQBorrowDonorReserveEntries),
+      sqBorrowBaseReserveEntries(params.smtSQBorrowBaseReserveEntries),
+      sqBorrowDonorReserveEntries(params.smtSQBorrowDonorReserveEntries),
+      stats(nullptr, params.numThreads),
       LQEntries(params.LQEntries),
+      physicalSQEntries(params.SQEntries),
+      storeQueueMultiple(params.StoreQueueMultiple),
+      phySQFullCheckAtReplay(params.phySQFullCheckAtReplay),
       SQEntries(params.SQEntries),
       enqueueWidth(params.renameWidth),
       RARQEntries(params.RARQEntries),
@@ -437,6 +545,29 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
       numThreads(params.numThreads)
 {
     assert(numThreads > 0 && numThreads <= MaxThreads);
+    // Initialize LSQ borrowing state for LQ and SQ separately
+    for (ThreadID tid = 0; tid < MaxThreads; ++tid) {
+        lqBorrowingDonor[tid] = false;
+        sqBorrowingDonor[tid] = false;
+        lqBorrowingStateHoldCycle[tid] = 0;
+        sqBorrowingStateHoldCycle[tid] = 0;
+    }
+    panic_if(physicalSQEntries == 0,
+             "SQEntries must be greater than zero\n");
+    panic_if(storeQueueMultiple == 0 || !isPowerOf2(storeQueueMultiple),
+             "StoreQueueMultiple must be a non-zero power of two (got %u)\n",
+             storeQueueMultiple);
+    panic_if(physicalSQEntries >
+                 std::numeric_limits<unsigned>::max() / storeQueueMultiple,
+             "Virtual store queue capacity overflows unsigned: %u * %u\n",
+             physicalSQEntries, storeQueueMultiple);
+    panic_if(storeQueueMultiple > 1 && lsqMode == SMTLSQMode::Shared,
+             "VirtualSQ currently requires smtLSQMode=Independent\n");
+    SQEntries = physicalSQEntries * storeQueueMultiple;
+    panic_if(SQEntries < enqueueWidth,
+             "Virtual store queue capacity (%u) must be at least "
+             "renameWidth (%u)\n",
+             SQEntries, enqueueWidth);
     if (!_enableLdMissReplay && _enablePipeNukeCheck) {
         panic("LSQ can not support pipeline nuke replay when EnableLdMissReplay is False");
     }
@@ -451,8 +582,28 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
     panic_if(dcacheSetDivNum > (1ULL << dcacheSetBits),
              "DcacheSetDivNum (%u) must be <= num_sets (2^%u)\n",
              dcacheSetDivNum, dcacheSetBits);
+    panic_if(dcacheBankBytes == 0 || !isPowerOf2(dcacheBankBytes),
+             "DcacheBankBytes must be a positive power of two (got %u)\n",
+             dcacheBankBytes);
+    panic_if(dcacheBankBytes > cpu_ptr->cacheLineSize() ||
+                 cpu_ptr->cacheLineSize() % dcacheBankBytes != 0,
+             "DcacheBankBytes (%u) must divide cache line size (%u)\n",
+             dcacheBankBytes, cpu_ptr->cacheLineSize());
+    panic_if(numBank == 0 || !isPowerOf2(numBank),
+             "Derived dcache bank count must be a positive power of two "
+             "(line size=%u, bank bytes=%u, bank count=%u)\n",
+             cpu_ptr->cacheLineSize(), dcacheBankBytes, numBank);
+    DPRINTF(LSQ, "Dcache bank model: line bytes=%u, bank bytes=%u, "
+            "bank count=%u\n",
+            cpu_ptr->cacheLineSize(), dcacheBankBytes, numBank);
 
     cpu->addStatGroup("lsq", &stats);
+
+    DPRINTF(LSQ, "VirtualSQ physical=%u multiple=%u virtual=%u policy=%s\n",
+            physicalSQEntries, storeQueueMultiple, SQEntries,
+            storeQueueMultiple == 1 ? "disabled" :
+            (phySQFullCheckAtReplay ? "check-at-replay" :
+                                      "unconditional-replay"));
 
     //**********************************************
     //************ Handle SMT Parameters ***********
@@ -464,20 +615,28 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
                 LQEntries, SQEntries, RARQEntries, RAWQEntries);
     } else if (lsqMode == SMTLSQMode::Shared) {
         panic_if(lsqPolicy == SMTQueuePolicy::Threshold &&
-                 smtLSQThreshold == 0,
-                 "SMT LSQ threshold must be non-zero in shared threshold mode");
+                 (smtLQThreshold == 0 || smtSQThreshold == 0),
+                 "SMT LQ/SQ thresholds must be non-zero in shared threshold mode");
 
-        if (lsqPolicy == SMTQueuePolicy::Dynamic ||
-            lsqPolicy == SMTQueuePolicy::DynamicBorrowing) {
-            DPRINTF(LSQ, "LSQ mode set to Shared/Dynamic: %u LQ and %u SQ "
-                    "entries are shared across active SMT threads, along "
-                    "with %u RARQ and %u RAWQ entries\n",
-                    LQEntries, SQEntries, RARQEntries, RAWQEntries);
+        // Print LQ/SQ policy
+        if (lsqPolicy == SMTQueuePolicy::Dynamic) {
+            DPRINTF(LSQ, "LSQ mode set to Shared: LQ/SQ use Dynamic policy, "
+                    "RARQ uses %s policy, RAWQ uses %s policy\n",
+                    SMTQueuePolicyStrings[static_cast<int>(rarqPolicy)],
+                    SMTQueuePolicyStrings[static_cast<int>(rawqPolicy)]);
+        } else if (lsqPolicy == SMTQueuePolicy::DynamicBorrowing) {
+            DPRINTF(LSQ, "LSQ mode set to Shared: LQ/SQ use DynamicBorrowing policy, "
+                    "RARQ uses %s policy, RAWQ uses %s policy\n",
+                    SMTQueuePolicyStrings[static_cast<int>(rarqPolicy)],
+                    SMTQueuePolicyStrings[static_cast<int>(rawqPolicy)]);
         } else if (lsqPolicy == SMTQueuePolicy::Partitioned) {
-            DPRINTF(LSQ, "LSQ mode set to Shared/Partitioned\n");
+            DPRINTF(LSQ, "LSQ mode set to Shared: LQ/SQ use Partitioned policy, "
+                    "RARQ uses %s policy, RAWQ uses %s policy\n",
+                    SMTQueuePolicyStrings[static_cast<int>(rarqPolicy)],
+                    SMTQueuePolicyStrings[static_cast<int>(rawqPolicy)]);
         } else if (lsqPolicy == SMTQueuePolicy::Threshold) {
-            DPRINTF(LSQ, "LSQ mode set to Shared/Threshold: threshold=%u\n",
-                    smtLSQThreshold);
+            DPRINTF(LSQ, "LSQ mode set to Shared/Threshold: LQ threshold=%u, SQ threshold=%u\n",
+                    smtLQThreshold, smtSQThreshold);
         } else {
             panic("Invalid LSQ sharing policy. Options are: Dynamic, "
                         "Partitioned, Threshold, DynamicBorrowing");
@@ -489,10 +648,11 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
     thread.reserve(numThreads);
     // TODO: Parameterize the load/store pipeline stages
     for (ThreadID tid = 0; tid < numThreads; tid++) {
-        thread.emplace_back(LQEntries, SQEntries,
+        thread.emplace_back(LQEntries, SQEntries, physicalSQEntries,
             params.LdPipeStages, params.StPipeStages, params.RARQEntries, params.RAWQEntries,
             params.RARDequeuePerCycle, params.RAWDequeuePerCycle, params.LoadCompletionWidth,
-            params.StoreCompletionWidth);
+            params.StoreCompletionWidth, params.scheduler->getLoadPipeCount(),
+            params.scheduler->getStorePipeCount());
         thread[tid].init(cpu, iew_ptr, params, this, tid);
         thread[tid].setDcachePort(&dcachePort);
         _storeBufferFlushing[tid] = false;
@@ -505,10 +665,6 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
     storeBuffer.setData(store_buffer_entries);
     storeBuffer.setMaxThread(numThreads);
     bankOccupied.resize(dcacheSetDivNum, std::vector<bool>(numBank, false));
-    pendingDcacheRefill.resize(dcacheSetDivNum, false);
-    dcacheRefillDataRead.resize(dcacheSetDivNum, 0);
-    dcacheRefillDataWrite.resize(dcacheSetDivNum, 0);
-    dcacheRefillTagWrite.resize(dcacheSetDivNum, 0);
 }
 
 
@@ -558,6 +714,11 @@ LSQ::isDrained() const
 {
     bool drained(true);
 
+    if (!storeBufferEmpty()) {
+        DPRINTF(Drain, "Not drained, SBuffer or store misses pending.\n");
+        drained = false;
+    }
+
     if (!lqEmpty()) {
         DPRINTF(Drain, "Not drained, LQ not empty.\n");
         drained = false;
@@ -579,6 +740,11 @@ LSQ::takeOverFrom()
 
     for (ThreadID tid = 0; tid < numThreads; tid++) {
         thread[tid].takeOverFrom();
+        // Reset LSQ borrowing state
+        lqBorrowingDonor[tid] = false;
+        sqBorrowingDonor[tid] = false;
+        lqBorrowingStateHoldCycle[tid] = 0;
+        sqBorrowingStateHoldCycle[tid] = 0;
     }
 }
 
@@ -596,18 +762,23 @@ LSQ::tick()
     std::list<ThreadID>::iterator end = activeThreads->end();
     unsigned lq_entry_num = 0;
     unsigned sq_entry_num = 0;
-    bool lq_full = false;
-    bool sq_full = false;
-
     while (threads != end) {
         ThreadID tid = *threads++;
         lq_entry_num += thread[tid].numLoads();
         sq_entry_num += thread[tid].numStores();
-        // TODO: this per-thread OR is an approximation for SMT/shared-LSQ
-        // configurations. With multiple active threads it may not match the
-        // aggregate free-entry condition seen by rename/dispatch.
-        lq_full = lq_full || thread[tid].numFreeLoadEntries() < enqueueWidth;
-        sq_full = sq_full || thread[tid].numFreeStoreEntries() < enqueueWidth;
+        const bool thread_lq_full =
+            logicalFreeLoadEntries(tid) < enqueueWidth;
+        const bool thread_sq_full =
+            logicalFreeStoreEntries(tid) < enqueueWidth;
+        if (thread_lq_full) {
+            ++stats.lqFullCycles[tid];
+        }
+        if (thread_sq_full) {
+            ++stats.sqFullCycles[tid];
+        }
+        if (thread_lq_full || thread_sq_full) {
+            ++stats.lsqFullCycles[tid];
+        }
         thread[tid].tick();
     }
 
@@ -619,18 +790,10 @@ LSQ::tick()
 
     // Sample current store buffer occupancy once per cycle.
     stats.sbufferAvgEntryNum = storeBuffer.size();
-    if (storeBuffer.full()) {
-        ++stats.sbufferFullCycles;
-    }
-
-    if (lq_full) {
-        ++stats.lqFullCycles;
-    }
-    if (sq_full) {
-        ++stats.sqFullCycles;
-    }
-    if (lq_full || sq_full) {
-        ++stats.lsqFullCycles;
+    for (ThreadID tid : *activeThreads) {
+        if (storeBuffer.full(tid) || storeBuffer.full()) {
+            ++stats.sbufferFullCycles[tid];
+        }
     }
 
 }
@@ -638,38 +801,402 @@ LSQ::tick()
 void
 LSQ::clearAddresses()
 {
-    for (unsigned div = 0; div < dcacheSetDivNum; div++) {
-        // Check if the current cycle is already occupied by previous operations
-        // (e.g. delayed writeback).
-        bool currentCycleBusy =
-            (dcacheRefillDataRead[div] | dcacheRefillDataWrite[div]) & 0x1;
+    advanceDcacheMainPipe();
+    markDcacheMainPipeBusyBanks();
+    recentlyloadAddr.clear();
+}
 
-        if (pendingDcacheRefill[div]) {
-            // If current cycle is busy, we stall the new request (keep pending).
-            // If free, we issue the new request.
-            if (!currentCycleBusy) {
-                pendingDcacheRefill[div] = false;
-                // Data Read at current cycle (Bit 0)
-                dcacheRefillDataRead[div] |= 0x1;
-                // Tag Write at 3 cycles later (Bit 3)
-                dcacheRefillTagWrite[div] |= (1 << 3);
-                // Data Write at 4 cycles later (Bit 4)
-                dcacheRefillDataWrite[div] |= (1 << 4);
+void
+LSQ::advanceDcacheMainPipe()
+{
+    DcacheMainPipeBufferedPipe next_pipe = {};
 
-                // We just occupied the current cycle.
-                currentCycleBusy = true;
+    const auto &s1_data_read =
+        dcacheMainPipeStage(DcacheMainPipeStage::S1DataRead);
+    const auto &s2_data_resp =
+        dcacheMainPipeStage(DcacheMainPipeStage::S2DataResp);
+    const auto &s3_tag_write =
+        dcacheMainPipeStage(DcacheMainPipeStage::S3TagWrite);
+    const auto &s4_data_write =
+        dcacheMainPipeStage(DcacheMainPipeStage::S4DataWrite);
+
+    auto &next_s1_data_read =
+        next_pipe.at(dcacheMainPipeIndex(DcacheMainPipeStage::S1DataRead));
+    auto &next_s2_data_resp =
+        next_pipe.at(dcacheMainPipeIndex(DcacheMainPipeStage::S2DataResp));
+    auto &next_s3_tag_write =
+        next_pipe.at(dcacheMainPipeIndex(DcacheMainPipeStage::S3TagWrite));
+    auto &next_s4_data_write =
+        next_pipe.at(dcacheMainPipeIndex(DcacheMainPipeStage::S4DataWrite));
+
+    // S4 resources are modeled as always ready for now. Keeping the local
+    // variable makes later resource backpressure additions contained here.
+    const bool s4_can_go = true;
+    const bool s4_ready = !s4_data_write.valid || s4_can_go;
+    const bool s3_can_go = s4_ready;
+    const bool s3_ready = !s3_tag_write.valid || s3_can_go;
+    const bool s2_can_go = s3_ready;
+
+    DcacheMainPipeS2Result s2_issue_result =
+        DcacheMainPipeS2Result::Blocked;
+    if (s2_data_resp.valid && s2_can_go) {
+        // StoreBuffer S2 issue can either hit and proceed to S3, or miss and
+        // leave the fake pipe while the classic cache tracks the miss.
+        s2_issue_result = !s2_data_resp.req.onS2Issue ?
+            DcacheMainPipeS2Result::GoToS3 :
+            s2_data_resp.req.onS2Issue(curTick());
+    }
+    const bool s2_ready = !s2_data_resp.valid || s2_can_go;
+
+    const bool s1_data_conflict = hasDcacheMainPipeDataArrayConflict();
+    const bool s1_can_go = s2_ready && !s1_data_conflict;
+
+    if (s1_data_conflict) {
+        ++stats.dcacheMainPipeBlockedByDataConflict;
+    }
+
+    if (s4_data_write.valid && s4_can_go &&
+        s4_data_write.req.onComplete) {
+        s4_data_write.req.onComplete(curTick());
+    }
+
+    if (s4_data_write.valid && !s4_can_go) {
+        next_s4_data_write = s4_data_write;
+    }
+
+    if (s3_tag_write.valid && !s3_can_go) {
+        next_s3_tag_write = s3_tag_write;
+    } else if (s3_tag_write.valid) {
+        next_s4_data_write = s3_tag_write;
+    }
+
+    if (s2_data_resp.valid) {
+        if (!s2_can_go) {
+            next_s2_data_resp = s2_data_resp;
+        } else if (s2_issue_result == DcacheMainPipeS2Result::GoToS3) {
+            next_s3_tag_write = s2_data_resp;
+        }
+    }
+
+    if (s1_data_read.valid) {
+        if (s1_can_go) {
+            next_s2_data_resp = s1_data_read;
+        } else {
+            next_s1_data_read = s1_data_read;
+        }
+    }
+
+    if (!dcacheMainPipeRefillQ.empty()) {
+        const auto &queued_refill = dcacheMainPipeRefillQ.front();
+        if (canEnterDcacheMainPipe(queued_refill, next_pipe)) {
+            next_s1_data_read.valid = true;
+            next_s1_data_read.req = queued_refill;
+            dcacheMainPipeRefillQ.pop();
+            ++stats.dcacheMainPipeRefillEnter;
+        } else {
+            ++stats.dcacheMainPipeRefillBlocked;
+            ++stats.dcacheMainPipeRefillBlockedByPipeResource;
+        }
+    }
+
+    dcacheMainPipe = next_pipe;
+}
+
+LSQ::DcacheMainPipeSlot &
+LSQ::dcacheMainPipeStage(DcacheMainPipeStage stage)
+{
+    return dcacheMainPipe.at(dcacheMainPipeIndex(stage));
+}
+
+const LSQ::DcacheMainPipeSlot &
+LSQ::dcacheMainPipeStage(DcacheMainPipeStage stage) const
+{
+    return dcacheMainPipe.at(dcacheMainPipeIndex(stage));
+}
+
+bool
+LSQ::willDcacheRefillTagWriteNextCycle() const
+{
+    const auto &s2_data_resp =
+        dcacheMainPipeStage(DcacheMainPipeStage::S2DataResp);
+    const auto &s3_tag_write =
+        dcacheMainPipeStage(DcacheMainPipeStage::S3TagWrite);
+    const auto &s4_data_write =
+        dcacheMainPipeStage(DcacheMainPipeStage::S4DataWrite);
+
+    // Keep these readiness rules aligned with advanceDcacheMainPipe().
+    const bool s4_can_go = true;
+    const bool s4_ready = !s4_data_write.valid || s4_can_go;
+    const bool s3_can_go = s4_ready;
+    const bool s3_ready = !s3_tag_write.valid || s3_can_go;
+    const bool s2_can_go = s3_ready;
+
+    const DcacheMainPipeSlot *next_s3 = nullptr;
+    if (s3_tag_write.valid && !s3_can_go) {
+        next_s3 = &s3_tag_write;
+    } else if (s2_data_resp.valid && s2_can_go) {
+        next_s3 = &s2_data_resp;
+    }
+
+    return next_s3 &&
+        next_s3->req.isRefill() &&
+        next_s3->req.needTagWrite;
+}
+
+LSQ::DcacheBankMask
+LSQ::fullDcacheBankMask() const
+{
+    return DcacheBankMask(numBank, true);
+}
+
+LSQ::DcacheBankMask
+LSQ::storeMaskToDcacheBanks(Addr block_addr,
+                            const std::vector<bool> &mask) const
+{
+    assert(mask.size() == cpu->cacheLineSize());
+    DcacheBankMask bank_mask(numBank, false);
+    if (sbufferBankWriteAccurately) {
+        for (unsigned byte = 0; byte < mask.size(); ++byte) {
+            if (mask.at(byte)) {
+                bank_mask.at(bankNum(block_addr + byte)) = true;
             }
         }
-
-        // Advance the pipeline for the next cycle.
-        dcacheRefillDataRead[div] >>= 1;
-        dcacheRefillTagWrite[div] >>= 1;
-        dcacheRefillDataWrite[div] >>= 1;
-
-        std::fill(bankOccupied[div].begin(), bankOccupied[div].end(),
-                  currentCycleBusy);
+    } else {
+        std::fill(bank_mask.begin(), bank_mask.end(), true);
     }
-    recentlyloadAddr.clear();
+    return bank_mask;
+}
+
+LSQ::DcacheMainPipeRequest
+LSQ::makeDcacheRefillMainPipeRequest(
+    Addr addr, bool need_data_read,
+    DcacheMainPipeCompleteCallback on_complete) const
+{
+    DcacheMainPipeRequest req;
+    req.source = DcacheMainPipeSource::Refill;
+    req.addr = addr;
+    req.div = getDcacheDiv(addr);
+    req.setKey = getDcacheSetKey(addr);
+    req.needDataRead = need_data_read;
+    req.needTagWrite = true;
+    req.needDataWrite = true;
+    req.needWritebackPort = need_data_read;
+    req.readBanks = need_data_read ? fullDcacheBankMask() :
+        DcacheBankMask(numBank, false);
+    req.writeBanks = fullDcacheBankMask();
+    req.onComplete = std::move(on_complete);
+    return req;
+}
+
+LSQ::DcacheMainPipeRequest
+LSQ::makeStoreBufferMainPipeRequest(
+    const StoreBufferEntry &entry, DcacheMainPipeS2Callback on_s2_issue) const
+{
+    DcacheMainPipeRequest req;
+    req.source = DcacheMainPipeSource::StoreBuffer;
+    req.addr = entry.blockVaddr;
+    req.div = getDcacheDiv(entry.blockVaddr);
+    req.setKey = getDcacheSetKey(entry.blockVaddr);
+    req.writeBanks = storeMaskToDcacheBanks(entry.blockVaddr, entry.validMask);
+    req.readBanks = DcacheBankMask(numBank, false);
+    req.needDataWrite = dcacheBankMaskAny(req.writeBanks);
+    req.needTagWrite = false;
+
+    DcacheBankMask full_write(numBank, false);
+    DcacheBankMask bank_has_bytes(numBank, false);
+    DcacheBankMask bank_fully_written(numBank, true);
+    for (unsigned byte = 0; byte < entry.validMask.size(); ++byte) {
+        const unsigned bank = bankNum(entry.blockVaddr + byte);
+        bank_has_bytes.at(bank) = true;
+        bank_fully_written.at(bank) = bank_fully_written.at(bank) &&
+            entry.validMask.at(byte);
+    }
+    for (unsigned bank = 0; bank < numBank; ++bank) {
+        full_write.at(bank) = bank_has_bytes.at(bank) &&
+            bank_fully_written.at(bank);
+    }
+
+    for (unsigned bank = 0; bank < numBank; ++bank) {
+        req.readBanks.at(bank) = req.writeBanks.at(bank) && !full_write.at(bank);
+    }
+    req.needDataRead = dcacheBankMaskAny(req.readBanks);
+    req.onS2Issue = std::move(on_s2_issue);
+    return req;
+}
+
+void
+LSQ::markDcacheMainPipeBusyBanks()
+{
+    for (unsigned div = 0; div < dcacheSetDivNum; ++div) {
+        std::fill(bankOccupied.at(div).begin(), bankOccupied.at(div).end(),
+                  false);
+    }
+
+    auto mark_banks = [this](const DcacheMainPipeRequest &req,
+                             const DcacheBankMask &mask) {
+        for (unsigned bank = 0; bank < numBank; ++bank) {
+            if (mask.at(bank)) {
+                bankOccupied.at(req.div).at(bank) = true;
+            }
+        }
+    };
+
+    const auto &s1_data_read =
+        dcacheMainPipeStage(DcacheMainPipeStage::S1DataRead);
+    const auto &s4_data_write =
+        dcacheMainPipeStage(DcacheMainPipeStage::S4DataWrite);
+
+    if (s1_data_read.valid && s1_data_read.req.needDataRead) {
+        mark_banks(s1_data_read.req, s1_data_read.req.readBanks);
+    }
+    if (s4_data_write.valid && s4_data_write.req.needDataWrite) {
+        mark_banks(s4_data_write.req, s4_data_write.req.writeBanks);
+    }
+}
+
+bool
+LSQ::dcacheBankMaskAny(const DcacheBankMask &mask) const
+{
+    return std::any_of(mask.begin(), mask.end(), [](bool v) { return v; });
+}
+
+bool
+LSQ::dcacheBankMaskOverlap(const DcacheBankMask &lhs,
+                           const DcacheBankMask &rhs) const
+{
+    assert(lhs.size() == numBank && rhs.size() == numBank);
+    for (unsigned bank = 0; bank < numBank; ++bank) {
+        if (lhs.at(bank) && rhs.at(bank)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
+LSQ::hasDcacheMainPipeDataArrayConflict() const
+{
+    const auto &s1_data_read =
+        dcacheMainPipeStage(DcacheMainPipeStage::S1DataRead);
+    const auto &s4_data_write =
+        dcacheMainPipeStage(DcacheMainPipeStage::S4DataWrite);
+
+    return s1_data_read.valid &&
+        s1_data_read.req.needDataRead &&
+        s4_data_write.valid &&
+        s4_data_write.req.needDataWrite &&
+        s1_data_read.req.div == s4_data_write.req.div &&
+        dcacheBankMaskOverlap(s1_data_read.req.readBanks,
+                              s4_data_write.req.writeBanks);
+}
+
+bool
+LSQ::isDcacheMainPipeSetBlocked(uint64_t set_key) const
+{
+    // S4 only models data write resource usage; it does not block S0 tag/meta
+    // reads by same-set conflict.
+    for (unsigned stage = static_cast<unsigned>(DcacheMainPipeStage::S1DataRead);
+         stage <= static_cast<unsigned>(DcacheMainPipeStage::S3TagWrite);
+         ++stage) {
+        const auto &pipe_stage =
+            dcacheMainPipeStage(static_cast<DcacheMainPipeStage>(stage));
+        if (pipe_stage.valid && pipe_stage.req.setKey == set_key) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
+LSQ::canEnterDcacheMainPipe(
+    const DcacheMainPipeRequest &request,
+    const DcacheMainPipeBufferedPipe &next_pipe)
+{
+    const bool s0_tag_read_blocked =
+        dcacheMainPipeStage(DcacheMainPipeStage::S3TagWrite).valid &&
+        dcacheMainPipeStage(DcacheMainPipeStage::S3TagWrite).req.needTagWrite;
+    const bool s1_backpressured =
+        next_pipe.at(dcacheMainPipeIndex(DcacheMainPipeStage::S1DataRead)).valid;
+
+    bool blocked = false;
+    if (s1_backpressured) {
+        ++stats.dcacheMainPipeBlockedByS1Backpressure;
+        if (request.isStoreBuffer()) {
+            ++stats.dcacheMainPipeStoreBlockedByS1Backpressure;
+        } else if (request.isRefill()) {
+            ++stats.dcacheMainPipeRefillBlockedByS1Backpressure;
+        }
+        blocked = true;
+    }
+    if (s0_tag_read_blocked) {
+        if (request.isStoreBuffer()) {
+            ++stats.dcacheMainPipeStoreBlockedByTagWrite;
+        }
+        blocked = true;
+    }
+    if (blocked) {
+        return false;
+    }
+    return !isDcacheMainPipeSetBlocked(request.setKey);
+}
+
+bool
+LSQ::canEnterStoreBufferDcacheMainPipe(const StoreBufferEntry &entry)
+{
+    const auto req = makeStoreBufferMainPipeRequest(entry);
+    const bool s1_backpressured =
+        dcacheMainPipeStage(DcacheMainPipeStage::S1DataRead).valid;
+    const bool s0_tag_read_blocked =
+        dcacheMainPipeStage(DcacheMainPipeStage::S3TagWrite).valid &&
+        dcacheMainPipeStage(DcacheMainPipeStage::S3TagWrite).req.needTagWrite;
+
+    if (!dcacheMainPipeRefillQ.empty()) {
+        if (s1_backpressured) {
+            ++stats.dcacheMainPipeStoreBlockedByS1Backpressure;
+        }
+        if (s0_tag_read_blocked) {
+            ++stats.dcacheMainPipeStoreBlockedByTagWrite;
+        }
+        ++stats.dcacheMainPipeStoreBlockedByRefill;
+        return false;
+    }
+
+    bool blocked = false;
+    if (s1_backpressured) {
+        ++stats.dcacheMainPipeBlockedByS1Backpressure;
+        ++stats.dcacheMainPipeStoreBlockedByS1Backpressure;
+        blocked = true;
+    }
+    if (s0_tag_read_blocked) {
+        ++stats.dcacheMainPipeStoreBlockedByTagWrite;
+        blocked = true;
+    }
+    if (isDcacheMainPipeSetBlocked(req.setKey)) {
+        ++stats.dcacheMainPipeStoreBlockedBySet;
+        blocked = true;
+    }
+    if (blocked) {
+        return false;
+    }
+
+    return true;
+}
+
+void
+LSQ::enterStoreBufferDcacheMainPipe(StoreBufferEntry &entry, PacketPtr data_pkt)
+{
+    const auto req = makeStoreBufferMainPipeRequest(
+        entry,
+        [this, data_pkt](Tick tick) {
+            return issueSbufferPacketFromDcacheMainPipe(data_pkt, tick);
+        });
+    auto &s1_data_read =
+        dcacheMainPipeStage(DcacheMainPipeStage::S1DataRead);
+    assert(!s1_data_read.valid);
+    s1_data_read.valid = true;
+    s1_data_read.req = req;
+    entry.inDcacheMainPipe = true;
+    ++stats.dcacheMainPipeStoreEnter;
 }
 
 unsigned
@@ -679,11 +1206,17 @@ LSQ::getDcacheDiv(Addr vaddr) const
 }
 
 uint64_t
+LSQ::getDcacheSetKey(Addr vaddr) const
+{
+    return (vaddr >> dcacheLineBits) & ((1ULL << dcacheSetBits) - 1);
+}
+
+uint64_t
 LSQ::getDcacheBankSetKey(Addr vaddr) const
 {
-    // [setIndex][bankIndex][dataOffset]
-    //         ^ (cacheLineBits)   ^ (3 bits)
-    return (vaddr >> 3) & ((1ULL << dcacheSetBankBits) - 1);
+    // Vaddr: [TagBits][setIndex][bankIndex][dataOffset]
+    // BankSetKey: [setIndex][bankIndex]
+    return (getDcacheSetKey(vaddr) << dcacheBankIndexBits) | bankNum(vaddr);
 }
 
 uint64_t
@@ -694,33 +1227,67 @@ LSQ::getDcacheDivBankSetKey(Addr vaddr) const
 }
 
 bool
-LSQ::loadBankConflictedCheck(Addr vaddr)
+LSQ::loadBankConflictedCheck(Addr vaddr, unsigned size)
 {
-    bool now_bank_conflict = false;
-    const int bankIndex = bankNum(vaddr);
-    const unsigned div = getDcacheDiv(vaddr);
-    const uint64_t key = getDcacheDivBankSetKey(vaddr);
+    if (!enableBankConflictCheck || size == 0) {
+        return false;
+    }
 
-    if (enableBankConflictCheck) {
-        if (recentlyloadAddr.contains(key)) {
-            recentlyloadAddr.get(key);
-            return false;
-        }
-        if (bankOccupied[div][bankIndex]) {
-            now_bank_conflict = true;
+    struct TouchedBank
+    {
+        unsigned bankIndex;
+        unsigned div;
+        uint64_t key;
+        bool recentlyAccessed;
+    };
 
-        } else {
-            bankOccupied[div][bankIndex] = true;
-            recentlyloadAddr.insert(key, {});
+    // Collect all banks will be touched by the load request.
+    // Eg. Bank size = 2B, load size = 8B, address = 0x0, will touch bank 0,1,2,3.
+    std::vector<TouchedBank> touched_banks;
+    for (unsigned offset = 0; offset < size;) {
+        const Addr bank_vaddr = vaddr + offset;
+        touched_banks.push_back({
+            bankNum(bank_vaddr),
+            getDcacheDiv(bank_vaddr),
+            getDcacheDivBankSetKey(bank_vaddr),
+            false
+        });
+        // Take care of misaligned situation.
+        Addr offsetInc = dcacheBankBytes - (bank_vaddr & (dcacheBankBytes - 1));
+        offset += offsetInc;
+    }
+
+    // Probe every target bank before claiming any of them. A failed
+    // multi-bank load will not update bankOccupied and recentlyloadAddr.
+    for (auto &bank : touched_banks) {
+        bank.recentlyAccessed = recentlyloadAddr.contains(bank.key);
+        if (!bank.recentlyAccessed &&
+            bankOccupied[bank.div][bank.bankIndex]) {
+            return true;
         }
     }
-    return now_bank_conflict;
+
+    // Occupy the banks and insert new keys to recentlyloadAddr.
+    for (const auto &bank : touched_banks) {
+        bankOccupied[bank.div][bank.bankIndex] = true;
+        if (!bank.recentlyAccessed) {
+            recentlyloadAddr.insert(bank.key, {});
+        }
+    }
+
+    return false;
 }
 
 void
-LSQ::notifyDcacheRefill(Addr addr)
+LSQ::notifyDcacheRefill(
+    Addr addr, bool need_data_read,
+    DcacheMainPipeCompleteCallback on_complete)
 {
-    pendingDcacheRefill.at(getDcacheDiv(addr)) = true;
+    dcacheMainPipeRefillQ.push(
+        makeDcacheRefillMainPipeRequest(
+            addr, need_data_read, std::move(on_complete)));
+    cpu->wakeCPU();
+    cpu->activityThisCycle();
 }
 
 unsigned
@@ -822,6 +1389,47 @@ LSQ::issueToStorePipe(const DynInstPtr &inst)
     thread[tid].issueToStorePipe(inst);
 }
 
+bool
+LSQ::storeQueueWriteReady(const DynInstPtr &inst) const
+{
+    return thread[inst->threadNumber].storeQueueWriteReady(inst);
+}
+
+void
+LSQ::recordAddrOrDataReady(const DynInstPtr &inst)
+{
+    thread[inst->threadNumber].recordAddrOrDataReady(inst);
+}
+
+void
+LSQ::recordAddrOrDataDequeue(const DynInstPtr &inst)
+{
+    thread[inst->threadNumber].recordAddrOrDataDequeue(inst);
+}
+
+bool
+LSQ::phySQFullReplayReady(const DynInstPtr &inst)
+{
+    if (!inst || inst->isSquashed() || storeQueueMultiple == 1 ||
+        !phySQFullCheckAtReplay) {
+        return true;
+    }
+
+    auto &unit = thread[inst->threadNumber];
+    if (unit.storeQueueWriteReady(inst)) {
+        return true;
+    }
+
+    unit.recordPhysicalSQReplayBlocked(inst);
+    return false;
+}
+
+void
+LSQ::recordStoreQueueReplay(const DynInstPtr &inst)
+{
+    thread[inst->threadNumber].recordStoreQueueReplay(inst);
+}
+
 void
 LSQ::executePipeSx()
 {
@@ -872,10 +1480,9 @@ LSQ::processWriteback()
     storeBufferWriteback();
 
 
-    if (storeBufferBlocked()) {
-        DPRINTF(StoreBuffer, "Store buffer is blocking, skip SQ offload\n");
-        return;
-    }
+    // Output backpressure is independent from SQ->SBuffer enqueue ready.
+    // Continue offering entries that can allocate or merge; the blocked
+    // eviction/replay is retried by its own path below.
 
     std::vector<uint32_t> offload_quota(numThreads, 0);
     std::vector<uint32_t> offload_demand(numThreads, 0);
@@ -963,6 +1570,11 @@ LSQ::storeBufferWriteback()
         can_evict = false;
     }
 
+    // Replayed S2 exits are retried before pre-admission blocks and new
+    // evictions.
+    if (can_evict && retryReplayStoreBuffer()) {
+        can_evict = false;
+    }
     if (can_evict && retryBlockedStoreBuffer()) {
         can_evict = false;
     }
@@ -1030,16 +1642,50 @@ LSQ::storeBufferWriteback()
             entry->request->sbuffer_entry = entry;
             bool success = entry->request->sendPacketToCache();
             if (!success) {
-                setBlockedStoreBufferEntry(entry);
+                setBlockedStoreBufferEntry(
+                    entry,
+                    lastSbufferSendBlockedByMainPipe ?
+                        StoreBufferBlockCause::MainPipe :
+                        StoreBufferBlockCause::CachePort);
                 DPRINTF(StoreBuffer, "send packet fail\n");
             } else {
-                DPRINTF(StoreBuffer, "send packet successed\n");
-                entry->sending = true;
-                sbufferWriteBank(entry->blockVaddr, entry->validMask);
+                DPRINTF(StoreBuffer, "enter dcache mainpipe successed\n");
                 resetStoreBufferInactiveCycles();
             }
         }
     }
+}
+
+bool
+LSQ::retryReplayStoreBuffer()
+{
+    if (sbufferMainPipeReplayQ.empty()) {
+        return false;
+    }
+
+    // The front replay has priority, but a failed timing send must wait for the
+    // cache retry before it can re-enter the fake pipe.
+    if (cacheBlocked()) {
+        return true;
+    }
+
+    auto *entry = sbufferMainPipeReplayQ.front();
+    assert(entry);
+    assert(entry->replayQueued);
+    assert(!entry->inDcacheMainPipe);
+    assert(!entry->sending);
+    assert(entry->request);
+
+    bool success = entry->request->sendPacketToCache();
+    if (!success) {
+        // Keep the front replay queued; it will retry from S0 later.
+        return true;
+    }
+
+    entry->replayQueued = false;
+    sbufferMainPipeReplayQ.pop_front();
+    resetStoreBufferInactiveCycles();
+    return true;
 }
 
 bool
@@ -1051,48 +1697,160 @@ LSQ::retryBlockedStoreBuffer()
 
     bool success = blockedSbufferEntry->request->sendPacketToCache();
     if (!success) {
+        setBlockedStoreBufferEntry(
+            blockedSbufferEntry,
+            lastSbufferSendBlockedByMainPipe ?
+                StoreBufferBlockCause::MainPipe :
+                StoreBufferBlockCause::CachePort);
         return true;
     }
 
-    blockedSbufferEntry->sending = true;
-    sbufferWriteBank(blockedSbufferEntry->blockVaddr,
-                     blockedSbufferEntry->validMask);
     resetStoreBufferInactiveCycles();
-    blockedSbufferEntry = nullptr;
+    clearBlockedStoreBufferEntry();
     return true;
 }
 
 bool
-LSQ::sbufferSendPacket(PacketPtr data_pkt)
+LSQ::sbufferEnterDcacheMainPipe(PacketPtr data_pkt)
 {
-    bool ret = true;
-    bool cache_got_blocked = false;
+    lastSbufferSendBlockedByMainPipe = false;
 
+    auto request = dynamic_cast<SbufferRequest *>(data_pkt->senderState);
+    assert(request);
+    assert(request->sbuffer_entry);
+    assert(!request->sbuffer_entry->sending);
+    assert(!request->sbuffer_entry->inDcacheMainPipe);
 
-    if (!cacheBlocked() && cachePortAvailable(false)) {
-        if (!dcachePort.sendTimingReq(data_pkt)) {
-            ret = false;
-            cache_got_blocked = true;
-        }
-    } else {
-        ret = false;
+    if (!canEnterStoreBufferDcacheMainPipe(*request->sbuffer_entry)) {
+        lastSbufferSendBlockedByMainPipe = true;
+        ++stats.sbufferDcacheReqBlocked;
+        ++stats.sbufferDcacheReqBlockedByMainPipe;
+        return false;
     }
 
-    if (ret) {
+    enterStoreBufferDcacheMainPipe(*request->sbuffer_entry, data_pkt);
+    return true;
+}
+
+LSQ::DcacheMainPipeS2Result
+LSQ::issueSbufferPacketFromDcacheMainPipe(PacketPtr data_pkt, Tick issue_tick)
+{
+    DcacheMainPipeS2Result result = DcacheMainPipeS2Result::GoToS3;
+    bool cache_got_blocked = false;
+
+    auto request = dynamic_cast<SbufferRequest *>(data_pkt->senderState);
+    assert(request);
+    assert(request->sbuffer_entry);
+    assert(request->_numOutstandingPackets == 0);
+    assert(request->sbuffer_entry->inDcacheMainPipe);
+    assert(!request->sbuffer_entry->sending);
+
+    data_pkt->sendTick = issue_tick;
+    data_pkt->clearDcacheMainPipeSbufferHit();
+    data_pkt->setDcacheMainPipeSbufferReq();
+    data_pkt->setLSQPtr(this);
+
+    // Issue to the real classic cache only at fake S2 so StoreBuffer misses
+    // cannot allocate or merge MSHRs at fake-pipe admission time.
+    auto pending = sbufferMissRequests.find(data_pkt->getAddr());
+    const bool same_line = pending != sbufferMissRequests.end();
+    bool compatible = true;
+    data_pkt->sbufferMergeTarget = nullptr;
+    data_pkt->sbufferMergeFailed = false;
+    if (same_line) {
+        auto *previous = pending->second.back();
+        const auto *previous_entry = previous->sbuffer_entry;
+        // Do not merge different SMT threads or virtual aliases. The cache
+        // additionally checks that the predecessor is still in a mergeable
+        // store-origin MSHR, rather than only awaiting its CPU response.
+        compatible = previous_entry->tid == request->sbuffer_entry->tid &&
+            getDcacheSetKey(previous_entry->blockVaddr) ==
+            getDcacheSetKey(request->sbuffer_entry->blockVaddr);
+        data_pkt->sbufferMergeTarget = previous->mainPacket();
+    }
+    if (!compatible) {
+        result = DcacheMainPipeS2Result::Blocked;
+    } else if (!cacheBlocked() && cachePortAvailable(false)) {
+        if (!dcachePort.sendTimingReq(data_pkt)) {
+            result = DcacheMainPipeS2Result::Blocked;
+            // A same-line SBuffer merge failure is replayed through S0 and
+            // does not mean that the cache port is unavailable.
+            cache_got_blocked = !data_pkt->sbufferMergeFailed;
+        }
+    } else {
+        result = DcacheMainPipeS2Result::Blocked;
+    }
+    data_pkt->sbufferMergeTarget = nullptr;
+    if (same_line) {
+        if (result == DcacheMainPipeS2Result::Blocked) {
+            ++stats.sbufferMissSameLineReplay;
+        } else {
+            assert(!data_pkt->isDcacheMainPipeSbufferHit());
+            ++stats.sbufferMissMerged;
+        }
+    }
+
+    if (result == DcacheMainPipeS2Result::GoToS3) {
         stats.sbufferDcacheReqFire++;
         cachePortBusy(false);
+        request->_numOutstandingPackets = 1;
+        request->sbuffer_entry->inDcacheMainPipe = false;
+        request->sbuffer_entry->sending = true;
+        resetStoreBufferInactiveCycles();
+        result = data_pkt->isDcacheMainPipeSbufferHit() ?
+            DcacheMainPipeS2Result::GoToS3 :
+            DcacheMainPipeS2Result::ExitPipe;
+        if (result == DcacheMainPipeS2Result::ExitPipe) {
+            ++stats.dcacheMainPipeStoreS2MissExit;
+            if (sbufferReleaseOnMiss) {
+                release_sbuffer_miss_entry(request);
+            }
+        }
     } else {
+        auto *entry = request->sbuffer_entry;
         stats.sbufferDcacheReqBlocked++;
+        ++stats.dcacheMainPipeStoreS2IssueBlocked;
+        entry->inDcacheMainPipe = false;
+        // S2 issue failed. Exit the fake pipe and let the StoreBuffer replay
+        // this eviction from S0 through the replay queue.
+        if (!entry->replayQueued) {
+            entry->replayQueued = true;
+            sbufferMainPipeReplayQ.push_back(entry);
+        }
         if (cache_got_blocked) {
             cacheBlocked(true);
 
-            auto request = dynamic_cast<SbufferRequest *>(data_pkt->senderState);
-            assert(request);
             request->_port.recordStoreBufferBlockedByCache();
         }
     }
 
-    return ret;
+    return result;
+}
+
+void
+LSQ::release_sbuffer_miss_entry(SbufferRequest *request)
+{
+    auto *entry = request->sbuffer_entry;
+    assert(entry && entry->sending && !request->releasedEntry);
+    request->releasedEntry = std::make_unique<StoreBufferEntry>(*entry);
+    request->releasedEntry->vice = nullptr;
+    request->sbuffer_entry = request->releasedEntry.get();
+    request->_data = request->sbuffer_entry->blockDatas.data();
+    request->mainPacket()->deleteData();
+    request->mainPacket()->dataStatic(request->_data);
+
+    sbufferMissRequests[entry->blockPaddr].push_back(request);
+    ++sbufferMissRequestCount;
+    sbufferMissSeqs[entry->tid].insert(entry->seqNum);
+    entry->request = nullptr;
+    storeBuffer.release(entry);
+    ++stats.sbufferMissEntriesReleased;
+    stats.sbufferMissPending = sbufferMissRequestCount;
+    DPRINTF(StoreBuffer,
+            "[tid:%u] Release sbuffer entry[%#lx] on miss acceptance, "
+            "sbuffer size: %llu, pending misses: %llu\n",
+            request->sbuffer_entry->tid, request->mainReq()->getPaddr(),
+            storeBuffer.size(), sbufferMissRequestCount);
 }
 
 void
@@ -1113,7 +1871,27 @@ LSQ::completeSbufferEvict(PacketPtr pkt)
             request->_size);
     }
 
-    storeBuffer.release(request->sbuffer_entry);
+    if (request->releasedEntry) {
+        auto *entry = request->sbuffer_entry;
+        auto pending = sbufferMissRequests.find(entry->blockPaddr);
+        assert(pending != sbufferMissRequests.end());
+        auto &requests = pending->second;
+        auto target = std::find(requests.begin(), requests.end(), request);
+        assert(target != requests.end());
+        requests.erase(target);
+        if (requests.empty()) {
+            sbufferMissRequests.erase(pending);
+        }
+        assert(sbufferMissRequestCount > 0);
+        --sbufferMissRequestCount;
+        auto &sequences = sbufferMissSeqs[entry->tid];
+        auto sequence = sequences.find(entry->seqNum);
+        assert(sequence != sequences.end());
+        sequences.erase(sequence);
+        stats.sbufferMissPending = sbufferMissRequestCount;
+    } else {
+        storeBuffer.release(request->sbuffer_entry);
+    }
     DPRINTF(StoreBuffer,
             "finish entry[%#x] evict to cache, sbuffer size: %d, "
             "unsentsize: %d\n",
@@ -1260,7 +2038,9 @@ LSQ::recvReqRetry()
     iewStage->cacheUnblocked();
     cacheBlocked(false);
 
-    retryBlockedStoreBuffer();
+    if (!retryReplayStoreBuffer()) {
+        retryBlockedStoreBuffer();
+    }
 
     for (ThreadID tid : *activeThreads) {
         thread[tid].recvRetry();
@@ -1493,48 +2273,194 @@ LSQ::activeLSQThreads() const
     return activeThreads->size();
 }
 
+/** Queue type enum for sharedLSQAllocation */
+enum class LSQQueueType
+{
+    LQ,
+    SQ,
+    RARQ,
+    RAWQ
+};
+
 unsigned
-LSQ::sharedLSQAllocation(unsigned entries) const
+LSQ::sharedLSQAllocation(unsigned entries, LSQQueueType queueType) const
 {
     const unsigned active_threads = std::max(1U, activeLSQThreads());
 
-    switch (lsqPolicy) {
+    // Select policy based on queue type
+    SMTQueuePolicy policy;
+    switch (queueType) {
+      case LSQQueueType::LQ:
+      case LSQQueueType::SQ:
+        policy = lsqPolicy;
+        break;
+      case LSQQueueType::RARQ:
+        policy = rarqPolicy;
+        break;
+      case LSQQueueType::RAWQ:
+        policy = rawqPolicy;
+        break;
+      default:
+        panic("Invalid LSQ queue type");
+    }
+
+    switch (policy) {
       case SMTQueuePolicy::Dynamic:
       case SMTQueuePolicy::DynamicBorrowing:
         return entries;
       case SMTQueuePolicy::Partitioned:
         return entries / active_threads;
       case SMTQueuePolicy::Threshold:
-        return active_threads == 1 ? entries :
-            std::min(entries, smtLSQThreshold);
+        // Use separate thresholds for LQ and SQ
+        if (queueType == LSQQueueType::LQ) {
+            return active_threads == 1 ? entries :
+                std::min(entries, smtLQThreshold);
+        } else if (queueType == LSQQueueType::SQ) {
+            return active_threads == 1 ? entries :
+                std::min(entries, smtSQThreshold);
+        } else {
+            // RARQ/RAWQ should not use Threshold policy through lsqPolicy
+            panic("Threshold policy for RARQ/RAWQ requires separate threshold parameters");
+        }
       default:
         panic("Invalid LSQ sharing policy. Options are: Dynamic, "
               "Partitioned, Threshold, DynamicBorrowing");
     }
 }
 
+bool
+LSQ::canBorrowLQ(ThreadID tid) const
+{
+    return lsqPolicy == SMTQueuePolicy::DynamicBorrowing &&
+           tid < numThreads;
+}
+
+bool
+LSQ::canBorrowSQ(ThreadID tid) const
+{
+    return lsqPolicy == SMTQueuePolicy::DynamicBorrowing &&
+           tid < numThreads;
+}
+
+unsigned
+LSQ::borrowingLimitLQ(ThreadID tid) const
+{
+    if (tid >= numThreads) {
+        return 0;
+    }
+
+    if (!canBorrowLQ(tid)) {
+        return logicalMaxLoadEntries(tid);
+    }
+
+    const unsigned active_threads = std::max(1U, activeLSQThreads());
+    const unsigned base = lqBorrowBaseReserveEntries;
+    const unsigned donor_resume_quota =
+        std::min(base, lqBorrowDonorReserveEntries);
+
+    unsigned reserved = 0;
+    for (ThreadID other = 0; other < numThreads; ++other) {
+        if (other == tid) {
+            continue;
+        }
+
+        const unsigned reserve =
+            lqBorrowingDonor[other] ? donor_resume_quota : base;
+        const unsigned used = thread[other].numLoads();
+        reserved += std::max(reserve, used);
+    }
+
+    if (reserved >= LQEntries) {
+        return 0;
+    }
+
+    return LQEntries - reserved;
+}
+
+unsigned
+LSQ::borrowingLimitSQ(ThreadID tid) const
+{
+    if (tid >= numThreads) {
+        return 0;
+    }
+
+    if (!canBorrowSQ(tid)) {
+        return logicalMaxStoreEntries(tid);
+    }
+
+    const unsigned active_threads = std::max(1U, activeLSQThreads());
+    const unsigned base = sqBorrowBaseReserveEntries;
+    const unsigned donor_resume_quota =
+        std::min(base, sqBorrowDonorReserveEntries);
+
+    unsigned reserved = 0;
+    for (ThreadID other = 0; other < numThreads; ++other) {
+        if (other == tid) {
+            continue;
+        }
+
+        const unsigned reserve =
+            sqBorrowingDonor[other] ? donor_resume_quota : base;
+        const unsigned used = thread[other].numStores();
+        reserved += std::max(reserve, used);
+    }
+
+    if (reserved >= SQEntries) {
+        return 0;
+    }
+
+    return SQEntries - reserved;
+}
+
+void
+LSQ::setLQBorrowingDonor(ThreadID tid, bool donor)
+{
+    if (lqBorrowingDonor[tid] != donor) {
+        lqBorrowingDonor[tid] = donor;
+        lqBorrowingStateHoldCycle[tid] = 0;
+    }
+}
+
+void
+LSQ::setSQBorrowingDonor(ThreadID tid, bool donor)
+{
+    if (sqBorrowingDonor[tid] != donor) {
+        sqBorrowingDonor[tid] = donor;
+        sqBorrowingStateHoldCycle[tid] = 0;
+    }
+}
+
+void
+LSQ::addBorrowingStateHoldCycle()
+{
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        lqBorrowingStateHoldCycle[tid]++;
+        sqBorrowingStateHoldCycle[tid]++;
+    }
+}
+
 unsigned
 LSQ::logicalMaxLoadEntries(ThreadID tid) const
 {
-    return sharedLSQMode() ? sharedLSQAllocation(LQEntries) : LQEntries;
+    return sharedLSQMode() ? sharedLSQAllocation(LQEntries, LSQQueueType::LQ) : LQEntries;
 }
 
 unsigned
 LSQ::logicalMaxStoreEntries(ThreadID tid) const
 {
-    return sharedLSQMode() ? sharedLSQAllocation(SQEntries) : SQEntries;
+    return sharedLSQMode() ? sharedLSQAllocation(SQEntries, LSQQueueType::SQ) : SQEntries;
 }
 
 unsigned
 LSQ::logicalMaxRAREntries(ThreadID tid) const
 {
-    return sharedLSQMode() ? sharedLSQAllocation(RARQEntries) : RARQEntries;
+    return sharedLSQMode() ? sharedLSQAllocation(RARQEntries, LSQQueueType::RARQ) : RARQEntries;
 }
 
 unsigned
 LSQ::logicalMaxRAWEntries(ThreadID tid) const
 {
-    return sharedLSQMode() ? sharedLSQAllocation(RAWQEntries) : RAWQEntries;
+    return sharedLSQMode() ? sharedLSQAllocation(RAWQEntries, LSQQueueType::RAWQ) : RAWQEntries;
 }
 
 unsigned
@@ -1544,6 +2470,21 @@ LSQ::logicalFreeLoadEntries(ThreadID tid) const
         static_cast<int>(logicalMaxLoadEntries(tid)) - thread[tid].numLoads());
     if (!sharedLSQMode()) {
         return thread_free;
+    }
+
+    // For DynamicBorrowing policy, use borrowing limit
+    if (lsqPolicy == SMTQueuePolicy::DynamicBorrowing) {
+        const unsigned limit = borrowingLimitLQ(tid);
+        const unsigned used = thread[tid].numLoads();
+        if (limit <= used) {
+            return 0;
+        }
+        const unsigned borrow_free = limit - used;
+        // Also ensure we don't exceed shared free space
+        const unsigned shared_used = numLoads();
+        const unsigned shared_free = std::max(
+            0, static_cast<int>(LQEntries) - static_cast<int>(shared_used));
+        return std::min(borrow_free, shared_free);
     }
 
     const unsigned shared_used = numLoads();
@@ -1559,6 +2500,21 @@ LSQ::logicalFreeStoreEntries(ThreadID tid) const
         static_cast<int>(logicalMaxStoreEntries(tid)) - thread[tid].numStores());
     if (!sharedLSQMode()) {
         return thread_free;
+    }
+
+    // For DynamicBorrowing policy, use borrowing limit
+    if (lsqPolicy == SMTQueuePolicy::DynamicBorrowing) {
+        const unsigned limit = borrowingLimitSQ(tid);
+        const unsigned used = thread[tid].numStores();
+        if (limit <= used) {
+            return 0;
+        }
+        const unsigned borrow_free = limit - used;
+        // Also ensure we don't exceed shared free space
+        const unsigned shared_used = numStores();
+        const unsigned shared_free = std::max(
+            0, static_cast<int>(SQEntries) - static_cast<int>(shared_used));
+        return std::min(borrow_free, shared_free);
     }
 
     const unsigned shared_used = numStores();
@@ -1915,19 +2871,32 @@ LSQ::flushStores(ThreadID tid, InstSeqNum seq_num)
 }
 
 LSQ::StoreBufferEntry *
-LSQ::findForwardingStoreBufferEntry(Addr block_paddr, ThreadID load_tid,
-                                    InstSeqNum load_seq) const
+LSQ::findForwardingStoreBufferEntry(Addr block_paddr, ThreadID load_tid) const
 {
     auto entry = storeBuffer.get(load_tid, block_paddr);
     if (!entry) {
+        entry = find_inflight_store_buffer_entry(block_paddr, load_tid);
+    }
+    return entry;
+}
+
+LSQ::StoreBufferEntry *
+LSQ::find_inflight_store_buffer_entry(Addr block_paddr, ThreadID load_tid,
+                                      int byte_idx) const
+{
+    auto pending = sbufferMissRequests.find(block_paddr);
+    if (pending == sbufferMissRequests.end()) {
         return nullptr;
     }
-
-    if (entry->seqNum < load_seq ||
-        (entry->vice && entry->vice->seqNum < load_seq)) {
-        return entry;
+    // Each list is bounded by accepted cache targets and pending responses.
+    for (auto it = pending->second.rbegin(); it != pending->second.rend();
+         ++it) {
+        auto *entry = (*it)->sbuffer_entry;
+        if (entry->tid == load_tid &&
+            (byte_idx < 0 || entry->validMask[byte_idx])) {
+            return entry;
+        }
     }
-
     return nullptr;
 }
 
@@ -1972,6 +2941,19 @@ LSQ::numStoresToSbuffer(ThreadID tid)
 bool
 LSQ::willWB()
 {
+    if (!dcacheMainPipeRefillQ.empty()) {
+        return true;
+    }
+    for (const auto &stage : dcacheMainPipe) {
+        if (stage.valid) {
+            return true;
+        }
+    }
+
+    if (!sbufferMainPipeReplayQ.empty() && !cacheBlocked()) {
+        return true;
+    }
+
     if (blockedSbufferEntry && !cacheBlocked()) {
         return true;
     }
@@ -2199,7 +3181,7 @@ LSQ::SingleDataRequest::SingleDataRequest(
                 std::move(amo_op)) {
     port->numSingleRequest++;
     singleList.push_back(this);
-    assert(port->numSingleRequest <= 400);
+    assert(port->numSingleRequest <= 500);
 }
 
 LSQ::SingleDataRequest::~SingleDataRequest(){
@@ -2439,7 +3421,8 @@ LSQ::SbufferRequest::SbufferRequest(CPU* cpu, LSQUnit* port, Addr blockpaddr, ui
       cpu(cpu) {
     lsq = port->getLsq();
     port->numSBufferRequest++;
-    assert(port->numSBufferRequest <= port->getLsq()->getSbufferEntries());
+    assert(port->numSBufferRequest <= lsq->getSbufferEntries() +
+           lsq->sbufferMissRequestCount);
 }
 
 LSQ::SbufferRequest::~SbufferRequest() {
@@ -2691,12 +3674,27 @@ LSQ::SingleDataRequest::recvTimingResp(PacketPtr pkt)
     bool cacheHit = LSQRequest::_inst->getCpuPtr()->ticksToCycles(curTick() - pkt->sendTick) <= 1;
     // Dump inst num, request addr, and packet addr
     if (debug::LSQ) {
-        char buffer[8];
-        std::memcpy(buffer, pkt->getPtr<char>(), pkt->getSize());
-        DPRINTF(LSQ, "Single Req::recvTimingResp: inst: %llu, pkt: %#lx, isLoad: %d, "
-                    "isLLSC: %d, isUncache: %d, isCachehit: %d, data: %d\n",
-                    pkt->req->getReqInstSeqNum(), pkt->getAddr(), isLoad(), mainReq()->isLLSC(),
-                    mainReq()->isUncacheable(), cacheHit, *((uint64_t*)buffer));
+        uint64_t firstWord = 0;
+        const size_t copySize =
+            std::min<size_t>(pkt->getSize(), sizeof(firstWord));
+
+        std::memcpy(
+            &firstWord,
+            pkt->getPtr<uint8_t>(),
+            copySize);
+
+        DPRINTF(LSQ,
+                "Single Req::recvTimingResp: inst: %llu, pkt: %#lx, "
+                "size: %u, isLoad: %d, isLLSC: %d, isUncache: %d, "
+                "isCachehit: %d, firstData: %#llx\n",
+                pkt->req->getReqInstSeqNum(),
+                pkt->getAddr(),
+                pkt->getSize(),
+                isLoad(),
+                mainReq()->isLLSC(),
+                mainReq()->isUncacheable(),
+                cacheHit,
+                static_cast<unsigned long long>(firstWord));
     }
 
     if (isLoad()) {
@@ -2919,12 +3917,13 @@ bool
 LSQ::SbufferRequest::sendPacketToCache()
 {
     assert(_numOutstandingPackets == 0);
-    bool success = lsq->sbufferSendPacket(_packets.at(0));
-    DPRINTF(StoreBuffer, "Sbuffer Req::sendPacketToCache: entry[%#x]\n", _packets[0]->getAddr());
-    if (success) {
-        _packets[0]->setLSQPtr(lsq);
-        _numOutstandingPackets = 1;
-    }
+    // This only admits the request into the fake DCache MainPipe. The real
+    // classic-cache timing request is issued by the fake S2 callback.
+    bool success = lsq->sbufferEnterDcacheMainPipe(_packets.at(0));
+    DPRINTF(StoreBuffer,
+            "Sbuffer Req::sendPacketToCache: entry[%#x] %s dcache "
+            "mainpipe\n",
+            _packets[0]->getAddr(), success ? "entered" : "blocked before");
 
     return success;
 }
@@ -2992,11 +3991,35 @@ LSQ::SplitDataRequest::sendPacketToCache()
     bool mshr_alias_fail = false;
     bool hit_in_write_buffer = false;
     while (numReceivedPackets + _numOutstandingPackets < _packets.size()) {
-        bool success = lsqUnit()->trySendPacket(isLoad(), _packets.at(numReceivedPackets + _numOutstandingPackets),
-                                                bank_conflict, tag_read_fail, mshr_used,
-                                                mshr_alias_fail, hit_in_write_buffer);
+        const size_t pkt_idx =
+            numReceivedPackets + _numOutstandingPackets;
+        PacketPtr pkt = _packets.at(pkt_idx);
+
+        bool success = lsqUnit()->trySendPacket(
+            isLoad(), pkt,
+            bank_conflict, tag_read_fail, mshr_used,
+            mshr_alias_fail, hit_in_write_buffer);
+
+        DPRINTF(LSQ,
+                "Split send observe [sn:%llu] idx:%llu addr:%#lx "
+                "success:%d bankConflict:%d tagReadFail:%d "
+                "mshrUsed:%d mshrAliasFail:%d writeBuffer:%d "
+                "received:%llu outstanding:%llu total:%llu\n",
+                _inst->seqNum,
+                static_cast<unsigned long long>(pkt_idx),
+                pkt->getAddr(),
+                success,
+                bank_conflict,
+                tag_read_fail,
+                mshr_used,
+                mshr_alias_fail,
+                hit_in_write_buffer,
+                static_cast<unsigned long long>(numReceivedPackets),
+                static_cast<unsigned long long>(_numOutstandingPackets),
+                static_cast<unsigned long long>(_packets.size()));
+
         if (success) {
-            _packets[numReceivedPackets + _numOutstandingPackets]->setLSQPtr(lsqUnit()->getLsq());
+            pkt->setLSQPtr(lsqUnit()->getLsq());
             _numOutstandingPackets++;
         } else {
             break;

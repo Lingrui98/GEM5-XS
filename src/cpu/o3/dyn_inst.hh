@@ -44,11 +44,14 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdio>
 #include <deque>
 #include <list>
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "base/refcnt.hh"
 #include "base/trace.hh"
@@ -85,6 +88,7 @@ namespace o3
 {
 
 class IssueQue;
+class InstructionQueue;
 
 class DynInst : public ExecContext, public RefCounted
 {
@@ -134,11 +138,15 @@ class DynInst : public ExecContext, public RefCounted
     /** Completes the access.  Only valid for memory operations. */
     Fault completeAcc(PacketPtr pkt);
 
-    // create store data uop
+    // Turn a split store's original DynInst into the store-address uop.
+    // RISC-V stores use src0 as the address base and src1 as the store data.
+    // The address uop keeps src0 and drops the src1 dependency after the
+    // store-data uop has copied it.
     void buildStoreAddrUop();
 
-    // create store data uop
-    // call before buildStoreAddrUop
+    // Create the store-data uop for a split store.  This must run before
+    // buildStoreAddrUop(), while the original store still records src1's
+    // renamed physical register and ready bit.
     DynInstPtr createStoreDataUop();
 
     /** The sequence number of the instruction. */
@@ -149,6 +157,16 @@ class DynInst : public ExecContext, public RefCounted
 
     /** the xs metadata for this instruction */
     const XsDynInstMetaPtr xsMeta;
+
+    // One chain per source prevents an unrelated operand wake/cancel from
+    // overwriting the address dependency. Populated only for IQ wakeups.
+    std::vector<lldp::Chain> lldpInputs;
+    lldp::Chain lldpChain;
+    int lldpSource{-1};
+    bool lldpIssued{false};
+    bool lldpCounted{false};
+    void selectLldpChain();
+
 
     /** Pointer to the Impl's CPU object. */
     CPU *cpu = nullptr;
@@ -215,6 +233,7 @@ class DynInst : public ExecContext, public RefCounted
                                  /// instructions ahead of it
         SerializeAfter,          /// Needs to serialize instructions behind it
         SerializeHandled,        /// Serialization has been handled
+        RatSnapshotted,          /// Instruction owns a RAT checkpoint
         NumStatus
     };
 
@@ -237,6 +256,8 @@ class DynInst : public ExecContext, public RefCounted
         IsStrictlyOrdered,
         ReqMade,
         MemOpDone,
+        VectorMemCrossCacheBlock,
+        VectorMemCrossCacheBlockValid,
         HtmFromTransaction,
         IsEmptyMov,
         IsConstantFolded,
@@ -306,7 +327,7 @@ class DynInst : public ExecContext, public RefCounted
     // Whether or not the source register is ready, one bit per register.
     uint8_t *_readySrcIdx;
 
-    uint64_t amoOldGoldenValue;
+    uint8_t amoOldGoldenValue[16];
 
   public:
     size_t numSrcs() const { return _numSrcs; }
@@ -426,6 +447,10 @@ class DynInst : public ExecContext, public RefCounted
 
     Addr fallThruPC;
 
+    // Fetch-side RISC-V predecode has checked this instruction. Decode must
+    // not re-run its frontend redirect checks for it.
+    bool predecodeChecked = false;
+
     /** ftqId is used for squashing and committing */
     /** The fetch stream queue ID of the instruction. */
     unsigned ftqId;
@@ -463,14 +488,48 @@ class DynInst : public ExecContext, public RefCounted
     ssize_t sqIdx = -1;
     typename LSQUnit::SQIterator sqIt;
 
-    /** Store-set predicted producing stores (for replay-based MDP). */
+    /** PHAST metadata carried by each load. */
+    struct MemDepInfo
+    {
+        /** Store this load received forwarded data from, if any. */
+        InstSeqNum forwardedFrom = 0;
+
+        /** Store-load violation training target. */
+        InstSeqNum violatingStoreSeqNum = 0;
+        Addr violatingStorePC = 0;
+
+        /** Zero-based distance from the load to the violating older store. */
+        std::ptrdiff_t storeQueueDistance = -1;
+
+        /** Store addresses/sizes used to validate an MDP prediction. */
+        std::pair<Addr, Addr> predStoreAddrs = {0, 0};
+        std::pair<unsigned, unsigned> predStoreSizes = {0, 0};
+
+        /** PHAST table metadata used for confidence updates. */
+        unsigned predBranchHistLength = 0;
+        uint64_t predictorHash = 0;
+
+        /** True when this load received a valid concrete MDP prediction. */
+        bool predicted = false;
+
+        /** True after the RAW violation has been counted once. */
+        bool violationCounted = false;
+
+        /** True when a RAW violation is deferred until Commit. */
+        bool violationPending = false;
+
+        /** True after the RAW violation has trained PHAST once. */
+        bool violationTrained = false;
+    } memDepInfo;
+
+    /** Predicted producing stores (for replay-based MDP). */
     std::vector<InstSeqNum> mdpProducingStores;
 
     /** Whether this load is predicted to strictly wait for prior store addrs. */
     bool mdpPredStrictWait = false;
 
     /** If load data is from cache then it must be golden */
-    uint8_t goldenData[8] = {0};
+    uint8_t goldenData[16] = {0};
 
     int pf_source  = -1; // if load cache line is prefetched
     /////////////////////// TLB Miss //////////////////////
@@ -490,8 +549,17 @@ class DynInst : public ExecContext, public RefCounted
     RequestPtr reqToVerify;
 
     IssueQue* issueQue = nullptr;
+    InstructionQueue* instQueue = nullptr;
     int issueportid = -1;
     int iqtag = -1;
+
+    // Cached semantic latency for a dynamic floating-point divide.  The
+    // value is computed after the renamed source operands are available and
+    // reused by issue-port arbitration, execution, and wakeup scheduling.
+    mutable int fdivLatency = -1;
+
+    int getFdivLatency() const { return fdivLatency; }
+    void setFdivLatency(int latency) const { fdivLatency = latency; }
 
   public:
     /** Records changes to result? */
@@ -508,6 +576,16 @@ class DynInst : public ExecContext, public RefCounted
     /** Whether or not the memory operation is done. */
     bool memOpDone() const { return instFlags[MemOpDone]; }
     void memOpDone(bool f) { instFlags[MemOpDone] = f; }
+
+    bool vectorMemCrossCacheBlock() const
+    {
+        return instFlags[VectorMemCrossCacheBlock];
+    }
+
+    bool vectorMemCrossCacheBlockValid() const
+    {
+        return instFlags[VectorMemCrossCacheBlockValid];
+    }
 
     bool notAnInst() const { return instFlags[NotAnInst]; }
     void setNotAnInst() { instFlags[NotAnInst] = true; }
@@ -527,6 +605,9 @@ class DynInst : public ExecContext, public RefCounted
     {
         cpu->demapPage(vaddr, asn);
     }
+
+    void updateVectorMemCrossCacheBlock(
+            Addr addr, unsigned size, const std::vector<bool> &byte_enable);
 
     Fault initiateMemRead(Addr addr, unsigned size, Request::Flags flags,
             const std::vector<bool> &byte_enable) override;
@@ -666,6 +747,12 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Returns whether the instruction was predicted taken or not. */
     bool readPredTaken() { return instFlags[PredTaken]; }
+
+    void setPredecodeChecked() { predecodeChecked = true; }
+    bool isPredecodeChecked() const
+    {
+        return predecodeChecked;
+    }
 
     void
     setPredTaken(bool predicted_taken)
@@ -915,6 +1002,15 @@ class DynInst : public ExecContext, public RefCounted
      */
     bool isSerializeHandled() { return status[SerializeHandled]; }
 
+    /** Returns whether the instruction owns a RAT checkpoint. */
+    bool isRatSnapshotted() const { return status[RatSnapshotted]; }
+    /** Records that the instruction owns a RAT checkpoint. Does not capture
+     *  any alias-table state; it only marks the instruction so the ROB can
+     *  find the nearest checkpoint during a squash. */
+    void setRatSnapshotted() { status.set(RatSnapshotted); }
+    /** Clears the RAT-checkpoint mark. */
+    void clearRatSnapshotted() { status.reset(RatSnapshotted); }
+
     /** Returns the opclass of this instruction. */
     OpClass opClass() const { return staticInst->opClass(); }
 
@@ -923,12 +1019,21 @@ class DynInst : public ExecContext, public RefCounted
     branchTarget() const
     {
         if (traceBranchHasTarget()) {
-            // Construct a concrete PCState for the current ISA to hold the
-            // absolute target address, then return it as PCStateBase.
+            // The trace-recorded destination is authoritative, including for a
+            // not-taken branch: BranchOutcome::target must stay the control-flow
+            // destination, not the selected next PC.
             return std::make_unique<TheISA::PCState>(traceBranchTarget());
-        } else {
-            return staticInst->branchTarget(*pc);
         }
+        if (traceBranchInfoValid) {
+            // No recorded target, so the encoding is the only other source --
+            // and a synthetic trace encoding need not be a PC-relative branch
+            // (a compressed CALL_DIRECT becomes c.nop on RV64, and several
+            // uncompressible forms fall back to nops), where
+            // StaticInst::branchTarget() panics. The trace next PC is the
+            // ground truth for the fetch/decode consumers here.
+            return std::make_unique<TheISA::PCState>(traceBranchNextPC());
+        }
+        return staticInst->branchTarget(*pc);
     }
 
     /** Returns the number of source registers. */
@@ -949,7 +1054,7 @@ class DynInst : public ExecContext, public RefCounted
     /** Returns the logical register index of the i'th source register. */
     const RegId& srcRegIdx(int i) const { return staticInst->srcRegIdx(i); }
 
-    uint64_t getAmoOldGoldenValue() const { return amoOldGoldenValue; }
+    uint64_t getAmoOldGoldenValue() const { return *(const uint64_t *)amoOldGoldenValue; }
 
     void *getAmoOldGoldenValuePtr() { return (void *) &amoOldGoldenValue; }
 
@@ -1188,6 +1293,11 @@ class DynInst : public ExecContext, public RefCounted
 
     void setRescheduleReplay() { setReplay(LdStReplayType::RescheduleReplay); }
     bool needRescheduleReplay() const { return getReplayType() == LdStReplayType::RescheduleReplay; }
+
+    void setPhysicalSQFullReplay() { setReplay(LdStReplayType::PhysicalSQFullReplay); }
+    bool needPhysicalSQFullReplay() const {
+        return getReplayType() == LdStReplayType::PhysicalSQFullReplay;
+    }
 
     void setSTLFReplay() { setReplay(LdStReplayType::STLFReplay); }
     bool needSTLFReplay() const { return getReplayType() == LdStReplayType::STLFReplay; }
@@ -1464,11 +1574,11 @@ class DynInst : public ExecContext, public RefCounted
     uint64_t htmDepth = 0;
 
   public:
+    Tick fetchTick = -1;      // instruction fetch is completed.
 #if TRACING_ON
     // Value -1 indicates that particular phase
     // hasn't happened (yet).
     /** Tick records used for the pipeline activity viewer. */
-    Tick fetchTick = -1;      // instruction fetch is completed.
     int32_t decodeTick = -1;  // instruction enters decode phase
     int32_t renameTick = -1;  // instruction enters rename phase
     int32_t dispatchTick = -1;
@@ -1771,6 +1881,8 @@ class DynInst : public ExecContext, public RefCounted
 
     /** value prediction */
     valuepred::VPResult vpResult = {false, 0xdeadbeefULL};
+    std::unique_ptr<valuepred::VPPredictionRecord> vpRecord = nullptr;
+    bool vpApplied = false;
 
     RegVal actualValue = 0xdeadbeefULL;
     bool vpMisprediction = false;

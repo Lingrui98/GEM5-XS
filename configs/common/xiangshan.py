@@ -18,6 +18,7 @@ from common import CacheConfig
 from common import CpuConfig
 from common import MemConfig
 from common import ObjectList
+from common import PrefetcherConfig
 from common.Caches import *
 from common import Options
 from common.FUScheduler import *
@@ -165,8 +166,8 @@ def generate_xiangshan_dtb(system, *, cmdline: str, outdir: str = None) -> str:
     chosen = FdtNode("chosen")
     if cmdline:
         chosen.append(FdtPropertyStrings("bootargs", cmdline))
-    chosen.append(FdtPropertyStrings("stdout-path", "/soc/serial@40600000"))
-    chosen.append(FdtPropertyStrings("linux,stdout-path", "/soc/serial@40600000"))
+    chosen.append(FdtPropertyStrings("stdout-path", "/soc/serial@310b0000"))
+    chosen.append(FdtPropertyStrings("linux,stdout-path", "/soc/serial@310b0000"))
     root.append(chosen)
 
     for mem_range in system.mem_ranges:
@@ -185,7 +186,7 @@ def generate_xiangshan_dtb(system, *, cmdline: str, outdir: str = None) -> str:
     cpus_state = FdtState(addr_cells=1, size_cells=0)
     cpus_node.append(cpus_state.addrCellsProperty())
     cpus_node.append(cpus_state.sizeCellsProperty())
-    cpus_node.append(FdtPropertyWords("timebase-frequency", [10000000]))
+    cpus_node.append(FdtPropertyWords("timebase-frequency", [1000000]))
 
     mmu_type = "riscv,sv48"
     isa_string = "rv64imafdc"
@@ -253,14 +254,26 @@ def generate_xiangshan_dtb(system, *, cmdline: str, outdir: str = None) -> str:
     plic_node.appendCompatible(["riscv,plic0"])
     soc_node.append(plic_node)
 
-    uart = system.uartlite
-    uart_node = uart.generateBasicPioDeviceNode(
-        soc_state, "serial", uart.pio_addr, uart.pio_size
+    uart16550 = system.uart16550
+    uart16550_node = uart16550.generateBasicPioDeviceNode(
+        soc_state, "serial", uart16550.pio_addr, uart16550.pio_size
     )
-    uart_node.append(FdtPropertyWords("clock-frequency", [0]))
-    uart_node.append(FdtPropertyStrings("status", "okay"))
-    uart_node.appendCompatible(["xlnx,xps-uartlite-1.00.a"])
-    soc_node.append(uart_node)
+    uart16550_node.append(FdtPropertyWords("clock-frequency", [50000000]))
+    uart16550_node.append(FdtPropertyWords("current-speed", [115200]))
+    uart16550_node.append(FdtPropertyWords("reg-shift", [2]))
+    uart16550_node.append(FdtPropertyWords("reg-io-width", [4]))
+    uart16550_node.append(FdtPropertyStrings("status", "okay"))
+    uart16550_node.appendCompatible(["ns16550a"])
+    soc_node.append(uart16550_node)
+
+    uartlite = system.uartlite
+    uartlite_node = uartlite.generateBasicPioDeviceNode(
+        soc_state, "serial", uartlite.pio_addr, uartlite.pio_size
+    )
+    uartlite_node.append(FdtPropertyWords("clock-frequency", [0]))
+    uartlite_node.append(FdtPropertyStrings("status", "okay"))
+    uartlite_node.appendCompatible(["xlnx,xps-uartlite-1.00.a"])
+    soc_node.append(uartlite_node)
 
     root.append(soc_node)
 
@@ -357,7 +370,7 @@ def config_xiangshan_inputs(args: argparse.Namespace, sys):
 
     if args.num_cpus > 1 or args.smt:
         print("Simulating a multi-context system, demanding a larger GCPT restorer size (2M).")
-        sys.gcpt_restorer_size_limit = 2**20
+        sys.gcpt_restorer_size_limit = 2**21
     elif args.restore_rvv_cpt:
         print("Simulating single core with RVV, demanding GCPT restorer size of 0x1000.")
         sys.gcpt_restorer_size_limit = 0x1000
@@ -403,15 +416,13 @@ def config_difftest(cpu_list, args, sys):
     if not args.enable_difftest:
         return
     else:
-        if len(cpu_list) > 1 or args.smt:
+        if len(cpu_list) > 1 or args.smt or args.enable_mem_dedup:
             sys.enable_mem_dedup = True
             for cpu in cpu_list:
                 cpu.enable_mem_dedup = True
                 cpu.enable_difftest = True
                 cpu.difftest_ref_so = args.difftest_ref_so
         else:
-            # sys.enable_mem_dedup = True
-            # cpu_list[0].enable_mem_dedup = True
             cpu_list[0].enable_difftest = True
             cpu_list[0].difftest_ref_so = args.difftest_ref_so
 
@@ -445,6 +456,13 @@ def _finish_xiangshan_system(args, test_sys, TestCPUClass, ruby):
     for cpu in test_sys.cpu:
         if args.smt:
             cpu.numThreads = 2
+        # === Block Policy: pass SMT fetch block parameters ===
+        from m5.objects.BaseO3CPU import SMTDecodePolicy
+        cpu.smtDecodePolicy = SMTDecodePolicy(args.smt_decode_policy)
+        from m5.objects.BaseO3CPU import SMTFetchBlockPolicy
+        cpu.smtFetchBlockPolicy = SMTFetchBlockPolicy(args.smt_fetch_block_policy)
+        cpu.smtFetchBlockThreshold = args.smt_fetch_block_threshold
+        cpu.smtBorrowThrottleCycles = args.smt_fetch_throttle_cycles
         cpu.mmu.pma_checker = PMAChecker(
             uncacheable=[AddrRange(0, size=0x80000000)])
         cpu.mmu.functional = args.functional_tlb
@@ -541,6 +559,10 @@ def _finish_xiangshan_system(args, test_sys, TestCPUClass, ruby):
             cpu.traceEnableWrongPath = (not args.trace_disable_wrongpath)
             if hasattr(args, 'trace_wrongpath_use_traceinst') and args.trace_wrongpath_use_traceinst:
                 cpu.traceWrongPathUseTraceInst = True
+            # A/B diagnostic: force synthetic encoding even when the trace
+            # records the real instruction bits (tracertl).
+            if getattr(args, 'trace_use_synthetic_enc', False):
+                cpu.traceUseSyntheticEnc = True
 
             # Note: Difftest configured at system level, not CPU level
 
@@ -713,6 +735,7 @@ def _finish_xiangshan_system(args, test_sys, TestCPUClass, ruby):
             name = PerfRecord.vals[i]
             type_str = "bigint unsigned" if name.lower().startswith(('at', 'pc', 'result')) else "char(20)"
             perfCCT_cmd += "," + name + " " + type_str + " NOT NULL"
+        perfCCT_cmd += ",TID int unsigned NOT NULL"
         perfCCT_cmd += ");"
 
         perfCCT_cmd += """
@@ -741,7 +764,7 @@ CREATE TABLE LoadLifeTimeCommitTrace(
         test_sys.arch_db.dump_stride_train_trace = False
         test_sys.arch_db.dump_sms_train_trace = False
         test_sys.arch_db.dump_vaddr_trace = False
-        test_sys.arch_db.dump_lifetime = False
+        test_sys.arch_db.dump_lifetime = args.arch_db_dump_lifetime
         test_sys.arch_db.table_cmds = [
             "CREATE TABLE L1MissTrace(" \
             "ID INTEGER PRIMARY KEY AUTOINCREMENT," \
@@ -854,6 +877,11 @@ def build_xiangshan_system(args):
     np = args.num_cpus
     assert buildEnv['TARGET_ISA'] == "riscv"
 
+    enable_dynamic_pf = getattr(args, 'enable_dynamic_pf', False)
+    PrefetcherConfig.set_enable_dynamic_pf(
+        enable_dynamic_pf is True or enable_dynamic_pf == "True"
+    )
+
     TestCPUClass = get_xiangshan_cpu_class(args)
     ruby = bool(hasattr(args, 'ruby') and args.ruby)
     num_threads = np * (2 if getattr(args, 'smt', False) else 1)
@@ -911,10 +939,161 @@ def xiangshan_system_init():
         help="Use BTBTAGEUpperBound in kmhv3 instead of the default BTBTAGE",
     )
     parser.add_argument(
+        "--disable-l1-direct-compression",
+        action="store_false",
+        dest="enable_l1_direct_compression",
+        default=True,
+        help="Disable L1 direct one-stage TLB compression for A/B validation",
+    )
+    parser.add_argument(
+        "--disable-ptw-level-limit",
+        action="store_false",
+        dest="enable_ptw_level_limit",
+        default=True,
+        help="Disable PTW level parallelism limits for A/B validation",
+    )
+    parser.add_argument(
+        "--ptw-level0-limit",
+        type=int,
+        default=6,
+        help="PTW level-0 parallelism limit",
+    )
+    parser.add_argument(
+        "--ptw-level1-limit",
+        type=int,
+        default=1,
+        help="PTW level-1 parallelism limit",
+    )
+    parser.add_argument(
+        "--ptw-level2-limit",
+        type=int,
+        default=1,
+        help="PTW level-2 parallelism limit",
+    )
+    parser.add_argument(
+        "--ptw-level3-limit",
+        type=int,
+        default=1,
+        help="PTW level-3 parallelism limit",
+    )
+    parser.add_argument(
+        "--ptw-miss-queue-size",
+        type=int,
+        default=40,
+        help="PTW MissQueue size",
+    )
+    parser.add_argument(
+        "--smtROBDonorEntry",
+        type=int,
+        default=8,
+        help="Minimum ROB entries reserved for a borrowing donor to resume",
+    )
+    parser.add_argument(
+        "--smtROBBaseEntry",
+        type=int,
+        default=80,
+        help="Minimum ROB entries reserved for a borrowing base to resume",
+    )
+    parser.add_argument(
+        "--ROBTotalEntry",
+        type=int,
+        default=160,
+        help="Number of reorder buffer entries",
+    )
+    parser.add_argument(
         "--standalone-sc",
         action="store_true",
         default=False,
         help="Disable direction TAGE sources in kmhv3 and force MGSC standalone SC prediction",
+    )
+
+    parser.add_argument(
+        "--smt-decode-policy",
+        type=str,
+        default="MultiPriority",
+        choices=["ICount", "DelayedICount", "MultiPriority", "RoundRobin"],
+        help="SMT decode select policy: ICount, DelayedICount, MultiPriority, RoundRobin",
+    )
+    # BlockStallPolicy: block is an ADDITIONAL throttle source (OR with base throttle)
+    # BlockThrottlePolicy: block REPLACES base throttle, becoming the sole throttle driver
+    # FlushFromLoadPolicy: squash all instructions after the long-latency load
+    # FlushFromUsePolicy: squash from first consumer of load result (or ROB tail if none)
+    parser.add_argument(
+        "--smt-fetch-block-policy",
+        type=str,
+        default="BaseLine",
+        choices=["BaseLine", "BlockStallPolicy", "BlockThrottlePolicy",
+                 "FlushFromLoadPolicy", "FlushFromUsePolicy"],
+        help="SMT fetch block/flush policy for long-latency loads: "
+             "BaseLine (no blocking), BlockStallPolicy (block + base throttle), "
+             "BlockThrottlePolicy (block drives throttle), "
+             "FlushFromLoadPolicy (squash after load), "
+             "FlushFromUsePolicy (squash from first consumer)",
+    )
+    parser.add_argument(
+        "--smt-fetch-block-threshold",
+        type=int,
+        default=15,
+        help="Number of consecutive cycles a thread's LQ head must be stalled on a "
+             "long-latency load before IEW signals Fetch to block (T15 from Tullsen & Brown)",
+    )
+    parser.add_argument(
+        "--smt-fetch-throttle-cycles",
+        type=int,
+        default=8,
+        help="Cycles to keep a backend-stalled SMT thread throttled at fetch, 0 means disable throttle",
+    )
+
+    parser.add_argument(
+        "--solver-problem-ref",
+        type=str,
+        default="",
+        help="Solver problem spec used by the CI parameter solver prototype",
+    )
+    parser.add_argument(
+        "--solver-bind-output",
+        type=str,
+        default="",
+        help="Write solver binding metadata and exit before instantiate",
+    )
+    parser.add_argument(
+        "--solver-overlay",
+        type=str,
+        default="",
+        help="Apply a solver overlay JSON before instantiate",
+    )
+    parser.add_argument(
+        "--rob-walk-policy",
+        type=str,
+        default="Replay",
+        choices=["Rollback", "Replay", "ConstCycle", "NaiveCpt"],
+        help="ROB misprediction-recovery walk policy. NaiveCpt enables the "
+              "RAT-checkpoint recovery-cost model.",
+    )
+
+    parser.add_argument(
+        "--smt-iq-policy",
+        type=str,
+        default="Dynamic",
+        help="SMT IQ partitioning policy (Dynamic/Watermark)",
+    )
+    parser.add_argument(
+        "--smt-iq-watermark-int",
+        type=int,
+        default=0,
+        help="SMT IQ watermark for intIQ (entries reserved per thread)",
+    )
+    parser.add_argument(
+        "--smt-iq-watermark-mem",
+        type=int,
+        default=0,
+        help="SMT IQ watermark for memIQ (entries reserved per thread)",
+    )
+    parser.add_argument(
+        "--smt-iq-watermark-fp",
+        type=int,
+        default=0,
+        help="SMT IQ watermark for fpIQ/vecIQ (entries reserved per thread)",
     )
 
     # Add the ruby specific and protocol specific args

@@ -89,6 +89,15 @@ class DelayedICountScheduler : public ICountScheduler
         ThreadID selectedTid = timebuffer.front();
         timebuffer.pop_front();
         timebuffer.push_back(ICountScheduler::getThread());
+        // check whether candidate
+        for (uint64_t i = 0; i < numThreads; i++) {
+            ThreadID tid = (selectedTid + i) % numThreads;
+            uint64_t count = counter->getCounter(tid);
+            if (count < UINT64_MAX) {
+                selectedTid = tid;
+                break;
+            }
+        }
         return selectedTid;
     }
 };
@@ -107,25 +116,54 @@ class MultiPrioritySched : public SMTScheduler
 
     ThreadID getThread() override
     {
-        for (size_t i = 0; i < counter.size(); ++i) {
-            bool set = false;
-            ThreadID selectedTid = 0;
-            uint64_t minCount = counter[i]->getCounter(0);
-            for (ThreadID tid = 1; tid < numThreads; ++tid) {
-                uint64_t count = counter[i]->getCounter(tid);
-                if (count < minCount) {
-                    minCount = count;
+        ThreadID selectedTid = 0;
+
+        for (ThreadID tid = 1; tid < numThreads; ++tid) {
+            for (size_t i = 0; i < counter.size(); ++i) {
+                uint64_t candidateCount = counter[i]->getCounter(tid);
+                uint64_t selectedCount = counter[i]->getCounter(selectedTid);
+
+                if (candidateCount < selectedCount) {
                     selectedTid = tid;
-                    set = true;
+                    break;
+                }
+
+                if (candidateCount > selectedCount) {
+                    break;
                 }
             }
-            if (set) {
-                return selectedTid;
-            }
         }
-        return 0;
+
+        return selectedTid;
     }
 };
+
+class RoundRobinScheduler : public SMTScheduler
+{
+    // count of inst based smt shceduler
+  protected:
+    InstsCounter* counter;
+    uint64_t selectedTimes = 0;
+
+  public:
+    RoundRobinScheduler(int numThreads, InstsCounter* counter) : SMTScheduler(numThreads), counter(counter) {}
+
+    ThreadID getThread() override
+    {
+        ThreadID selectedTid = 0;
+        for (uint64_t i = 0; i < numThreads; i++) {
+            ThreadID tid = (selectedTimes + i) % numThreads;
+            uint64_t count = counter->getCounter(tid);
+            if (count < UINT64_MAX - 1) {
+                selectedTid = tid;
+                break;
+            }
+        }
+        selectedTimes++;
+        return selectedTid;
+    }
+};
+
 
 }}
 #endif
