@@ -1992,26 +1992,6 @@ Fetch::finishFdipTranslation(const Fault &fault, const RequestPtr &mem_req)
         return;
     }
 
-    if (tryCompleteFdipLineByDirectProbe(pending.tid, pending.lineIndex,
-                                         mem_req)) {
-        fdipPendingReqs.erase(it);
-        return;
-    }
-
-    const auto recent_unused_cycles = dbpbtb->fdipRecentUnusedCycles();
-    if (recent_unused_cycles > 0 && fdipIcacheAccessor &&
-        mem_req->hasPaddr() &&
-        fdipIcacheAccessor->shouldSuppressFdipLine(
-            mem_req->getPaddr(), mem_req->isSecure(),
-            recent_unused_cycles)) {
-        ++fetchStats.fdipFilteredRecentUnused;
-        state.lines[pending.lineIndex].status = FdipFilteredRecentUnused;
-        state.lines[pending.lineIndex].req.reset();
-        finishFdipTargetIfReady(pending.tid);
-        fdipPendingReqs.erase(it);
-        return;
-    }
-
     state.lines[pending.lineIndex].status = FdipReady;
 }
 
@@ -5405,18 +5385,6 @@ Addr
 Fetch::getTracePCByIndex(uint64_t index)
 {
     return traceFetch ? traceFetch->getTracePCByIndex(index) : 0;
-}
-
-bool
-Fetch::shouldDropFdipRefill(ContextID contextId,
-                            const Request::XsMetadata &xsMeta) const
-{
-    if (!xsMeta.isFdip() || !dbpbtb->fdipDropRefillOnEpochMismatch()) {
-        return false;
-    }
-
-    const ThreadID tid = cpu->contextToThread(contextId);
-    return xsMeta.fdipEpoch != fdipEpoch[tid];
 }
 
 } // namespace o3

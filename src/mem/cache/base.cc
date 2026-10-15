@@ -544,12 +544,9 @@ BaseCache::BaseCache(const BaseCacheParams &p, unsigned blk_size)
     fatal_if(demandFetchMSHRs > p.mshrs,
         "%s demand_fetch_mshrs (%u) exceeds mshrs (%u)",
         name(), demandFetchMSHRs, p.mshrs);
-    fatal_if(fdipPrefetchMSHRs > p.mshrs,
-        "%s fdip_prefetch_mshrs (%u) exceeds mshrs (%u)",
-        name(), fdipPrefetchMSHRs, p.mshrs);
-    fatal_if(demandFetchMSHRs + fdipPrefetchMSHRs > p.mshrs,
-        "%s demand_fetch_mshrs + fdip_prefetch_mshrs (%u + %u) exceeds mshrs (%u)",
-        name(), demandFetchMSHRs, fdipPrefetchMSHRs, p.mshrs);
+    fatal_if(instPrefetchMSHRs > p.mshrs,
+        "%s effective instruction-prefetch mshr quota (%u) exceeds mshrs (%u)",
+        name(), instPrefetchMSHRs, p.mshrs);
 
     fatal_if(compressor && !dynamic_cast<CompressedTags*>(tags),
         "The tags of compressed cache %s must derive from CompressedTags",
@@ -2983,32 +2980,6 @@ BaseCache::maintainClusivity(bool from_cache, CacheBlk *blk)
         // with respect to the cache above, drop the block
         invalidateBlock(blk);
     }
-}
-
-bool
-BaseCache::shouldDropFdipRefill(MSHR *mshr, const PacketPtr pkt) const
-{
-    if (!isL1I() || !mshr || !pkt || !pkt->req || mshr->hasFromDemand() ||
-        !isFdipPkt(pkt) || !pkt->req->hasXsMetadata()) {
-        return false;
-    }
-
-    const ContextID context_id = pkt->req->contextId();
-    if (context_id < 0 || context_id >= system->threads.size()) {
-        return false;
-    }
-
-    ThreadContext *thread_context = system->threads[context_id];
-    if (!thread_context) {
-        return false;
-    }
-
-    auto *cpu = dynamic_cast<o3::CPU *>(thread_context->getCpuPtr());
-    if (!cpu) {
-        return false;
-    }
-
-    return cpu->shouldDropFdipRefill(context_id, pkt->req->getXsMetadata());
 }
 
 bool

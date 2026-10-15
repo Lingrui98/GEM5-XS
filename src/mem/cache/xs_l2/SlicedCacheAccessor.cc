@@ -82,13 +82,6 @@ SlicedCacheAccessor::findBlock(Addr addr, bool is_secure) const
 }
 
 bool
-SlicedCacheAccessor::lookupHitWay(Addr addr, bool is_secure, uint8_t &way) const
-{
-    fatal_if(l2_wrapper->cache_accessors.empty(), "No slice accessors available.");
-    return getSlice(addr)->lookupHitWay(addr, is_secure, way);
-}
-
-bool
 SlicedCacheAccessor::shouldSuppressFdipLine(Addr addr, bool is_secure,
                                             uint64_t cooldown_cycles) const
 {

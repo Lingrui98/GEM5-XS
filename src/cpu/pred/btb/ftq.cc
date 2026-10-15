@@ -103,12 +103,6 @@ FetchTargetQueue::finishPrefetchTarget(ThreadID tid)
 }
 
 void
-FetchTargetQueue::finishPrefetchTarget(ThreadID tid)
-{
-    queue[tid].prefetchptr++;
-}
-
-void
 FetchTargetQueue::commitTarget(ThreadID tid)
 {
     queue[tid].cap.pop_front();

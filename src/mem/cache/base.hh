@@ -1493,13 +1493,6 @@ class BaseCache : public ClockedObject, public CacheAccessor
         /** Number of FDIP allocations rejected (no prefetch MSHR credit). */
         statistics::Scalar fdipRejectedNoPrefetchMSHR;
 
-        /** Late FDIP observations after a cold/unknown prior. */
-        statistics::Scalar fdipMissAllocColdOrUnknownThenLate;
-        /** Number of after-useful FDIP miss allocs later observed as late. */
-        statistics::Scalar fdipMissAllocAfterUsefulThenLate;
-        /** Number of after-unused FDIP miss allocs later observed as late. */
-        statistics::Scalar fdipMissAllocAfterUnusedThenLate;
-
         /** Number of FDIP misses that allocate a real MSHR. */
         statistics::Scalar fdipMissAlloc;
         /** Number of FDIP miss allocs with no prior FDIP lifecycle outcome. */
@@ -1508,6 +1501,12 @@ class BaseCache : public ClockedObject, public CacheAccessor
         statistics::Scalar fdipMissAllocAfterUseful;
         /** Number of FDIP miss allocs following a prior unused FDIP lifecycle. */
         statistics::Scalar fdipMissAllocAfterUnused;
+        /** Late FDIP observations after a cold/unknown prior. */
+        statistics::Scalar fdipMissAllocColdOrUnknownThenLate;
+        /** Number of after-useful FDIP miss allocs later observed as late. */
+        statistics::Scalar fdipMissAllocAfterUsefulThenLate;
+        /** Number of after-unused FDIP miss allocs later observed as late. */
+        statistics::Scalar fdipMissAllocAfterUnusedThenLate;
         /** Number of cold/unknown FDIP miss allocs later observed as useful. */
         statistics::Scalar fdipMissAllocColdOrUnknownThenUseful;
         /** Number of cold/unknown FDIP miss allocs later observed as unused. */
